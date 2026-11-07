@@ -505,9 +505,10 @@ def index():
                     </p>
                     <div class="input-group mb-3">
                         <span class="input-group-text bg-white"><i class="fa-solid fa-link text-muted"></i></span>
-                        <input type="text" id="sheetUrlInput" class="form-control" placeholder="Dán link Google Sheet (ví dụ: https://docs.google.com/spreadsheets/d/.../edit)">
+                        <input type="text" id="sheetUrlInput" class="form-control" value="https://docs.google.com/spreadsheets/d/1Qq1lkhVzlDe0FJ5k3HDDkBiGYDqTItO2ycQMDQHATD0/edit?pli=1&gid=1405549804#gid=1405549804" placeholder="Dán link Google Sheet (ví dụ: https://docs.google.com/spreadsheets/d/.../edit)">
                         <button class="btn btn-success px-4" id="btnSyncSheet" onclick="syncGoogleSheet()"><i class="fa-solid fa-arrows-rotate"></i> Đồng bộ ngay</button>
                     </div>
+
 
                     <div id="syncReportBox" style="display:none;" class="mb-3"></div>
 

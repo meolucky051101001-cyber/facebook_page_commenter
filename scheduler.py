@@ -18,8 +18,9 @@ SCHEDULER_METRICS: Dict[str, Any] = {
     "post_scan": {"last_run": None, "last_error": None, "status": "RUNNING"},
     "task_exec": {"last_run": None, "last_error": None, "status": "RUNNING"},
     "maintenance": {"last_run": None, "last_error": None, "status": "RUNNING"},
-    "sheet_sync": {"last_run": None, "last_error": None, "sheet_url": None},
+    "sheet_sync": {"last_run": None, "last_error": None, "sheet_url": config.DEFAULT_SHEET_URL},
     "paused_all": False
+
 }
 
 

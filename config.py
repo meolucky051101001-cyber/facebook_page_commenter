@@ -50,4 +50,11 @@ ANTIDETECT_DIR = os.getenv("ANTIDETECT_DIR", r"C:\Projects\Tools\Antidetect Pyth
 ANTIDETECT_AUTO_CLOSE_BROWSER = os.getenv("ANTIDETECT_AUTO_CLOSE_BROWSER", "1").strip() in ("1", "true", "yes", "on")
 ANTIDETECT_AUTO_SCAN_POSTS = os.getenv("ANTIDETECT_AUTO_SCAN_POSTS", "0").strip() in ("1", "true", "yes", "on")
 
+# 6. Default Google Sheet URL
+DEFAULT_SHEET_URL = os.getenv(
+    "DEFAULT_SHEET_URL",
+    "https://docs.google.com/spreadsheets/d/1Qq1lkhVzlDe0FJ5k3HDDkBiGYDqTItO2ycQMDQHATD0/edit?pli=1&gid=1405549804#gid=1405549804"
+).strip()
+
+
 

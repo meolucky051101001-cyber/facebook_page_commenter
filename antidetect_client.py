@@ -216,13 +216,14 @@ def sync_pages_from_antidetect(export_csv: bool = True) -> Dict[str, Any]:
 
 
 def export_all_pages_to_csv_templates() -> None:
-    """Updates template_pages.csv and template_comments.csv with all pages in DB."""
+    """Updates template_pages.csv, template_comments.csv, and template_gop_1_sheet_59_pages.csv with all pages in DB."""
     pages = db.get_all_pages()
     pages_sorted = sorted(pages, key=lambda x: (x.get("account_name") or "", x.get("page_name") or ""))
     base_dir = Path(__file__).resolve().parent
 
     pages_csv = base_dir / "template_pages.csv"
     comments_csv = base_dir / "template_comments.csv"
+    unified_csv = base_dir / "template_gop_1_sheet_59_pages.csv"
 
     with open(pages_csv, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
@@ -260,6 +261,41 @@ def export_all_pages_to_csv_templates() -> None:
                     1,
                     f"mau_{idx}",
                 ])
+
+    with open(unified_csv, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "Page ID",
+            "Tên Fanpage",
+            "Sau bao lâu comment (phút)",
+            "Mỗi ngày mấy comment",
+            "Mẫu bình luận",
+            "Bật tự động",
+            "Profile / Chế độ",
+        ])
+        for p in pages_sorted:
+            mode = p.get("connection_mode") or "GRAPH_API"
+            prof_name = p.get("antidetect_profile_name") or p.get("account_name") or ""
+            templates = []
+            try:
+                templates = json.loads(p.get("templates") or "[]")
+            except Exception:
+                pass
+            if not templates:
+                templates = [
+                    f"{{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}}, cảm ơn bạn đã ghé thăm {p['page_name']}! {{Inbox page để được tư vấn chi tiết nhé|Nhắn tin cho tụi mình nếu cần hỗ trợ thêm nha}} ❤️"
+                ]
+            for tmpl in templates:
+                writer.writerow([
+                    f"'{p['page_id']}",
+                    p["page_name"],
+                    p.get("delay_minutes") or 10,
+                    p.get("max_comments_per_day") or 20,
+                    tmpl,
+                    "TRUE" if p.get("rule_enabled", 1) else "FALSE",
+                    f"[{mode}] {prof_name}".strip(),
+                ])
+
 
 
 # ============================================================================

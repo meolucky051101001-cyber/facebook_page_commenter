@@ -403,3 +403,41 @@ def test_antidetect_hybrid_linking_and_cdp_execution():
         assert tasks[0]["status"] == "SUCCESS"
         assert tasks[0]["comment_id"] == "cdp_61594671061927_999"
 
+
+def test_google_sheet_unified_single_tab_mode():
+    acc_id = db.upsert_account("Nick Test Unified", "u_uni", "tok")
+    db.upsert_page("61594671061927", "Tiện Ích Ngôi Nhà", "tok_p", acc_id)
+
+    unified_rows = [
+        {
+            "page id": "'61594671061927",
+            "tên fanpage": "Tiện Ích Ngôi Nhà",
+            "sau bao lâu comment (phút)": "15",
+            "mỗi ngày mấy comment": "12",
+            "mẫu bình luận": "{Chào|Xin chào} bạn, mẫu 1!",
+            "bật tự động": "TRUE",
+        },
+        {
+            "page id": "'61594671061927",
+            "tên fanpage": "Tiện Ích Ngôi Nhà",
+            "sau bao lâu comment (phút)": "15",
+            "mỗi ngày mấy comment": "12",
+            "mẫu bình luận": "Mẫu 2 {nhé|nha}!",
+            "bật tự động": "TRUE",
+        },
+    ]
+
+    with patch("sheets_sync.fetch_sheet_csv", return_value=(unified_rows, None)):
+        res = sheets_sync.sync_from_google_sheet(
+            "https://docs.google.com/spreadsheets/d/1Qq1lkhVzlDe0FJ5k3HDDkBiGYDqTItO2ycQMDQHATD0/edit?pli=1&gid=1405549804#gid=1405549804"
+        )
+        assert res["success"] is True
+        assert res["pages_synced"] == 1
+        assert "Chế độ 1 Bảng gộp" in res["message"]
+
+    p = db.get_page("61594671061927")
+    assert p["delay_minutes"] == 15
+    assert p["max_comments_per_day"] == 12
+    assert json.loads(p["templates"]) == ["{Chào|Xin chào} bạn, mẫu 1!", "Mẫu 2 {nhé|nha}!"]
+
+
