@@ -1,0 +1,40 @@
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+from cryptography.fernet import Fernet
+
+BASE_DIR = Path(__file__).resolve().parent
+ENV_FILE = BASE_DIR / ".env"
+
+if not ENV_FILE.exists():
+    EXAMPLE_FILE = BASE_DIR / ".env.example"
+    if EXAMPLE_FILE.exists():
+        ENV_FILE.write_text(EXAMPLE_FILE.read_text(encoding="utf-8"), encoding="utf-8")
+    else:
+        ENV_FILE.touch()
+
+load_dotenv(ENV_FILE)
+
+# 1. Meta Credentials
+META_APP_ID = os.getenv("META_APP_ID", "").strip()
+META_APP_SECRET = os.getenv("META_APP_SECRET", "").strip()
+GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v19.0").strip()
+
+# 2. Encryption Key for Tokens
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "").strip()
+if not ENCRYPTION_KEY:
+    # Auto-generate a Fernet key and persist to .env
+    new_key = Fernet.generate_key().decode("utf-8")
+    ENCRYPTION_KEY = new_key
+    with open(ENV_FILE, "a", encoding="utf-8") as f:
+        f.write(f"\nENCRYPTION_KEY={new_key}\n")
+
+# 3. Intervals & Performance Settings
+POST_SCAN_INTERVAL_SEC = int(os.getenv("POST_SCAN_INTERVAL_SEC", "240"))
+TASK_TICK_SEC = int(os.getenv("TASK_TICK_SEC", "20"))
+SHEET_SYNC_INTERVAL_SEC = int(os.getenv("SHEET_SYNC_INTERVAL_SEC", "300"))
+
+# 4. Anti-spam / Safeguard Limits
+MAX_POST_AGE_MIN = int(os.getenv("MAX_POST_AGE_MIN", "120"))
+MIN_GAP_PER_PAGE_SEC = int(os.getenv("MIN_GAP_PER_PAGE_SEC", "45"))
+MAX_COMMENTS_PER_PAGE_PER_DAY = int(os.getenv("MAX_COMMENTS_PER_PAGE_PER_DAY", "20"))
