@@ -1,6 +1,7 @@
+import shutil
 import sqlite3
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 import crypto
@@ -8,39 +9,74 @@ import migrations
 
 DB_PATH = Path(__file__).parent / "fb_commenter.db"
 
+
 def get_connection():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
     return conn
 
+
 def init_db():
+    # Backup existing DB file if present before running migrations
+    if DB_PATH.exists() and DB_PATH.stat().st_size > 0:
+        backup_path = DB_PATH.with_suffix(".db.bak")
+        try:
+            shutil.copy2(DB_PATH, backup_path)
+        except Exception:
+            pass
+
     conn = get_connection()
     migrations.run_migrations(conn)
-    # Perform startup recovery for dangling tasks
-    recover_stale_tasks(conn)
+    # Perform startup recovery for dangling tasks from previous process crash
+    recover_stale_tasks(conn, startup=True)
     conn.close()
 
-def recover_stale_tasks(conn: Optional[sqlite3.Connection] = None):
+
+def recover_stale_tasks(
+    conn: Optional[sqlite3.Connection] = None,
+    startup: bool = True,
+    stale_after_seconds: int = 300
+) -> int:
     """
-    On startup or periodic check, recovers tasks that were left in 'SENDING' status
-    because of unexpected crash or power-off. Moves them to 'NEED_CHECK'.
+    Recovers tasks left in 'SENDING' status:
+    - If startup=True: recovers ALL tasks in 'SENDING' (process just restarted).
+    - If startup=False: only recovers tasks in 'SENDING' whose locked_at is older
+      than `stale_after_seconds` (default 5 minutes), avoiding active in-flight tasks!
     """
     should_close = False
     if conn is None:
         conn = get_connection()
         should_close = True
 
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_utc = datetime.now(timezone.utc)
+    now_iso = now_utc.isoformat()
+    affected = 0
     with conn:
-        conn.execute("""
-            UPDATE tasks
-            SET status = 'NEED_CHECK',
-                error_message = 'Tiến trình bị gián đoạn khi đang gửi. Vui lòng đối chiếu trên Facebook trước khi quyết định gửi lại.',
-                updated_at = ?
-            WHERE status = 'SENDING'
-        """, (now_iso,))
+        cursor = conn.cursor()
+        if startup:
+            cursor.execute("""
+                UPDATE tasks
+                SET status = 'NEED_CHECK',
+                    error_message = 'Tiến trình bị gián đoạn khi đang gửi. Vui lòng đối chiếu trên Facebook trước khi quyết định gửi lại.',
+                    updated_at = ?
+                WHERE status = 'SENDING'
+            """, (now_iso,))
+            affected = cursor.rowcount
+        else:
+            cutoff_iso = (now_utc - timedelta(seconds=stale_after_seconds)).isoformat()
+            cursor.execute("""
+                UPDATE tasks
+                SET status = 'NEED_CHECK',
+                    error_message = 'Tác vụ bị treo ở trạng thái Đang gửi quá 5 phút. Vui lòng đối chiếu trên Facebook.',
+                    updated_at = ?
+                WHERE status = 'SENDING' AND (locked_at IS NULL OR locked_at <= ?)
+            """, (now_iso, cutoff_iso))
+            affected = cursor.rowcount
+
     if should_close:
         conn.close()
+    return affected
+
 
 # --- CRUD HELPER METHODS ---
 
@@ -49,17 +85,21 @@ def upsert_account(account_name: str, user_id: Optional[str] = None, long_lived_
     token_enc = crypto.encrypt_token(long_lived_user_token) if long_lived_user_token else None
     with conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT id FROM accounts WHERE (user_id IS NOT NULL AND user_id = ?) OR account_name = ?", (user_id, account_name))
+        cursor.execute(
+            "SELECT id FROM accounts WHERE (user_id IS NOT NULL AND user_id = ?) OR account_name = ?",
+            (user_id, account_name)
+        )
         row = cursor.fetchone()
         if row:
             acc_id = row['id']
             cursor.execute("""
                 UPDATE accounts
                 SET status = 'ACTIVE',
+                    account_name = ?,
                     user_id = COALESCE(?, user_id),
                     long_lived_user_token_enc = COALESCE(?, long_lived_user_token_enc)
                 WHERE id = ?
-            """, (user_id, token_enc, acc_id))
+            """, (account_name, user_id, token_enc, acc_id))
         else:
             cursor.execute("""
                 INSERT INTO accounts (account_name, user_id, long_lived_user_token_enc)
@@ -69,6 +109,7 @@ def upsert_account(account_name: str, user_id: Optional[str] = None, long_lived_
     conn.close()
     return acc_id
 
+
 def upsert_page(
     page_id: str,
     page_name: str,
@@ -76,38 +117,42 @@ def upsert_page(
     account_id: int,
     token_status: str = "OK",
     missing_permissions: Optional[List[str]] = None,
-    expires_at: Optional[str] = None
+    expires_at: Optional[str] = None,
+    status_note: Optional[str] = None
 ):
     conn = get_connection()
     token_enc = crypto.encrypt_token(page_access_token)
     perms_json = json.dumps(missing_permissions or [])
+    is_active = 0 if token_status in ("EXPIRED", "MISSING_PERMISSIONS") else 1
     now = datetime.now(timezone.utc).isoformat()
     with conn:
         conn.execute("""
             INSERT INTO pages (
                 page_id, page_name, page_access_token_enc, account_id,
                 is_active, token_status, missing_permissions, expires_at,
-                last_synced_at, updated_at
+                last_synced_at, status_note, updated_at
             )
-            VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(page_id) DO UPDATE SET
                 page_name = excluded.page_name,
                 page_access_token_enc = excluded.page_access_token_enc,
                 account_id = excluded.account_id,
-                is_active = 1,
+                is_active = excluded.is_active,
                 token_status = excluded.token_status,
                 missing_permissions = excluded.missing_permissions,
                 expires_at = excluded.expires_at,
                 last_synced_at = excluded.last_synced_at,
+                status_note = excluded.status_note,
                 updated_at = excluded.updated_at
-        """, (page_id, page_name, token_enc, account_id, token_status, perms_json, expires_at, now, now))
+        """, (page_id, page_name, token_enc, account_id, is_active, token_status, perms_json, expires_at, now, status_note, now))
 
         # Ensure default rule exists for this page
         conn.execute("""
             INSERT OR IGNORE INTO page_rules (page_id, delay_minutes, templates, max_comments_per_day, is_enabled)
             VALUES (?, 10, ?, 20, 1)
-        """, (page_id, json.dumps(["Dạ chào bạn, inbox page để được tư vấn chi tiết nhé!"])))
+        """, (page_id, json.dumps(["Dạ chào bạn, inbox page để được tư vấn chi tiết nhé!"], ensure_ascii=False)))
     conn.close()
+
 
 def get_all_pages() -> List[Dict[str, Any]]:
     conn = get_connection()
@@ -128,6 +173,7 @@ def get_all_pages() -> List[Dict[str, Any]]:
     conn.close()
     return rows
 
+
 def get_page(page_id: str) -> Optional[Dict[str, Any]]:
     conn = get_connection()
     cursor = conn.cursor()
@@ -144,6 +190,7 @@ def get_page(page_id: str) -> Optional[Dict[str, Any]]:
     row = cursor.fetchone()
     conn.close()
     return dict(row) if row else None
+
 
 def get_page_with_decrypted_token(page_id: str) -> Optional[Dict[str, Any]]:
     """Strictly for internal worker execution; decrypts token for Meta API call."""
@@ -163,6 +210,7 @@ def get_page_with_decrypted_token(page_id: str) -> Optional[Dict[str, Any]]:
     res["page_access_token"] = crypto.decrypt_token(res.get("page_access_token_enc", ""))
     return res
 
+
 def update_page_status(page_id: str, is_active: bool, token_status: str, status_note: Optional[str] = None):
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
@@ -172,10 +220,59 @@ def update_page_status(page_id: str, is_active: bool, token_status: str, status_
             SET is_active = ?, token_status = ?, status_note = ?, updated_at = ?
             WHERE page_id = ?
         """, (1 if is_active else 0, token_status, status_note, now, page_id))
+        if not is_active and token_status in ("EXPIRED", "MISSING_PERMISSIONS"):
+            # Pause all pending tasks of this page so they don't keep failing
+            conn.execute("""
+                UPDATE tasks
+                SET status = 'PAUSED',
+                    error_message = COALESCE(?, 'Tạm dừng do Token của Page hết hạn hoặc thiếu quyền'),
+                    updated_at = ?
+                WHERE page_id = ? AND status = 'PENDING'
+            """, (status_note, now, page_id))
     conn.close()
 
-def update_page_rule(page_id: str, delay_minutes: int, templates: List[str], max_comments_per_day: int, is_enabled: bool):
+
+def update_page_api_usage(page_id: str, usage_pct: float):
     conn = get_connection()
+    with conn:
+        conn.execute("""
+            UPDATE pages SET api_usage_percent = ? WHERE page_id = ?
+        """, (float(usage_pct), page_id))
+    conn.close()
+
+
+def resume_paused_tasks_for_page(page_id: str) -> int:
+    """Resumes PAUSED tasks for a page back to PENDING, shifting overdue times to now."""
+    conn = get_connection()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE tasks
+            SET status = 'PENDING',
+                scheduled_at = (CASE WHEN scheduled_at < ? THEN ? ELSE scheduled_at END),
+                error_message = NULL,
+                updated_at = ?
+            WHERE page_id = ? AND status = 'PAUSED'
+        """, (now_iso, now_iso, now_iso, page_id))
+        count = cursor.rowcount
+    conn.close()
+    return count
+
+
+def update_page_rule(
+    page_id: str,
+    delay_minutes: int,
+    templates: List[str],
+    max_comments_per_day: int = 20,
+    is_enabled: bool = True,
+    conn: Optional[sqlite3.Connection] = None
+):
+    should_close = False
+    if conn is None:
+        conn = get_connection()
+        should_close = True
+
     now = datetime.now(timezone.utc).isoformat()
     with conn:
         conn.execute("""
@@ -188,7 +285,10 @@ def update_page_rule(page_id: str, delay_minutes: int, templates: List[str], max
                 is_enabled = excluded.is_enabled,
                 updated_at = excluded.updated_at
         """, (page_id, delay_minutes, json.dumps(templates, ensure_ascii=False), max_comments_per_day, 1 if is_enabled else 0, now))
-    conn.close()
+
+    if should_close:
+        conn.close()
+
 
 def create_task(
     page_id: str,
@@ -209,7 +309,7 @@ def create_task(
         if source == "AUTO":
             dedupe_key = f"auto:{page_id}:{post_id}"
         else:
-            bid = batch_id or datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+            bid = batch_id or datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
             dedupe_key = f"manual:{bid}:{post_id}"
 
     conn = get_connection()
@@ -221,10 +321,10 @@ def create_task(
             """, (page_id, post_id, dedupe_key, source, batch_id, comment_content, scheduled_at, post_created_time))
         return True
     except sqlite3.IntegrityError:
-        # Task already exists with this dedupe_key
         return False
     finally:
         conn.close()
+
 
 def get_due_tasks(limit: int = 10) -> List[Dict[str, Any]]:
     conn = get_connection()
@@ -248,6 +348,7 @@ def get_due_tasks(limit: int = 10) -> List[Dict[str, Any]]:
     conn.close()
     return rows
 
+
 def lock_task_for_sending(task_id: int) -> bool:
     conn = get_connection()
     with conn:
@@ -262,6 +363,7 @@ def lock_task_for_sending(task_id: int) -> bool:
     conn.close()
     return affected
 
+
 def update_task_result(task_id: int, status: str, comment_id: Optional[str] = None, error_message: Optional[str] = None):
     conn = get_connection()
     now_utc = datetime.now(timezone.utc).isoformat()
@@ -275,7 +377,6 @@ def update_task_result(task_id: int, status: str, comment_id: Optional[str] = No
         """, (status, comment_id, error_message, now_utc, status, task_id))
 
         if status == "SUCCESS":
-            # Update Page stats: last_comment_at, comments_today_count
             cursor.execute("SELECT page_id FROM tasks WHERE id = ?", (task_id,))
             t_row = cursor.fetchone()
             if t_row:
@@ -290,6 +391,7 @@ def update_task_result(task_id: int, status: str, comment_id: Optional[str] = No
                 """, (now_utc, today_str, today_str, pid))
     conn.close()
 
+
 def cancel_task(task_id: int) -> bool:
     conn = get_connection()
     with conn:
@@ -301,6 +403,52 @@ def cancel_task(task_id: int) -> bool:
         success = cursor.rowcount > 0
     conn.close()
     return success
+
+
+def retry_task(task_id: int) -> bool:
+    """
+    Safely resets a task back to PENDING only if it is currently in
+    FAILED, NEED_CHECK, PAUSED, or CANCELLED status.
+    Never retries a task that is already SUCCESS or SENDING!
+    """
+    conn = get_connection()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE tasks
+            SET status = 'PENDING',
+                scheduled_at = ?,
+                retry_count = 0,
+                locked_at = NULL,
+                error_message = NULL,
+                updated_at = ?
+            WHERE id = ? AND status IN ('FAILED', 'NEED_CHECK', 'PAUSED', 'CANCELLED')
+        """, (now_iso, now_iso, task_id))
+        success = cursor.rowcount > 0
+    conn.close()
+    return success
+
+
+def resolve_task(task_id: int, comment_id: Optional[str] = None) -> bool:
+    """
+    Manually marks a NEED_CHECK / FAILED / PAUSED task as SUCCESS after operator verification.
+    """
+    conn = get_connection()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE tasks
+            SET status = 'SUCCESS',
+                comment_id = ?,
+                updated_at = ?
+            WHERE id = ? AND status IN ('NEED_CHECK', 'FAILED', 'PAUSED')
+        """, (comment_id or "MANUAL_VERIFIED", now_iso, task_id))
+        success = cursor.rowcount > 0
+    conn.close()
+    return success
+
 
 def get_all_tasks(page_id: Optional[str] = None, status: Optional[str] = None, source: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
     conn = get_connection()

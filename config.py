@@ -20,6 +20,12 @@ META_APP_ID = os.getenv("META_APP_ID", "").strip()
 META_APP_SECRET = os.getenv("META_APP_SECRET", "").strip()
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v19.0").strip()
 
+
+def has_app_credentials() -> bool:
+    """Returns True if both META_APP_ID and META_APP_SECRET are configured."""
+    return bool(META_APP_ID and META_APP_SECRET)
+
+
 # 2. Encryption Key for Tokens
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "").strip()
 if not ENCRYPTION_KEY:

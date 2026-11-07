@@ -6,7 +6,16 @@ import httpx
 from typing import Dict, Any, List, Optional, Tuple
 
 import database as db
-import spintax
+
+PAGE_ID_COLS = {"page id", "page_id", "id page"}
+COMMENT_TPL_COLS = {"mẫu bình luận", "mau binh luan", "comment", "template"}
+PAGE_CONFIG_COLS = {
+    "delay (phút)", "delay", "thời gian chờ",
+    "bật tự động", "bật/tắt", "enabled",
+    "tên gợi nhớ", "page name", "page_name", "tên page",
+    "giới hạn comment/ngày", "giới hạn", "max_comments_per_day"
+}
+
 
 def extract_sheet_id(url_or_id: str) -> Optional[str]:
     url_or_id = url_or_id.strip()
@@ -16,6 +25,7 @@ def extract_sheet_id(url_or_id: str) -> Optional[str]:
     if re.match(r'^[a-zA-Z0-9-_]{20,}$', url_or_id):
         return url_or_id
     return None
+
 
 def fetch_sheet_csv(sheet_id: str, tab_name: str) -> Tuple[List[Dict[str, str]], Optional[str]]:
     """
@@ -32,7 +42,7 @@ def fetch_sheet_csv(sheet_id: str, tab_name: str) -> Tuple[List[Dict[str, str]],
             content = resp.text
             # If Google redirected to HTML login page
             if "<html" in content.lower() or "google.com/accounts" in content.lower():
-                return [], "Google Sheet chưa được cấp quyền công khai. Vui lòng chọn 'Bất kỳ ai có đường liên kết đều có thể xem'."
+                return [], "Google Sheet chưa được cấp quyền chia sẻ. Vui lòng chọn 'Bất kỳ ai có đường liên kết đều có thể xem'."
 
             f = io.StringIO(content)
             reader = csv.DictReader(f)
@@ -41,24 +51,28 @@ def fetch_sheet_csv(sheet_id: str, tab_name: str) -> Tuple[List[Dict[str, str]],
 
             rows = []
             for row in reader:
-                normalized_row = {k.strip().lower(): v.strip() for k, v in row.items() if k}
+                normalized_row = {k.strip().lower(): (v.strip() if v else "") for k, v in row.items() if k}
                 rows.append(normalized_row)
             return rows, None
     except Exception as e:
         return [], f"Lỗi kết nối khi tải tab '{tab_name}': {str(e)}"
 
+
 def validate_page_id(pid_str: str) -> Tuple[Optional[str], Optional[str]]:
     """Validates Page ID string, rejecting scientific notation and non-digits."""
     pid = pid_str.strip().strip("'")
     if "e+" in pid.lower() or "e-" in pid.lower():
-        return None, f"Page ID '{pid}' bị lỗi định dạng hàm mũ (E+). Hãy thêm dấu nháy đơn ' ở đầu ID trong Sheet để định dạng Văn bản thuần."
-    clean_digits = re.sub(r'[^0-9]', '', pid)
-    if len(clean_digits) < 5 or len(clean_digits) > 30:
-        return None, f"Page ID '{pid}' không hợp lệ (phải là dãy 5-30 chữ số)."
-    return clean_digits, None
+        return None, (
+            f"Page ID '{pid}' bị lỗi định dạng hàm mũ (E+). "
+            f"Hãy thêm dấu nháy đơn ' ở đầu ID trong Sheet để định dạng Văn bản thuần."
+        )
+    if not re.match(r'^[0-9]{5,30}$', pid):
+        return None, f"Page ID '{pid}' không hợp lệ (phải là dãy 5-30 chữ số nguyên vẹn)."
+    return pid, None
+
 
 def validate_spintax_braces(text: str) -> bool:
-    """Checks if curly braces { and } are properly balanced."""
+    """Checks if curly braces { and } are properly balanced and non-empty."""
     depth = 0
     for ch in text:
         if ch == '{':
@@ -67,11 +81,43 @@ def validate_spintax_braces(text: str) -> bool:
             depth -= 1
             if depth < 0:
                 return False
-    return depth == 0
+    if depth != 0:
+        return False
+    if "{}" in text:
+        return False
+    return True
+
+
+def _check_pages_headers(rows: List[Dict[str, str]]) -> Optional[str]:
+    if not rows:
+        return None
+    headers = set(rows[0].keys())
+    if not (headers & PAGE_ID_COLS):
+        return "Tab 'Pages' thiếu cột bắt buộc 'Page ID'."
+    if headers & COMMENT_TPL_COLS and not (headers & {"delay (phút)", "delay", "thời gian chờ"}):
+        return "Không tìm thấy tab 'Pages' (Google trả về nhầm tab 'Comments'). Hãy kiểm tra lại tên tab 'Pages'."
+    if not (headers & PAGE_CONFIG_COLS):
+        return "Tab 'Pages' thiếu các cột cấu hình ('Delay (phút)', 'Bật tự động', ...)."
+    return None
+
+
+def _check_comments_headers(rows: List[Dict[str, str]]) -> Optional[str]:
+    if not rows:
+        return None
+    headers = set(rows[0].keys())
+    if not (headers & PAGE_ID_COLS):
+        return "Tab 'Comments' thiếu cột bắt buộc 'Page ID'."
+    if not (headers & COMMENT_TPL_COLS):
+        return (
+            "Không tìm thấy tab 'Comments' hợp lệ hoặc thiếu cột 'Mẫu bình luận' "
+            "(Google có thể đã trả về nhầm tab đầu tiên do sai tên tab)."
+        )
+    return None
+
 
 def sync_from_google_sheet(sheet_url_or_id: str) -> Dict[str, Any]:
     """
-    Synchronizes Pages and Comments from Google Sheet into local database.
+    Synchronizes Pages and Comments from Google Sheet into local database inside a single transaction.
     Does NOT require tokens in the Google Sheet (tokens are managed securely in tool).
     """
     sheet_id = extract_sheet_id(sheet_url_or_id)
@@ -84,24 +130,40 @@ def sync_from_google_sheet(sheet_url_or_id: str) -> Dict[str, Any]:
     # 1. Fetch Pages tab
     pages_rows, err_pages = fetch_sheet_csv(sheet_id, "Pages")
     if err_pages:
-        # Try fallback name
         pages_rows, err_pages2 = fetch_sheet_csv(sheet_id, "Danh_Sach_Page")
         if err_pages2:
             return {"success": False, "error": err_pages}
 
+    if not pages_rows:
+        return {"success": False, "error": "Tab 'Pages' rỗng, hệ thống giữ nguyên cấu hình cũ để an toàn."}
+
+    header_err_pages = _check_pages_headers(pages_rows)
+    if header_err_pages:
+        return {"success": False, "error": header_err_pages}
+
     # 2. Fetch Comments tab
     comments_rows, err_comments = fetch_sheet_csv(sheet_id, "Comments")
     if err_comments:
-        comments_rows, _ = fetch_sheet_csv(sheet_id, "Mau_Binh_Luan")
+        comments_rows, err_comments2 = fetch_sheet_csv(sheet_id, "Mau_Binh_Luan")
+        if err_comments2:
+            return {"success": False, "error": err_comments}
+
+    if comments_rows:
+        header_err_comments = _check_comments_headers(comments_rows)
+        if header_err_comments:
+            return {"success": False, "error": header_err_comments}
 
     # Group comments by page_id
     comments_by_page: Dict[str, List[str]] = {}
     for idx, r in enumerate(comments_rows or [], start=2):
         pid_raw = r.get("page id") or r.get("page_id") or r.get("id page") or ""
         tpl = r.get("mẫu bình luận") or r.get("mau binh luan") or r.get("comment") or r.get("template") or ""
-        is_active_tpl = str(r.get("bật") or r.get("is_enabled") or "true").lower() in ["true", "1", "bật", "yes"]
+        is_active_tpl = str(r.get("bật") or r.get("is_enabled") or "true").lower() in ["true", "1", "bật", "yes", "ok"]
 
+        if not pid_raw and not tpl:
+            continue
         if not pid_raw or not tpl:
+            errors.append(f"Tab Comments dòng {idx}: Thiếu Page ID hoặc Mẫu bình luận.")
             continue
 
         clean_pid, pid_err = validate_page_id(str(pid_raw))
@@ -120,8 +182,8 @@ def sync_from_google_sheet(sheet_url_or_id: str) -> Dict[str, Any]:
 
     # Fetch currently connected pages in DB
     existing_pages_map = {p["page_id"]: p for p in db.get_all_pages()}
-    synced_count = 0
     seen_sheet_pids = set()
+    updates_to_apply: List[Tuple[str, int, List[str], int, bool]] = []
 
     for idx, r in enumerate(pages_rows, start=2):
         pid_raw = r.get("page id") or r.get("page_id") or r.get("id page") or ""
@@ -135,35 +197,39 @@ def sync_from_google_sheet(sheet_url_or_id: str) -> Dict[str, Any]:
 
         seen_sheet_pids.add(clean_pid)
 
-        # Check if Page is already connected in Tool
         if clean_pid not in existing_pages_map:
-            warnings.append(f"Page ID '{clean_pid}' (dòng {idx}) có trên Sheet nhưng chưa được kết nối trong Tool. Hãy bấm 'Kết nối Nick' để nạp token trước.")
+            warnings.append(
+                f"Page ID '{clean_pid}' (dòng {idx}) có trên Sheet nhưng chưa được kết nối trong Tool. "
+                f"Hãy bấm 'Kết nối Nick' để nạp token trước."
+            )
             continue
 
-        # Parse delay minutes
-        delay_raw = r.get("delay (phút)") or r.get("delay") or r.get("thời gian chờ") or "10"
-        try:
-            delay_minutes = int(re.sub(r'[^0-9]', '', str(delay_raw)))
-            if delay_minutes < 1 or delay_minutes > 1440:
-                errors.append(f"Tab Pages dòng {idx}: Số phút delay phải từ 1 đến 1440.")
-                continue
-        except Exception:
-            delay_minutes = 10
+        # Parse delay minutes strictly
+        delay_raw = (r.get("delay (phút)") or r.get("delay") or r.get("thời gian chờ") or "10").strip()
+        if not re.match(r'^[0-9]+$', str(delay_raw)):
+            errors.append(f"Tab Pages dòng {idx}: Giá trị Delay '{delay_raw}' không phải là số nguyên hợp lệ.")
+            continue
+        delay_minutes = int(delay_raw)
+        if delay_minutes < 1 or delay_minutes > 1440:
+            errors.append(f"Tab Pages dòng {idx}: Số phút delay ({delay_minutes}) phải từ 1 đến 1440.")
+            continue
 
-        # Parse max comments per day
-        limit_raw = r.get("giới hạn comment/ngày") or r.get("giới hạn") or r.get("max_comments_per_day") or "20"
-        try:
-            max_per_day = int(re.sub(r'[^0-9]', '', str(limit_raw)))
-        except Exception:
-            max_per_day = 20
+        # Parse max comments per day strictly
+        limit_raw = (r.get("giới hạn comment/ngày") or r.get("giới hạn") or r.get("max_comments_per_day") or "20").strip()
+        if not re.match(r'^[0-9]+$', str(limit_raw)):
+            errors.append(f"Tab Pages dòng {idx}: Giá trị Giới hạn/ngày '{limit_raw}' không hợp lệ.")
+            continue
+        max_per_day = int(limit_raw)
+        if max_per_day < 1 or max_per_day > 1000:
+            errors.append(f"Tab Pages dòng {idx}: Giới hạn comment/ngày ({max_per_day}) phải từ 1 đến 1000.")
+            continue
 
         # Parse is_enabled
-        enabled_val = str(r.get("bật tự động") or r.get("bật/tắt") or r.get("enabled") or "true").lower()
+        enabled_val = str(r.get("bật tự động") or r.get("bật/tắt") or r.get("enabled") or "true").strip().lower()
         is_enabled = enabled_val in ["true", "1", "bật", "yes", "ok"]
 
         templates = comments_by_page.get(clean_pid, [])
         if not templates:
-            # Keep existing templates if Sheet doesn't specify any for this page
             try:
                 curr = existing_pages_map[clean_pid].get("templates")
                 templates = json.loads(curr) if curr else []
@@ -172,34 +238,47 @@ def sync_from_google_sheet(sheet_url_or_id: str) -> Dict[str, Any]:
             if not templates:
                 templates = ["Dạ chào bạn, inbox page để được tư vấn chi tiết nhé!"]
 
-        # Update rule in DB
-        db.update_page_rule(
-            page_id=clean_pid,
-            delay_minutes=delay_minutes,
-            templates=templates,
-            max_comments_per_day=max_per_day,
-            is_enabled=is_enabled
-        )
-        synced_count += 1
+        updates_to_apply.append((clean_pid, delay_minutes, templates, max_per_day, is_enabled))
 
-    # Soft-disable any previously active pages that were removed from the Sheet
+    # Apply all updates inside a single DB transaction
+    synced_count = 0
     disabled_count = 0
-    if seen_sheet_pids:
-        for pid, pdata in existing_pages_map.items():
-            if pid not in seen_sheet_pids and pdata.get("rule_enabled") == 1:
-                # Turn off rule
+    conn = db.get_connection()
+    try:
+        with conn:
+            for (clean_pid, delay_minutes, templates, max_per_day, is_enabled) in updates_to_apply:
                 db.update_page_rule(
-                    page_id=pid,
-                    delay_minutes=pdata.get("delay_minutes", 10),
-                    templates=json.loads(pdata.get("templates") or "[]"),
-                    max_comments_per_day=pdata.get("max_comments_per_day", 20),
-                    is_enabled=False
+                    page_id=clean_pid,
+                    delay_minutes=delay_minutes,
+                    templates=templates,
+                    max_comments_per_day=max_per_day,
+                    is_enabled=is_enabled,
+                    conn=conn
                 )
-                disabled_count += 1
+                synced_count += 1
+
+            # Soft-disable any previously active pages that were removed from the Sheet
+            # Only do this if there were no row-level parsing errors on the Pages tab
+            if seen_sheet_pids and not errors:
+                for pid, pdata in existing_pages_map.items():
+                    if pid not in seen_sheet_pids and pdata.get("rule_enabled") == 1:
+                        db.update_page_rule(
+                            page_id=pid,
+                            delay_minutes=pdata.get("delay_minutes", 10),
+                            templates=json.loads(pdata.get("templates") or "[]"),
+                            max_comments_per_day=pdata.get("max_comments_per_day", 20),
+                            is_enabled=False,
+                            conn=conn
+                        )
+                        disabled_count += 1
+    finally:
+        conn.close()
 
     msg = f"Đã đồng bộ thành công {synced_count} Fanpage từ Google Sheet."
     if disabled_count > 0:
         msg += f" Đã tạm dừng {disabled_count} Page không còn nằm trong Sheet."
+    if errors:
+        msg += f" Phát hiện {len(errors)} dòng lỗi cần kiểm tra."
 
     return {
         "success": True,

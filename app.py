@@ -13,9 +13,10 @@ import scheduler
 import sheets_sync
 import spintax
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initialize DB schema & recovery
+    # Initialize DB schema & startup recovery
     db.init_db()
     # Start 3 background loops
     task1 = asyncio.create_task(scheduler.loop_post_scanner())
@@ -26,21 +27,26 @@ async def lifespan(app: FastAPI):
     task2.cancel()
     task3.cancel()
 
+
 app = FastAPI(title="Facebook Page Multi-Account Commenter Hub", lifespan=lifespan)
+
 
 # --- Pydantic Request Models ---
 class ConnectAccountRequest(BaseModel):
     account_name: str
     user_access_token: str
 
+
 class SyncSheetRequest(BaseModel):
     sheet_url: str
+
 
 class UpdateRuleRequest(BaseModel):
     delay_minutes: int
     templates: List[str]
     max_comments_per_day: int = 20
     is_enabled: bool
+
 
 class ManualTaskRequest(BaseModel):
     page_id: str
@@ -50,8 +56,14 @@ class ManualTaskRequest(BaseModel):
     scheduled_at: Optional[str] = None
     batch_id: Optional[str] = None
 
+
+class SpintaxPreviewRequest(BaseModel):
+    content: str
+
+
 class ResolveTaskRequest(BaseModel):
     comment_id: Optional[str] = None
+
 
 # --- REST API Endpoints ---
 
@@ -72,19 +84,34 @@ def get_metrics():
         "metrics": scheduler.SCHEDULER_METRICS,
         "task_counts": counts,
         "total_pages": len(pages),
-        "active_pages": sum(1 for p in pages if p.get("is_active") and p.get("rule_enabled"))
+        "active_pages": sum(1 for p in pages if p.get("is_active") and p.get("rule_enabled")),
+        "has_app_credentials": config.has_app_credentials()
     }
+
 
 @app.post("/api/system/toggle_pause")
 def toggle_pause():
     scheduler.SCHEDULER_METRICS["paused_all"] = not scheduler.SCHEDULER_METRICS["paused_all"]
     state = "TẠM DỪNG" if scheduler.SCHEDULER_METRICS["paused_all"] else "ĐANG CHẠY"
-    return {"success": True, "paused": scheduler.SCHEDULER_METRICS["paused_all"], "message": f"Hệ thống hiện {state}"}
+    return {
+        "success": True,
+        "paused": scheduler.SCHEDULER_METRICS["paused_all"],
+        "message": f"Hệ thống hiện {state}"
+    }
+
+
+@app.post("/api/sync")
+def trigger_manual_sync():
+    scheduler.detect_new_posts_and_schedule()
+    scheduler.execute_due_tasks()
+    return {"success": True, "message": "Đã quét bài mới và thực thi các tác vụ đến hạn."}
+
 
 @app.get("/api/pages")
 def list_pages():
     pages = db.get_all_pages()
     return {"pages": pages}
+
 
 @app.get("/api/pages/{page_id}/recent_posts")
 def get_page_posts(page_id: str):
@@ -100,6 +127,16 @@ def get_page_posts(page_id: str):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Không thể tải bài viết: {str(e)}")
 
+
+@app.post("/api/pages/{page_id}/resume_tasks")
+def resume_page_tasks(page_id: str):
+    page = db.get_page(page_id)
+    if not page:
+        raise HTTPException(status_code=404, detail="Không tìm thấy Page")
+    resumed = db.resume_paused_tasks_for_page(page_id)
+    return {"success": True, "resumed_count": resumed, "message": f"Đã khôi phục {resumed} tác vụ tạm dừng về hàng đợi."}
+
+
 @app.post("/api/accounts/connect")
 def connect_account(req: ConnectAccountRequest):
     """
@@ -110,16 +147,27 @@ def connect_account(req: ConnectAccountRequest):
     if not token:
         raise HTTPException(status_code=400, detail="Vui lòng nhập Access Token")
 
+    warnings: List[str] = []
+
     # 1. Exchange for long-lived token
-    try:
-        long_lived_token, _ = meta_client.exchange_for_long_lived_user_token(token)
-    except Exception:
+    if not config.has_app_credentials():
         long_lived_token = token
+        warnings.append(
+            "Chưa cấu hình META_APP_ID và META_APP_SECRET trong file .env — "
+            "Token chưa được đổi sang dài hạn, có thể hết hạn sau 1–2 giờ."
+        )
+    else:
+        try:
+            long_lived_token, _ = meta_client.exchange_for_long_lived_user_token(token)
+        except meta_client.MetaAPIError as e:
+            raise HTTPException(status_code=400, detail=f"Không thể đổi sang Token dài hạn: {e.message}")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Lỗi khi đổi sang Token dài hạn: {str(e)}")
 
     # 2. Get User Info
     try:
         user_info = meta_client.get_user_info(long_lived_token)
-        user_id = str(user_info.get("id"))
+        user_id = str(user_info.get("id")) if user_info.get("id") else None
     except Exception:
         user_id = None
 
@@ -132,50 +180,91 @@ def connect_account(req: ConnectAccountRequest):
         raise HTTPException(status_code=500, detail=f"Không thể kết nối Meta API: {str(e)}")
 
     if not pages:
-        return {"success": True, "message": "Không tìm thấy Page nào do tài khoản này quản lý.", "pages_added": 0}
+        return {
+            "success": True,
+            "message": "Không tìm thấy Page nào do tài khoản này quản lý.",
+            "pages_added": 0,
+            "warnings": warnings
+        }
 
     # Upsert account record
-    acc_id = db.upsert_account(account_name=req.account_name, user_id=user_id, long_lived_user_token=long_lived_token)
+    acc_id = db.upsert_account(
+        account_name=req.account_name,
+        user_id=user_id,
+        long_lived_user_token=long_lived_token
+    )
 
     added = 0
-    warnings = []
     for p in pages:
         page_id = str(p.get("id"))
         page_name = p.get("name")
         page_token = p.get("access_token")
         if page_id and page_token:
-            # Debug page token scopes
             info = meta_client.debug_token(page_token)
+            if info.get("checked") is True:
+                t_status = info.get("status", "OK")
+                missing_scopes = info.get("missing_scopes", [])
+                expires_at = info.get("expires_at")
+            else:
+                t_status = "OK"
+                missing_scopes = []
+                expires_at = None
+
+            status_note = f"Thiếu quyền: {', '.join(missing_scopes)}" if missing_scopes else None
             db.upsert_page(
                 page_id=page_id,
                 page_name=page_name,
                 page_access_token=page_token,
                 account_id=acc_id,
-                token_status=info.get("status", "OK"),
-                missing_permissions=info.get("missing_scopes", []),
-                expires_at=info.get("expires_at")
+                token_status=t_status,
+                missing_permissions=missing_scopes,
+                expires_at=expires_at,
+                status_note=status_note
             )
-            if info.get("missing_scopes"):
-                warnings.append(f"Page '{page_name}' thiếu quyền: {', '.join(info['missing_scopes'])}")
+            if missing_scopes:
+                warnings.append(f"Page '{page_name}' thiếu quyền: {', '.join(missing_scopes)}")
             added += 1
 
     msg = f"Đã kết nối thành công tài khoản '{req.account_name}' và nạp {added} Fanpage."
     return {"success": True, "message": msg, "pages_added": added, "warnings": warnings}
+
 
 @app.post("/api/sheets/sync")
 def sync_google_sheet(req: SyncSheetRequest):
     result = sheets_sync.sync_from_google_sheet(req.sheet_url)
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error", "Lỗi đồng bộ Google Sheet"))
+    # Save URL for periodic auto-sync
+    scheduler.SCHEDULER_METRICS["sheet_sync"]["sheet_url"] = req.sheet_url.strip()
+    scheduler.SCHEDULER_METRICS["sheet_sync"]["last_run"] = datetime.now(timezone.utc).isoformat()
+    scheduler.SCHEDULER_METRICS["sheet_sync"]["last_error"] = None
     return result
+
 
 @app.post("/api/pages/{page_id}/rule")
 def update_rule(page_id: str, req: UpdateRuleRequest):
     page = db.get_page(page_id)
     if not page:
         raise HTTPException(status_code=404, detail="Không tìm thấy Page")
+    for idx, tpl in enumerate(req.templates, start=1):
+        if not sheets_sync.validate_spintax_braces(tpl):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Mẫu bình luận dòng {idx} bị lỗi đóng/mở ngoặc nhọn Spintax '{{...}}'."
+            )
     db.update_page_rule(page_id, req.delay_minutes, req.templates, req.max_comments_per_day, req.is_enabled)
     return {"success": True, "message": "Đã cập nhật kịch bản bình luận thành công"}
+
+
+@app.post("/api/spintax/preview")
+def preview_spintax(req: SpintaxPreviewRequest):
+    raw = req.content.strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Vui lòng nhập nội dung cần xem trước")
+    if not sheets_sync.validate_spintax_braces(raw):
+        raise HTTPException(status_code=400, detail="Cú pháp Spintax bị lỗi đóng/mở ngoặc nhọn '{...}'")
+    return {"success": True, "preview": spintax.spin(raw)}
+
 
 @app.post("/api/tasks/manual")
 def create_manual_task(req: ManualTaskRequest):
@@ -183,6 +272,12 @@ def create_manual_task(req: ManualTaskRequest):
     if not page:
         raise HTTPException(status_code=404, detail="Không tìm thấy Page")
     token = page.get("page_access_token", "")
+
+    raw_content = req.content.strip()
+    if not raw_content:
+        raise HTTPException(status_code=400, detail="Nội dung bình luận không được để trống")
+    if not sheets_sync.validate_spintax_braces(raw_content):
+        raise HTTPException(status_code=400, detail="Nội dung bình luận bị lỗi đóng/mở ngoặc nhọn Spintax '{...}'")
 
     # 1. Verify post belongs to this page
     try:
@@ -194,7 +289,7 @@ def create_manual_task(req: ManualTaskRequest):
         raise HTTPException(status_code=400, detail=f"Lỗi kiểm tra bài viết: {str(e)}")
 
     # 2. Spin content immediately so user gets consistent output
-    spun_content = spintax.spin(req.content)
+    spun_content = spintax.spin(raw_content)
 
     # 3. Calculate target time
     if req.post_now:
@@ -204,7 +299,7 @@ def create_manual_task(req: ManualTaskRequest):
             raise HTTPException(status_code=400, detail="Vui lòng chọn thời gian hẹn giờ")
         sched_time = req.scheduled_at
 
-    batch_id = req.batch_id or datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    batch_id = (req.batch_id or "").strip() or datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     success = db.create_task(
         page_id=req.page_id,
         post_id=verified_post_id,
@@ -218,31 +313,50 @@ def create_manual_task(req: ManualTaskRequest):
 
     return {"success": True, "message": "Đã tạo tác vụ bình luận thành công!", "content_preview": spun_content}
 
+
 @app.get("/api/tasks")
-def list_tasks(page_id: Optional[str] = None, status: Optional[str] = None, source: Optional[str] = None, limit: int = 50):
+def list_tasks(
+    page_id: Optional[str] = None,
+    status: Optional[str] = None,
+    source: Optional[str] = None,
+    limit: int = 50
+):
     tasks = db.get_all_tasks(page_id=page_id, status=status, source=source, limit=limit)
     return {"tasks": tasks}
+
 
 @app.post("/api/tasks/{task_id}/cancel")
 def cancel_task(task_id: int):
     success = db.cancel_task(task_id)
     if not success:
-        raise HTTPException(status_code=400, detail="Không thể hủy tác vụ (chỉ hủy được khi trạng thái là Chờ lịch hoặc Tạm dừng).")
+        raise HTTPException(
+            status_code=400,
+            detail="Không thể hủy tác vụ (chỉ hủy được khi trạng thái là Chờ lịch hoặc Tạm dừng)."
+        )
     return {"success": True, "message": "Đã hủy tác vụ thành công"}
+
 
 @app.post("/api/tasks/{task_id}/retry")
 def retry_task(task_id: int):
-    conn = db.get_connection()
-    with conn:
-        conn.execute("UPDATE tasks SET status = 'PENDING', scheduled_at = ?, retry_count = 0 WHERE id = ?",
-                     (datetime.now(timezone.utc).isoformat(), task_id))
-    conn.close()
+    success = db.retry_task(task_id)
+    if not success:
+        raise HTTPException(
+            status_code=400,
+            detail="Không thể gửi lại tác vụ này (chỉ gửi lại được tác vụ Lỗi, Cần kiểm tra, Tạm dừng hoặc Đã hủy; không gửi lại tác vụ Đã đăng hoặc Đang gửi)."
+        )
     return {"success": True, "message": "Đã dời tác vụ về trạng thái Chờ gửi ngay"}
+
 
 @app.post("/api/tasks/{task_id}/resolve")
 def resolve_task(task_id: int, req: ResolveTaskRequest):
-    db.update_task_result(task_id=task_id, status="SUCCESS", comment_id=req.comment_id or "MANUAL_VERIFIED")
+    success = db.resolve_task(task_id=task_id, comment_id=req.comment_id)
+    if not success:
+        raise HTTPException(
+            status_code=400,
+            detail="Không thể đánh dấu tác vụ này (chỉ áp dụng cho tác vụ Cần kiểm tra, Lỗi hoặc Tạm dừng)."
+        )
     return {"success": True, "message": "Đã đánh dấu tác vụ thành công"}
+
 
 # --- Embedded Web Dashboard UI ---
 @app.get("/", response_class=HTMLResponse)
@@ -278,6 +392,7 @@ def index():
         <div class="container">
             <a class="navbar-brand" href="#"><i class="fa-brands fa-facebook"></i> Page Auto Commenter Hub</a>
             <div class="d-flex align-items-center gap-2">
+                <button class="btn btn-sm btn-outline-primary" onclick="triggerManualSync()"><i class="fa-solid fa-rotate"></i> Quét & Chạy ngay</button>
                 <span id="systemStatusBadge" class="badge bg-success py-2 px-3"><i class="fa-solid fa-circle-check"></i> Hệ thống đang chạy</span>
                 <button id="pauseBtn" class="btn btn-sm btn-outline-warning" onclick="togglePause()"><i class="fa-solid fa-pause"></i> Tạm dừng khẩn cấp</button>
             </div>
@@ -285,6 +400,13 @@ def index():
     </nav>
 
     <div class="container my-3">
+        <!-- App Credentials Warning Banner -->
+        <div id="appCredWarning" class="alert alert-warning py-2 mb-3" style="display: none;">
+            <i class="fa-solid fa-triangle-exclamation"></i>
+            <strong>Lưu ý cấu hình:</strong> Bạn chưa điền <code>META_APP_ID</code> và <code>META_APP_SECRET</code> trong file <code>.env</code>.
+            Hãy bổ sung trước khi kết nối Nick thật để tool tự động đổi sang Token dài hạn (~60 ngày / vĩnh viễn cho Page).
+        </div>
+
         <!-- Live Metrics Bar -->
         <div class="row g-2 mb-3">
             <div class="col-md-3">
@@ -327,7 +449,7 @@ def index():
                 <div class="card p-4">
                     <h5 class="fw-bold text-success mb-2"><i class="fa-solid fa-file-excel"></i> Quản lý Cấu hình & Mẫu Comment qua Google Sheet</h5>
                     <p class="text-muted small">
-                        <strong>Bảo mật 100%:</strong> Sheet này <u>KHÔNG</u> chứa Token. Token được quản lý riêng trong tool để đảm bảo an toàn nếu bạn gửi link Sheet cho người khác.
+                        <strong>Bảo mật 100%:</strong> Sheet này <u>KHÔNG</u> chứa Token. Token được quản lý riêng trong tool để đảm bảo an toàn nếu bạn gửi link Sheet cho người khác. Sau khi đồng bộ lần đầu, tool sẽ tự động đồng bộ lại mỗi 5 phút.
                     </p>
                     <div class="input-group mb-3">
                         <span class="input-group-text bg-white"><i class="fa-solid fa-link text-muted"></i></span>
@@ -345,7 +467,7 @@ def index():
                                 <ul class="small mb-0 mt-1">
                                     <li><code>Page ID</code>: ID Page dạng số (nên thêm dấu <code>'</code> ở đầu, vd: <code>'1029384756</code>)</li>
                                     <li><code>Tên gợi nhớ</code>: Tên nhận diện Fanpage</li>
-                                    <li><code>Delay (phút)</code>: Số phút chờ comment sau khi có bài mới</li>
+                                    <li><code>Delay (phút)</code>: Số phút chờ comment sau khi có bài mới (1–1440)</li>
                                     <li><code>Bật tự động</code>: <code>TRUE</code> hoặc <code>FALSE</code></li>
                                     <li><code>Giới hạn comment/ngày</code>: Tối đa số comment/ngày (vd: 20)</li>
                                 </ul>
@@ -457,13 +579,17 @@ def index():
                             </div>
                             <div class="mb-3">
                                 <label class="form-label fw-semibold">Hoặc nhập trực tiếp Post ID / Link bài:</label>
-                                <input type="text" id="manualPostId" class="form-control" placeholder="123456_987654 hoặc https://facebook.com/...">
+                                <input type="text" id="manualPostId" class="form-control" placeholder="123456_987654 hoặc https://facebook.com/..." oninput="resetManualBatchId()">
                             </div>
                         </div>
                         <div class="col-md-7 border-start">
                             <div class="mb-3">
-                                <label class="form-label fw-semibold">3. Nội dung bình luận (hỗ trợ Spintax):</label>
-                                <textarea id="manualContent" class="form-control" rows="3" placeholder="Nhập nội dung..."></textarea>
+                                <div class="d-flex justify-content-between align-items-center mb-1">
+                                    <label class="form-label fw-semibold mb-0">3. Nội dung bình luận (hỗ trợ Spintax):</label>
+                                    <button type="button" class="btn btn-sm btn-outline-secondary" onclick="previewManualSpintax()"><i class="fa-solid fa-dice"></i> Xem thử & Quay lại</button>
+                                </div>
+                                <textarea id="manualContent" class="form-control" rows="3" placeholder="Nhập nội dung..." oninput="resetManualBatchId()"></textarea>
+                                <div id="spintaxPreviewBox" class="alert alert-secondary py-2 px-3 mt-2 small" style="display:none;"></div>
                             </div>
                             <div class="mb-3">
                                 <div class="form-check form-check-inline">
@@ -491,10 +617,14 @@ def index():
                     <div class="d-flex justify-content-between align-items-center mb-3">
                         <h5 class="fw-bold mb-0"><i class="fa-solid fa-list-ol text-primary"></i> Hàng đợi & Lịch sử Tác vụ</h5>
                         <div class="d-flex gap-2">
+                            <select id="filterPage" class="form-select form-select-sm" onchange="loadTasks()">
+                                <option value="">Tất cả Fanpage</option>
+                            </select>
                             <select id="filterStatus" class="form-select form-select-sm" onchange="loadTasks()">
                                 <option value="">Tất cả trạng thái</option>
                                 <option value="NEED_CHECK">Cần kiểm tra (Ưu tiên)</option>
                                 <option value="PENDING">Chờ lịch</option>
+                                <option value="PAUSED">Tạm dừng</option>
                                 <option value="SUCCESS">Đã đăng thành công</option>
                                 <option value="FAILED">Thất bại</option>
                             </select>
@@ -527,11 +657,23 @@ def index():
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
         let cachedPages = [];
+        let currentManualBatchId = generateBatchId();
+
+        function generateBatchId() {
+            return 'b_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
+        }
+
+        function resetManualBatchId() {
+            currentManualBatchId = generateBatchId();
+        }
 
         function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text || '';
-            return div.innerHTML;
+            return String(text || '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
         }
 
         async function fetchMetrics() {
@@ -542,6 +684,9 @@ def index():
                 document.getElementById('mPending').innerText = data.task_counts?.PENDING || 0;
                 document.getElementById('mSuccess').innerText = data.task_counts?.SUCCESS || 0;
                 document.getElementById('mNeedCheck').innerText = data.task_counts?.NEED_CHECK || 0;
+
+                const credWarn = document.getElementById('appCredWarning');
+                credWarn.style.display = data.has_app_credentials === false ? 'block' : 'none';
 
                 const isPaused = data.metrics?.paused_all;
                 const statusBadge = document.getElementById('systemStatusBadge');
@@ -561,7 +706,15 @@ def index():
         }
 
         async function togglePause() {
-            const res = await fetch('/api/system/toggle_pause', { method: 'POST' });
+            await fetch('/api/system/toggle_pause', { method: 'POST' });
+            fetchMetrics();
+        }
+
+        async function triggerManualSync() {
+            const res = await fetch('/api/sync', { method: 'POST' });
+            const data = await res.json();
+            alert(data.message);
+            loadTasks();
             fetchMetrics();
         }
 
@@ -574,10 +727,12 @@ def index():
             const tbody = document.getElementById('pageTableBody');
             const ruleSelect = document.getElementById('rulePageSelect');
             const manualSelect = document.getElementById('manualPageSelect');
+            const filterPage = document.getElementById('filterPage');
 
             tbody.innerHTML = '';
             ruleSelect.innerHTML = '';
             manualSelect.innerHTML = '';
+            filterPage.innerHTML = '<option value="">Tất cả Fanpage</option>';
 
             if (cachedPages.length === 0) {
                 tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted py-4">Chưa có Page nào. Hãy thêm User Access Token bên trái để nạp Page.</td></tr>';
@@ -588,6 +743,7 @@ def index():
                 let badgeToken = '<span class="badge bg-success">Sẵn sàng (OK)</span>';
                 if (p.token_status === 'EXPIRED') badgeToken = '<span class="badge bg-danger">Hết hạn / Mất quyền</span>';
                 else if (p.token_status === 'MISSING_PERMISSIONS') badgeToken = '<span class="badge bg-warning text-dark">Thiếu quyền Page</span>';
+                else if (p.token_status === 'EXPIRING_SOON') badgeToken = '<span class="badge bg-warning text-dark">Sắp hết hạn</span>';
 
                 const tr = document.createElement('tr');
                 tr.innerHTML = `
@@ -600,6 +756,7 @@ def index():
 
                 ruleSelect.innerHTML += `<option value="${escapeHtml(p.page_id)}">${escapeHtml(p.page_name)} (${escapeHtml(p.page_id)})</option>`;
                 manualSelect.innerHTML += `<option value="${escapeHtml(p.page_id)}">${escapeHtml(p.page_name)}</option>`;
+                filterPage.innerHTML += `<option value="${escapeHtml(p.page_id)}">${escapeHtml(p.page_name)}</option>`;
             });
 
             loadPageRule();
@@ -623,7 +780,11 @@ def index():
                 });
                 const data = await res.json();
                 if (res.ok) {
-                    alert(data.message);
+                    let msg = data.message;
+                    if (data.warnings && data.warnings.length) {
+                        msg += '\\n\\nLưu ý:\\n- ' + data.warnings.join('\\n- ');
+                    }
+                    alert(msg);
                     document.getElementById('accName').value = '';
                     document.getElementById('accToken').value = '';
                     fetchPages();
@@ -654,9 +815,16 @@ def index():
                 const data = await res.json();
                 const reportBox = document.getElementById('syncReportBox');
                 if (res.ok) {
-                    let html = `<div class="alert alert-success py-2 mb-0"><strong>${escapeHtml(data.message)}</strong>`;
+                    const hasErrors = data.errors && data.errors.length > 0;
+                    const alertClass = hasErrors ? 'alert-warning' : 'alert-success';
+                    let html = `<div class="alert ${alertClass} py-2 mb-0"><strong>${escapeHtml(data.message)}</strong>`;
+                    if (hasErrors) {
+                        html += '<div class="mt-2 text-danger fw-semibold small">Các dòng lỗi bị bỏ qua:</div><ul class="mb-1 text-danger small">';
+                        data.errors.forEach(err => html += `<li>${escapeHtml(err)}</li>`);
+                        html += '</ul>';
+                    }
                     if (data.warnings && data.warnings.length) {
-                        html += '<ul class="mb-0 mt-1 small">';
+                        html += '<div class="mt-1 fw-semibold small">Cảnh báo:</div><ul class="mb-0 small">';
                         data.warnings.forEach(w => html += `<li>${escapeHtml(w)}</li>`);
                         html += '</ul>';
                     }
@@ -734,16 +902,37 @@ def index():
                     d.className = 'post-card';
                     const text = pt.message ? pt.message.substring(0, 90) + '...' : '(Bài viết hình ảnh/video)';
                     const time = new Date(pt.created_time).toLocaleString('vi-VN');
-                    d.innerHTML = `<div><strong>${escapeHtml(text)}</strong></div><small class="text-muted">Đăng lúc: ${time} | ID: <code>${escapeHtml(pt.id)}</code></small>`;
+                    d.innerHTML = `<div><strong>${escapeHtml(text)}</strong></div><small class="text-muted">Đăng lúc: ${escapeHtml(time)} | ID: <code>${escapeHtml(pt.id)}</code></small>`;
                     d.onclick = () => {
                         document.querySelectorAll('.post-card').forEach(el => el.classList.remove('selected'));
                         d.classList.add('selected');
                         document.getElementById('manualPostId').value = pt.id;
+                        resetManualBatchId();
                     };
                     container.appendChild(d);
                 });
             } catch(e) {
                 container.innerHTML = '<small class="text-danger">Không thể tải danh sách bài.</small>';
+            }
+        }
+
+        async function previewManualSpintax() {
+            const content = document.getElementById('manualContent').value.trim();
+            const box = document.getElementById('spintaxPreviewBox');
+            if (!content) { alert('Vui lòng nhập nội dung bình luận để xem thử!'); return; }
+            const res = await fetch('/api/spintax/preview', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ content })
+            });
+            const data = await res.json();
+            box.style.display = 'block';
+            if (res.ok) {
+                box.className = 'alert alert-secondary py-2 px-3 mt-2 small';
+                box.innerHTML = `<strong>Xem trước câu sẽ đăng:</strong> ${escapeHtml(data.preview)}`;
+            } else {
+                box.className = 'alert alert-danger py-2 px-3 mt-2 small';
+                box.innerHTML = `<strong>Lỗi:</strong> ${escapeHtml(data.detail)}`;
             }
         }
 
@@ -774,12 +963,21 @@ def index():
                 const res = await fetch('/api/tasks/manual', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ page_id: pageId, post_id_or_url: postId, content: content, post_now: isNow, scheduled_at: schedIso })
+                    body: JSON.stringify({
+                        page_id: pageId,
+                        post_id_or_url: postId,
+                        content: content,
+                        post_now: isNow,
+                        scheduled_at: schedIso,
+                        batch_id: currentManualBatchId
+                    })
                 });
                 const data = await res.json();
                 if (res.ok) {
                     alert('Tạo tác vụ thành công!\\nNội dung: ' + data.content_preview);
                     document.getElementById('manualContent').value = '';
+                    document.getElementById('spintaxPreviewBox').style.display = 'none';
+                    resetManualBatchId();
                     loadTasks();
                     fetchMetrics();
                 } else {
@@ -792,8 +990,10 @@ def index():
 
         async function loadTasks() {
             const statusFilter = document.getElementById('filterStatus').value;
+            const pageFilter = document.getElementById('filterPage').value;
             let url = '/api/tasks?limit=50';
-            if (statusFilter) url += `&status=${statusFilter}`;
+            if (statusFilter) url += `&status=${encodeURIComponent(statusFilter)}`;
+            if (pageFilter) url += `&page_id=${encodeURIComponent(pageFilter)}`;
 
             const res = await fetch(url);
             const data = await res.json();
@@ -818,7 +1018,10 @@ def index():
                         <button class="btn btn-sm btn-outline-primary me-1" onclick="retryTask(${t.id})" title="Gửi lại"><i class="fa-solid fa-rotate-right"></i> Gửi lại</button>
                     `;
                 } else if (t.status === 'PENDING' || t.status === 'PAUSED') {
-                    actionBtns = `<button class="btn btn-sm btn-outline-danger" onclick="cancelTask(${t.id})">Hủy</button>`;
+                    actionBtns = `<button class="btn btn-sm btn-outline-danger me-1" onclick="cancelTask(${t.id})">Hủy</button>`;
+                    if (t.status === 'PAUSED') {
+                        actionBtns += `<button class="btn btn-sm btn-outline-primary" onclick="retryTask(${t.id})">Chạy tiếp</button>`;
+                    }
                 } else if (t.status === 'FAILED') {
                     actionBtns = `<button class="btn btn-sm btn-outline-primary" onclick="retryTask(${t.id})"><i class="fa-solid fa-rotate-right"></i> Thử lại</button>`;
                 }
@@ -832,8 +1035,8 @@ def index():
                     <td><strong>${escapeHtml(t.page_name)}</strong><br><small class="text-muted">${t.source === 'AUTO' ? '<i class="fa-solid fa-robot"></i> Tự động' : '<i class="fa-solid fa-user"></i> Thủ công'}</small></td>
                     <td><code>${escapeHtml(t.post_id)}</code></td>
                     <td><div style="max-width:240px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="${escapeHtml(t.comment_content)}">${escapeHtml(t.comment_content)}</div></td>
-                    <td><small>${dateStr}</small></td>
-                    <td><span class="badge badge-status badge-${t.status}">${t.status}</span><br><small class="text-danger">${escapeHtml(t.error_message || '')}</small></td>
+                    <td><small>${escapeHtml(dateStr)}</small></td>
+                    <td><span class="badge badge-status badge-${escapeHtml(t.status)}">${escapeHtml(t.status)}</span><br><small class="text-danger">${escapeHtml(t.error_message || '')}</small></td>
                     <td>${actionBtns}</td>
                 `;
                 tbody.appendChild(tr);
@@ -843,23 +1046,36 @@ def index():
         async function cancelTask(id) {
             if (!confirm('Bạn chắc chắn muốn hủy tác vụ này?')) return;
             const res = await fetch(`/api/tasks/${id}/cancel`, { method: 'POST' });
+            if (!res.ok) {
+                const data = await res.json();
+                alert(data.detail || 'Không thể hủy tác vụ');
+            }
             loadTasks();
             fetchMetrics();
         }
 
         async function retryTask(id) {
             const res = await fetch(`/api/tasks/${id}/retry`, { method: 'POST' });
+            if (!res.ok) {
+                const data = await res.json();
+                alert(data.detail || 'Không thể gửi lại tác vụ');
+            }
             loadTasks();
             fetchMetrics();
         }
 
         async function resolveTask(id) {
             const commentId = prompt('Nhập ID bình luận trên Facebook (nếu có, để trống cũng được):', '');
+            if (commentId === null) return;
             const res = await fetch(`/api/tasks/${id}/resolve`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ comment_id: commentId })
             });
+            if (!res.ok) {
+                const data = await res.json();
+                alert(data.detail || 'Không thể cập nhật tác vụ');
+            }
             loadTasks();
             fetchMetrics();
         }
