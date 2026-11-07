@@ -1,5 +1,60 @@
-Page ID,Mẫu bình luận,Bật
-'102938475612345,{Chào|Dạ shop chào} bạn, bạn check {inbox|tin nhắn} để nhận {tư vấn|ưu đãi hôm nay} nhé!,TRUE
-'102938475612345,Dạ bên em vừa gửi thông tin chi tiết qua tin nhắn cho mình rồi ạ!,TRUE
-'987654321054321,{Chào bạn|Hello bạn}, mẫu này còn đủ size {36 đến 43|từ 36-43} nha, nhắn shop để đặt nhé!,TRUE
-'987654321054321,Shop miễn phí giao hàng toàn quốc khi mua từ 2 đôi hôm nay ạ!,TRUE
+﻿page_id,comment_template,enabled,weight,tag
+'1134157636440779,"Dạ chào bạn, inbox page để được tư vấn chi tiết nhé!",TRUE,1,mau_1
+'993921657144854,"Dạ chào bạn, inbox page để được tư vấn chi tiết nhé!",TRUE,1,mau_1
+'1188328771035918,"Dạ chào bạn, inbox page để được tư vấn chi tiết nhé!",TRUE,1,mau_1
+'1305538922652860,"Dạ chào bạn, inbox page để được tư vấn chi tiết nhé!",TRUE,1,mau_1
+'1434778846383977,"Dạ chào bạn, inbox page để được tư vấn chi tiết nhé!",TRUE,1,mau_1
+'1410482708811511,"Dạ chào bạn, inbox page để được tư vấn chi tiết nhé!",TRUE,1,mau_1
+'724474920755540,"Dạ chào bạn, inbox page để được tư vấn chi tiết nhé!",TRUE,1,mau_1
+'1411674608696934,"Dạ chào bạn, inbox page để được tư vấn chi tiết nhé!",TRUE,1,mau_1
+'1283340001540426,"Dạ chào bạn, inbox page để được tư vấn chi tiết nhé!",TRUE,1,mau_1
+'61595653902005,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61595829838093,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61580355912577,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61596008780277,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61576575056385,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61579625012514,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61595621593491,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61590883863544,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61595706160020,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61578800919187,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61575355913294,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61591154001764,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61591791771842,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61595826538327,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61595540657222,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61595910721219,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61590958924481,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61571001207774,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61590749657084,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61595530361278,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61594196233794,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61594944594151,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61594356465409,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61595078204211,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61595083252781,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61593990100959,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61595844003942,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61594568049525,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61594270342263,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61594983397239,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61594275142039,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61593767531478,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61596066117981,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61595964052275,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61595573782531,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61594984462420,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61594058175135,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61594318967225,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61594918494256,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61594404932948,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61594819724912,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61596053604904,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61595967628603,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61595433628627,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61595250896194,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61595245946276,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61594823428172,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61594794845359,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61594671061927,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1
+'61595855246928,"{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!",TRUE,1,mau_1

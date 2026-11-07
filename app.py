@@ -9,9 +9,11 @@ from fastapi.responses import HTMLResponse
 import config
 import database as db
 import meta_client
+import antidetect_client
 import scheduler
 import sheets_sync
 import spintax
+
 
 
 @asynccontextmanager
@@ -107,6 +109,25 @@ def trigger_manual_sync():
     return {"success": True, "message": "Đã quét bài mới và thực thi các tác vụ đến hạn."}
 
 
+@app.get("/api/antidetect/status")
+def get_antidetect_status():
+    return antidetect_client.list_antidetect_profiles()
+
+
+@app.post("/api/antidetect/sync")
+def sync_from_antidetect():
+    res = antidetect_client.sync_pages_from_antidetect(export_csv=True)
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=res.get("error", "Không thể đồng bộ từ Antidetect Python"))
+    msg = (
+        f"Đã đồng bộ {res['profiles_synced']} Profile từ Antidetect Python: "
+        f"thêm mới {res['inserted']} Page, ghép Hybrid {res['linked_hybrid']} Page, "
+        f"cập nhật {res['updated']} Page (Tổng: {res['total_pages_in_db']} Fanpage)."
+    )
+    res["message"] = msg
+    return res
+
+
 @app.get("/api/pages")
 def list_pages():
     pages = db.get_all_pages()
@@ -114,18 +135,34 @@ def list_pages():
 
 
 @app.get("/api/pages/{page_id}/recent_posts")
-def get_page_posts(page_id: str):
+def get_page_posts(page_id: str, scan_cdp: bool = Query(False)):
     page = db.get_page_with_decrypted_token(page_id)
     if not page:
         raise HTTPException(status_code=404, detail="Không tìm thấy Page")
     token = page.get("page_access_token")
-    if not token:
-        raise HTTPException(status_code=400, detail="Page chưa có token hợp lệ")
-    try:
-        posts = meta_client.get_recent_posts(page_id, token, limit=15)
-        return {"posts": posts}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Không thể tải bài viết: {str(e)}")
+    if token:
+        try:
+            posts = meta_client.get_recent_posts(page_id, token, limit=15)
+            return {"posts": posts, "source": "GRAPH_API"}
+        except Exception as e:
+            if not (scan_cdp and page.get("antidetect_profile_id")):
+                raise HTTPException(status_code=400, detail=f"Không thể tải bài viết: {str(e)}")
+
+    profile_id = page.get("antidetect_profile_id")
+    if profile_id and scan_cdp:
+        try:
+            posts = antidetect_client.get_recent_posts_cdp(
+                page_id=page.get("fb_profile_id") or page_id,
+                page_url=page.get("page_url"),
+                profile_id=profile_id,
+                limit=10,
+            )
+            return {"posts": posts, "source": "ANTIDETECT_CDP"}
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Không thể quét bài qua Antidetect CDP: {str(e)}")
+
+    return {"posts": [], "source": "ANTIDETECT_MANUAL_INPUT"}
+
 
 
 @app.post("/api/pages/{page_id}/resume_tasks")
@@ -279,14 +316,27 @@ def create_manual_task(req: ManualTaskRequest):
     if not sheets_sync.validate_spintax_braces(raw_content):
         raise HTTPException(status_code=400, detail="Nội dung bình luận bị lỗi đóng/mở ngoặc nhọn Spintax '{...}'")
 
-    # 1. Verify post belongs to this page
-    try:
-        post_data = meta_client.verify_post_belongs_to_page(req.post_id_or_url, req.page_id, token)
-        verified_post_id = post_data["clean_post_id"]
-    except meta_client.MetaAPIError as e:
-        raise HTTPException(status_code=400, detail=f"Xác minh bài viết thất bại: {e.message}")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Lỗi kiểm tra bài viết: {str(e)}")
+    # 1. Verify post belongs to this page (Graph API) or extract post_id & URL (Antidetect CDP)
+    raw_post_input = req.post_id_or_url.strip()
+    post_url = raw_post_input if raw_post_input.startswith(("http://", "https://")) else None
+    profile_id = page.get("antidetect_profile_id")
+
+    if token and page.get("token_status") not in ("EXPIRED", "MISSING_PERMISSIONS", "ANTIDETECT_READY"):
+        try:
+            post_data = meta_client.verify_post_belongs_to_page(raw_post_input, req.page_id, token)
+            verified_post_id = post_data["clean_post_id"]
+        except meta_client.MetaAPIError as e:
+            raise HTTPException(status_code=400, detail=f"Xác minh bài viết thất bại: {e.message}")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Lỗi kiểm tra bài viết: {str(e)}")
+    elif profile_id:
+        eff_page_id = page.get("fb_profile_id") or req.page_id
+        extracted = meta_client.extract_post_id_from_input(raw_post_input, eff_page_id)
+        if not extracted:
+            raise HTTPException(status_code=400, detail="Link hoặc ID bài viết không hợp lệ.")
+        verified_post_id = extracted
+    else:
+        raise HTTPException(status_code=400, detail="Page chưa có Token Graph API và chưa gắn Profile Antidetect.")
 
     # 2. Spin content immediately so user gets consistent output
     spun_content = spintax.spin(raw_content)
@@ -306,8 +356,10 @@ def create_manual_task(req: ManualTaskRequest):
         comment_content=spun_content,
         scheduled_at=sched_time,
         source="MANUAL",
-        batch_id=batch_id
+        batch_id=batch_id,
+        post_url=post_url
     )
+
     if not success:
         raise HTTPException(status_code=400, detail="Tác vụ này đã tồn tại trong hàng đợi (chống gửi trùng).")
 
@@ -489,9 +541,22 @@ def index():
             <div class="tab-pane fade" id="tab-pages">
                 <div class="row">
                     <div class="col-md-5">
+                        <!-- Antidetect Python Direct Sync Card -->
+                        <div class="card p-4 border-start border-4 border-success mb-3">
+                            <h5 class="fw-bold mb-2 text-success"><i class="fa-solid fa-shield-halved"></i> Đồng bộ từ Antidetect Python</h5>
+                            <p class="text-muted small mb-2">
+                                Kết nối trực tiếp với <code>C:\\Projects\\Tools\\Antidetect Python</code> ở chế độ an toàn (Read-only + CDP Input). Không cần tài khoản Developer hay lấy Token cho các nick phụ!
+                            </p>
+
+                            <div id="antidetectSummary" class="small text-secondary mb-3">Đang kiểm tra dữ liệu Antidetect...</div>
+                            <button class="btn btn-success w-100" id="btnSyncAntidetect" onclick="syncFromAntidetect()">
+                                <i class="fa-solid fa-bolt"></i> Đồng bộ toàn bộ Fanpage từ Antidetect
+                            </button>
+                        </div>
+
                         <div class="card p-4">
-                            <h5 class="fw-bold mb-3"><i class="fa-solid fa-user-plus text-primary"></i> Kết nối Nick Facebook mới</h5>
-                            <p class="text-muted small">Dán User Token của nick bất kỳ. Hệ thống sẽ đổi sang Token dài hạn, kiểm tra quyền và mã hóa trước khi lưu.</p>
+                            <h5 class="fw-bold mb-3"><i class="fa-solid fa-user-plus text-primary"></i> Kết nối qua Graph API (Tùy chọn)</h5>
+                            <p class="text-muted small">Dán User Token của nick có Developer (nếu muốn chạy ngầm qua API không cần mở trình duyệt).</p>
                             <div class="mb-3">
                                 <label class="form-label fw-semibold">Tên gợi nhớ cho Nick:</label>
                                 <input type="text" id="accName" class="form-control" placeholder="Ví dụ: Nick Bán Hàng 01">
@@ -506,13 +571,13 @@ def index():
                     <div class="col-md-7">
                         <div class="card p-4">
                             <h5 class="fw-bold mb-3"><i class="fa-solid fa-list-check text-primary"></i> Danh sách Fanpage (<span id="pageCount">0</span>)</h5>
-                            <div class="table-responsive">
+                            <div class="table-responsive" style="max-height: 620px; overflow-y: auto;">
                                 <table class="table align-middle">
-                                    <thead class="table-light">
+                                    <thead class="table-light sticky-top">
                                         <tr>
                                             <th>Tên Fanpage</th>
-                                            <th>Nick nguồn</th>
-                                            <th>Tình trạng Token</th>
+                                            <th>Nick / Profile nguồn</th>
+                                            <th>Chế độ & Trạng thái</th>
                                             <th>Tự động</th>
                                         </tr>
                                     </thead>
@@ -525,6 +590,7 @@ def index():
                     </div>
                 </div>
             </div>
+
 
             <!-- TAB 3: RULES CONFIG -->
             <div class="tab-pane fade" id="tab-rules">
@@ -740,28 +806,71 @@ def index():
             }
 
             cachedPages.forEach(p => {
-                let badgeToken = '<span class="badge bg-success">Sẵn sàng (OK)</span>';
-                if (p.token_status === 'EXPIRED') badgeToken = '<span class="badge bg-danger">Hết hạn / Mất quyền</span>';
+                let badgeToken = '<span class="badge bg-success">Graph API (OK)</span>';
+                if (p.connection_mode === 'HYBRID') {
+                    badgeToken = '<span class="badge bg-primary">Hybrid (API + Antidetect)</span>';
+                } else if (p.connection_mode === 'ANTIDETECT' || p.token_status === 'ANTIDETECT_READY') {
+                    badgeToken = '<span class="badge bg-info text-dark">Sẵn sàng (Antidetect CDP)</span>';
+                }
+                if (p.token_status === 'EXPIRED') badgeToken = '<span class="badge bg-danger">Hết hạn / Cần đăng nhập lại</span>';
                 else if (p.token_status === 'MISSING_PERMISSIONS') badgeToken = '<span class="badge bg-warning text-dark">Thiếu quyền Page</span>';
                 else if (p.token_status === 'EXPIRING_SOON') badgeToken = '<span class="badge bg-warning text-dark">Sắp hết hạn</span>';
 
+                const srcLabel = p.antidetect_profile_name || p.account_name || 'N/A';
                 const tr = document.createElement('tr');
                 tr.innerHTML = `
                     <td><strong>${escapeHtml(p.page_name)}</strong><br><small class="text-muted">ID: ${escapeHtml(p.page_id)}</small></td>
-                    <td><span class="badge bg-light text-dark border">${escapeHtml(p.account_name || 'N/A')}</span></td>
+                    <td><span class="badge bg-light text-dark border text-wrap text-start">${escapeHtml(srcLabel)}</span></td>
                     <td>${badgeToken}<br><small class="text-muted">${escapeHtml(p.status_note || '')}</small></td>
                     <td>${p.rule_enabled ? `<span class="badge bg-primary">Chờ ${p.delay_minutes}p (Tối đa ${p.max_comments_per_day}/ngày)</span>` : '<span class="badge bg-secondary">Tắt</span>'}</td>
                 `;
                 tbody.appendChild(tr);
 
-                ruleSelect.innerHTML += `<option value="${escapeHtml(p.page_id)}">${escapeHtml(p.page_name)} (${escapeHtml(p.page_id)})</option>`;
-                manualSelect.innerHTML += `<option value="${escapeHtml(p.page_id)}">${escapeHtml(p.page_name)}</option>`;
+                const modeTag = p.connection_mode === 'ANTIDETECT' ? '[CDP]' : (p.connection_mode === 'HYBRID' ? '[Hybrid]' : '[API]');
+                ruleSelect.innerHTML += `<option value="${escapeHtml(p.page_id)}">${escapeHtml(p.page_name)} ${modeTag} (${escapeHtml(p.page_id)})</option>`;
+                manualSelect.innerHTML += `<option value="${escapeHtml(p.page_id)}">${escapeHtml(p.page_name)} ${modeTag}</option>`;
                 filterPage.innerHTML += `<option value="${escapeHtml(p.page_id)}">${escapeHtml(p.page_name)}</option>`;
             });
 
             loadPageRule();
             loadRecentPostsForManual();
         }
+
+        async function fetchAntidetectStatus() {
+            try {
+                const res = await fetch('/api/antidetect/status');
+                const data = await res.json();
+                const el = document.getElementById('antidetectSummary');
+                if (!el) return;
+                if (data.available) {
+                    el.innerHTML = `<i class="fa-solid fa-circle-check text-success"></i> Đã tìm thấy <strong>${data.total_profiles} Profile</strong> và <strong>${data.total_fanpages} Fanpage</strong> trong Antidetect Python.`;
+                } else {
+                    el.innerHTML = `<i class="fa-solid fa-triangle-exclamation text-warning"></i> Không tìm thấy dữ liệu tại <code>${escapeHtml(data.antidetect_dir)}</code>`;
+                }
+            } catch (e) {}
+        }
+
+        async function syncFromAntidetect() {
+            const btn = document.getElementById('btnSyncAntidetect');
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Đang đồng bộ từ Antidetect...';
+            try {
+                const res = await fetch('/api/antidetect/sync', { method: 'POST' });
+                const data = await res.json();
+                if (res.ok) {
+                    alert(data.message);
+                    fetchPages();
+                    fetchMetrics();
+                    fetchAntidetectStatus();
+                } else {
+                    alert('Lỗi: ' + (data.detail || 'Không thể đồng bộ'));
+                }
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fa-solid fa-bolt"></i> Đồng bộ toàn bộ Fanpage từ Antidetect';
+            }
+        }
+
 
         async function connectAccount() {
             const name = document.getElementById('accName').value.trim();
@@ -882,15 +991,32 @@ def index():
             }
         }
 
-        async function loadRecentPostsForManual() {
+        async function loadRecentPostsForManual(scanCdp = false) {
             const pageId = document.getElementById('manualPageSelect').value;
             const container = document.getElementById('recentPostsContainer');
             if (!pageId) return;
 
             container.innerHTML = '<small class="text-muted"><i class="fa-solid fa-spinner fa-spin"></i> Đang tải bài viết...</small>';
             try {
-                const res = await fetch(`/api/pages/${pageId}/recent_posts`);
+                const res = await fetch(`/api/pages/${pageId}/recent_posts?scan_cdp=${scanCdp ? 'true' : 'false'}`);
                 const data = await res.json();
+                if (!res.ok) {
+                    container.innerHTML = `<small class="text-danger">${escapeHtml(data.detail || 'Không thể tải bài viết')}</small>`;
+                    return;
+                }
+                if (data.source === 'ANTIDETECT_MANUAL_INPUT') {
+                    container.innerHTML = `
+                        <div class="p-2 small text-muted">
+                            Page này chạy qua <strong>Antidetect CDP</strong>. Bạn có thể dán trực tiếp <strong>Link bài viết</strong> vào ô bên dưới, hoặc bấm nút để mở trình duyệt quét bài mới:
+                            <div class="mt-2">
+                                <button type="button" class="btn btn-sm btn-outline-success" onclick="loadRecentPostsForManual(true)">
+                                    <i class="fa-solid fa-magnifying-glass"></i> Quét bài mới qua Antidetect CDP
+                                </button>
+                            </div>
+                        </div>
+                    `;
+                    return;
+                }
                 const posts = data.posts || [];
                 if (posts.length === 0) {
                     container.innerHTML = '<small class="text-muted">Không có bài viết gần đây.</small>';
@@ -900,13 +1026,14 @@ def index():
                 posts.forEach(pt => {
                     const d = document.createElement('div');
                     d.className = 'post-card';
-                    const text = pt.message ? pt.message.substring(0, 90) + '...' : '(Bài viết hình ảnh/video)';
+                    const text = pt.message ? pt.message.substring(0, 90) + '...' : (pt.permalink_url || '(Bài viết trên Fanpage)');
                     const time = new Date(pt.created_time).toLocaleString('vi-VN');
+                    const clickVal = pt.permalink_url || pt.id;
                     d.innerHTML = `<div><strong>${escapeHtml(text)}</strong></div><small class="text-muted">Đăng lúc: ${escapeHtml(time)} | ID: <code>${escapeHtml(pt.id)}</code></small>`;
                     d.onclick = () => {
                         document.querySelectorAll('.post-card').forEach(el => el.classList.remove('selected'));
                         d.classList.add('selected');
-                        document.getElementById('manualPostId').value = pt.id;
+                        document.getElementById('manualPostId').value = clickVal;
                         resetManualBatchId();
                     };
                     container.appendChild(d);
@@ -915,6 +1042,7 @@ def index():
                 container.innerHTML = '<small class="text-danger">Không thể tải danh sách bài.</small>';
             }
         }
+
 
         async function previewManualSpintax() {
             const content = document.getElementById('manualContent').value.trim();
@@ -1082,10 +1210,12 @@ def index():
 
         window.onload = () => {
             fetchMetrics();
+            fetchAntidetectStatus();
             fetchPages();
             loadTasks();
             setInterval(fetchMetrics, 10000);
         };
+
     </script>
 </body>
 </html>

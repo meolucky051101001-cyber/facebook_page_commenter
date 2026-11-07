@@ -180,8 +180,14 @@ def sync_from_google_sheet(sheet_url_or_id: str) -> Dict[str, Any]:
                 comments_by_page[clean_pid] = []
             comments_by_page[clean_pid].append(tpl)
 
-    # Fetch currently connected pages in DB
-    existing_pages_map = {p["page_id"]: p for p in db.get_all_pages()}
+    # Fetch currently connected pages in DB (map both page_id and fb_profile_id -> canonical page)
+    all_db_pages = db.get_all_pages()
+    existing_pages_map = {}
+    for p in all_db_pages:
+        existing_pages_map[p["page_id"]] = p
+        if p.get("fb_profile_id"):
+            existing_pages_map[str(p["fb_profile_id"])] = p
+
     seen_sheet_pids = set()
     updates_to_apply: List[Tuple[str, int, List[str], int, bool]] = []
 
@@ -195,14 +201,17 @@ def sync_from_google_sheet(sheet_url_or_id: str) -> Dict[str, Any]:
             errors.append(f"Tab Pages dòng {idx}: {pid_err}")
             continue
 
-        seen_sheet_pids.add(clean_pid)
-
         if clean_pid not in existing_pages_map:
             warnings.append(
                 f"Page ID '{clean_pid}' (dòng {idx}) có trên Sheet nhưng chưa được kết nối trong Tool. "
-                f"Hãy bấm 'Kết nối Nick' để nạp token trước."
+                f"Hãy bấm 'Đồng bộ từ Antidetect' hoặc 'Kết nối Nick' trước."
             )
             continue
+
+        matched_page = existing_pages_map[clean_pid]
+        canonical_pid = matched_page["page_id"]
+        seen_sheet_pids.add(canonical_pid)
+
 
         # Parse delay minutes strictly
         delay_raw = (r.get("delay (phút)") or r.get("delay") or r.get("thời gian chờ") or "10").strip()
@@ -228,17 +237,17 @@ def sync_from_google_sheet(sheet_url_or_id: str) -> Dict[str, Any]:
         enabled_val = str(r.get("bật tự động") or r.get("bật/tắt") or r.get("enabled") or "true").strip().lower()
         is_enabled = enabled_val in ["true", "1", "bật", "yes", "ok"]
 
-        templates = comments_by_page.get(clean_pid, [])
+        templates = comments_by_page.get(clean_pid) or comments_by_page.get(canonical_pid) or []
         if not templates:
             try:
-                curr = existing_pages_map[clean_pid].get("templates")
+                curr = matched_page.get("templates")
                 templates = json.loads(curr) if curr else []
             except Exception:
                 templates = []
             if not templates:
                 templates = ["Dạ chào bạn, inbox page để được tư vấn chi tiết nhé!"]
 
-        updates_to_apply.append((clean_pid, delay_minutes, templates, max_per_day, is_enabled))
+        updates_to_apply.append((canonical_pid, delay_minutes, templates, max_per_day, is_enabled))
 
     # Apply all updates inside a single DB transaction
     synced_count = 0
@@ -246,9 +255,9 @@ def sync_from_google_sheet(sheet_url_or_id: str) -> Dict[str, Any]:
     conn = db.get_connection()
     try:
         with conn:
-            for (clean_pid, delay_minutes, templates, max_per_day, is_enabled) in updates_to_apply:
+            for (canonical_pid, delay_minutes, templates, max_per_day, is_enabled) in updates_to_apply:
                 db.update_page_rule(
-                    page_id=clean_pid,
+                    page_id=canonical_pid,
                     delay_minutes=delay_minutes,
                     templates=templates,
                     max_comments_per_day=max_per_day,
@@ -260,7 +269,8 @@ def sync_from_google_sheet(sheet_url_or_id: str) -> Dict[str, Any]:
             # Soft-disable any previously active pages that were removed from the Sheet
             # Only do this if there were no row-level parsing errors on the Pages tab
             if seen_sheet_pids and not errors:
-                for pid, pdata in existing_pages_map.items():
+                for pdata in all_db_pages:
+                    pid = pdata["page_id"]
                     if pid not in seen_sheet_pids and pdata.get("rule_enabled") == 1:
                         db.update_page_rule(
                             page_id=pid,
@@ -271,6 +281,7 @@ def sync_from_google_sheet(sheet_url_or_id: str) -> Dict[str, Any]:
                             conn=conn
                         )
                         disabled_count += 1
+
     finally:
         conn.close()
 

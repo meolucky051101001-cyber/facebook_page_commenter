@@ -338,3 +338,68 @@ def test_timeout_self_reconciliation():
             res2 = meta_client.post_comment("111_222", "111", "token", "Nội dung test")
             assert res2["success"] is False
             assert res2["category"] == "NEED_CHECK"
+
+
+def test_antidetect_hybrid_linking_and_cdp_execution():
+    import antidetect_client
+    acc_id = db.upsert_account("Nick Graph API", "u_graph_1", "tok_u")
+    # 1. Existing Graph API page
+    db.upsert_page("993921657144854", "Chị Đẹp Thích Vẽ", "valid_page_token", acc_id, token_status="OK")
+
+    # 2. Syncing matching page from Antidetect upgrades it to HYBRID without losing its token
+    res_hybrid = db.upsert_antidetect_page(
+        fb_page_id="61575475678031",
+        page_name="Chị Đẹp Thích Vẽ",
+        page_url="https://www.facebook.com/61575475678031",
+        antidetect_profile_id="prof-uuid-2",
+        antidetect_profile_name="Profile 2 - Bóng Ma Đề Cương",
+        account_id=acc_id,
+    )
+    assert res_hybrid["action"] == "linked_hybrid"
+    assert res_hybrid["page_id"] == "993921657144854"
+
+    p_hybrid = db.get_page_with_decrypted_token("993921657144854")
+    assert p_hybrid["connection_mode"] == "HYBRID"
+    assert p_hybrid["page_access_token"] == "valid_page_token"
+    assert p_hybrid["fb_profile_id"] == "61575475678031"
+
+    # 3. Syncing a new Antidetect-only page (no Graph API token)
+    res_ad = db.upsert_antidetect_page(
+        fb_page_id="61594671061927",
+        page_name="Tiện Ích Ngôi Nhà",
+        page_url="https://www.facebook.com/61594671061927",
+        antidetect_profile_id="prof-uuid-7",
+        antidetect_profile_name="Profile 7 - Meo Meo",
+        account_id=acc_id,
+    )
+    assert res_ad["action"] == "inserted"
+    p_ad = db.get_page("61594671061927")
+    assert p_ad["connection_mode"] == "ANTIDETECT"
+    assert p_ad["token_status"] == "ANTIDETECT_READY"
+
+    # 4. Manual task creation on Antidetect-only page works without Graph API token
+    with TestClient(fastapi_app.app) as client:
+        resp = client.post("/api/tasks/manual", json={
+            "page_id": "61594671061927",
+            "post_id_or_url": "https://www.facebook.com/61594671061927/posts/pfbid02xyzAntidetectPost",
+            "content": "{Chào|Xin chào} bạn nhé!",
+            "post_now": True,
+            "batch_id": "batch_ad_1"
+        })
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
+
+    # 5. Executing due task for Antidetect-only page routes to antidetect_client.post_comment_cdp
+    with patch("antidetect_client.post_comment_cdp") as mock_cdp:
+        mock_cdp.return_value = {
+            "success": True,
+            "comment_id": "cdp_61594671061927_999",
+            "mode": "ANTIDETECT_CDP",
+            "usage_pct": None,
+        }
+        scheduler.execute_due_tasks()
+        assert mock_cdp.call_count == 1
+        tasks = db.get_all_tasks(page_id="61594671061927")
+        assert tasks[0]["status"] == "SUCCESS"
+        assert tasks[0]["comment_id"] == "cdp_61594671061927_999"
+

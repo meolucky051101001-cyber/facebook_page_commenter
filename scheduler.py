@@ -8,8 +8,10 @@ from typing import Dict, Any, Optional
 import config
 import database as db
 import meta_client
+import antidetect_client
 import sheets_sync
 import spintax
+
 
 # In-memory status for UI monitoring
 SCHEDULER_METRICS: Dict[str, Any] = {
@@ -42,7 +44,8 @@ def detect_new_posts_and_schedule():
         if not page_full:
             continue
         token = page_full.get("page_access_token", "")
-        if not token:
+        profile_id = p.get("antidetect_profile_id") or page_full.get("antidetect_profile_id")
+        if not token and not profile_id:
             continue
 
         delay_minutes = p.get("delay_minutes", 10)
@@ -55,19 +58,47 @@ def detect_new_posts_and_schedule():
         if not templates:
             continue
 
-        try:
-            posts = meta_client.get_recent_posts(page_id, token, since_timestamp=since_ts, limit=5)
-        except meta_client.MetaAPIError as e:
-            if e.category == "TOKEN_EXPIRED":
-                db.update_page_status(page_id, is_active=False, token_status="EXPIRED", status_note=e.message)
-            continue
-        except Exception:
-            continue
+        posts = []
+        if token:
+            try:
+                posts = meta_client.get_recent_posts(page_id, token, since_timestamp=since_ts, limit=5)
+            except meta_client.MetaAPIError as e:
+                if e.category == "TOKEN_EXPIRED":
+                    if profile_id:
+                        # Hybrid fallback: keep active on Antidetect if Graph token expired
+                        db.update_page_status(page_id, is_active=True, token_status="ANTIDETECT_READY", status_note="Token API hết hạn, đã chuyển sang chế độ Antidetect CDP")
+                    else:
+                        db.update_page_status(page_id, is_active=False, token_status="EXPIRED", status_note=e.message)
+                continue
+            except Exception:
+                continue
+        elif profile_id:
+            # For Antidetect-only pages, scan automatically if the profile is currently open
+            # or if ANTIDETECT_AUTO_SCAN_POSTS is enabled
+            rt = antidetect_client._read_runtime_readonly().get(profile_id) or {}
+            is_open = antidetect_client._probe_cdp_port(rt.get("port"))
+            if not is_open and not config.ANTIDETECT_AUTO_SCAN_POSTS:
+                continue
+            try:
+                posts = antidetect_client.get_recent_posts_cdp(
+                    page_id=page_id,
+                    page_url=p.get("page_url"),
+                    profile_id=profile_id,
+                    since_timestamp=since_ts,
+                    limit=5,
+                )
+            except meta_client.MetaAPIError as e:
+                if e.category == "TOKEN_EXPIRED":
+                    db.update_page_status(page_id, is_active=False, token_status="EXPIRED", status_note=e.message)
+                continue
+            except Exception:
+                continue
 
         latest_post_time = None
         for post in posts:
             post_id = post.get("id")
             created_str = post.get("created_time")
+            post_url = post.get("permalink_url")
             if not post_id or not created_str:
                 continue
 
@@ -100,8 +131,10 @@ def detect_new_posts_and_schedule():
                 comment_content=final_content,
                 scheduled_at=target_run_time.isoformat(),
                 source="AUTO",
-                post_created_time=created_dt.isoformat()
+                post_created_time=created_dt.isoformat(),
+                post_url=post_url
             )
+
 
         if latest_post_time:
             conn = db.get_connection()
@@ -190,13 +223,44 @@ def execute_due_tasks():
         if not db.lock_task_for_sending(task_id):
             continue
 
-        # 6. Post comment to Meta
-        result = meta_client.post_comment(
-            post_id=post_id,
-            page_id=page_id,
-            page_access_token=token,
-            message=content
-        )
+        # 6. Post comment to Meta (via Graph API if token available, else via Antidetect CDP)
+        profile_id = fresh_page.get("antidetect_profile_id") or task.get("antidetect_profile_id")
+        if token and fresh_page.get("token_status") not in ("EXPIRED", "MISSING_PERMISSIONS", "ANTIDETECT_READY"):
+            result = meta_client.post_comment(
+                post_id=post_id,
+                page_id=page_id,
+                page_access_token=token,
+                message=content
+            )
+            # Hybrid fallback: if Graph API token expired/failed auth and page has Antidetect profile
+            if not result.get("success") and result.get("category") == "TOKEN_EXPIRED" and profile_id:
+                result = antidetect_client.post_comment_cdp(
+                    post_id=post_id,
+                    page_id=fresh_page.get("fb_profile_id") or page_id,
+                    page_name=fresh_page.get("page_name") or page_id,
+                    page_url=fresh_page.get("page_url"),
+                    profile_id=profile_id,
+                    message=content,
+                    post_url=task.get("post_url"),
+                )
+        elif profile_id:
+            result = antidetect_client.post_comment_cdp(
+                post_id=post_id,
+                page_id=fresh_page.get("fb_profile_id") or page_id,
+                page_name=fresh_page.get("page_name") or page_id,
+                page_url=fresh_page.get("page_url"),
+                profile_id=profile_id,
+                message=content,
+                post_url=task.get("post_url"),
+            )
+        else:
+            result = {
+                "success": False,
+                "category": "TOKEN_EXPIRED",
+                "error": "Page chưa có Token Graph API và cũng chưa gắn Profile Antidetect.",
+                "usage_pct": None,
+            }
+
 
         if result.get("usage_pct") is not None:
             db.update_page_api_usage(page_id, float(result["usage_pct"]))

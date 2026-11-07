@@ -130,9 +130,9 @@ def upsert_page(
             INSERT INTO pages (
                 page_id, page_name, page_access_token_enc, account_id,
                 is_active, token_status, missing_permissions, expires_at,
-                last_synced_at, status_note, updated_at
+                last_synced_at, status_note, connection_mode, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'GRAPH_API', ?)
             ON CONFLICT(page_id) DO UPDATE SET
                 page_name = excluded.page_name,
                 page_access_token_enc = excluded.page_access_token_enc,
@@ -143,6 +143,7 @@ def upsert_page(
                 expires_at = excluded.expires_at,
                 last_synced_at = excluded.last_synced_at,
                 status_note = excluded.status_note,
+                connection_mode = (CASE WHEN pages.antidetect_profile_id IS NOT NULL AND pages.antidetect_profile_id != '' THEN 'HYBRID' ELSE 'GRAPH_API' END),
                 updated_at = excluded.updated_at
         """, (page_id, page_name, token_enc, account_id, is_active, token_status, perms_json, expires_at, now, status_note, now))
 
@@ -154,6 +155,113 @@ def upsert_page(
     conn.close()
 
 
+def upsert_antidetect_page(
+    fb_page_id: str,
+    page_name: str,
+    page_url: str,
+    antidetect_profile_id: str,
+    antidetect_profile_name: str,
+    account_id: int
+) -> Dict[str, Any]:
+    """
+    Links or inserts a Fanpage discovered from Antidetect Python.
+    - If a Page already exists in `pages` by page_id, fb_profile_id, or matching page_name
+      (with an existing Graph API token), links the Antidetect profile and sets connection_mode='HYBRID'.
+    - Otherwise inserts/updates as connection_mode='ANTIDETECT', token_status='ANTIDETECT_READY'.
+    """
+    conn = get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+    clean_name = (page_name or "").strip()
+    result_action = "inserted"
+    target_page_id = fb_page_id
+
+    with conn:
+        cur = conn.cursor()
+        # 1. Check exact match on page_id or fb_profile_id
+        cur.execute(
+            "SELECT page_id, page_access_token_enc, token_status FROM pages WHERE page_id = ? OR fb_profile_id = ?",
+            (fb_page_id, fb_page_id)
+        )
+        existing = cur.fetchone()
+
+        # 2. If not found by ID, check if a Graph API page with the exact same name exists
+        if not existing and clean_name:
+            cur.execute("""
+                SELECT page_id, page_access_token_enc, token_status
+                FROM pages
+                WHERE LOWER(TRIM(page_name)) = LOWER(?)
+                  AND page_access_token_enc IS NOT NULL
+                  AND page_access_token_enc != ''
+                LIMIT 1
+            """, (clean_name,))
+            existing = cur.fetchone()
+
+        if existing:
+            target_page_id = existing["page_id"]
+            has_token = bool(existing["page_access_token_enc"])
+            new_mode = "HYBRID" if has_token else "ANTIDETECT"
+            new_token_status = existing["token_status"] if has_token else "ANTIDETECT_READY"
+            conn.execute("""
+                UPDATE pages
+                SET antidetect_profile_id = ?,
+                    antidetect_profile_name = ?,
+                    page_url = COALESCE(?, page_url),
+                    fb_profile_id = COALESCE(?, fb_profile_id),
+                    connection_mode = ?,
+                    token_status = ?,
+                    last_synced_at = ?,
+                    updated_at = ?
+                WHERE page_id = ?
+            """, (
+                antidetect_profile_id,
+                antidetect_profile_name,
+                page_url,
+                fb_page_id,
+                new_mode,
+                new_token_status,
+                now,
+                now,
+                target_page_id
+            ))
+            result_action = "linked_hybrid" if has_token else "updated"
+        else:
+            conn.execute("""
+                INSERT INTO pages (
+                    page_id, page_name, page_access_token_enc, account_id,
+                    is_active, token_status, missing_permissions,
+                    last_synced_at, status_note, connection_mode,
+                    antidetect_profile_id, antidetect_profile_name,
+                    page_url, fb_profile_id, updated_at
+                )
+                VALUES (?, ?, '', ?, 1, 'ANTIDETECT_READY', '[]', ?, 'Kết nối qua Antidetect CDP', 'ANTIDETECT', ?, ?, ?, ?, ?)
+            """, (
+                fb_page_id,
+                clean_name or f"Page {fb_page_id}",
+                account_id,
+                now,
+                antidetect_profile_id,
+                antidetect_profile_name,
+                page_url,
+                fb_page_id,
+                now
+            ))
+            result_action = "inserted"
+
+        # Ensure default rule exists for this page
+        conn.execute("""
+            INSERT OR IGNORE INTO page_rules (page_id, delay_minutes, templates, max_comments_per_day, is_enabled)
+            VALUES (?, 10, ?, 20, 1)
+        """, (
+            target_page_id,
+            json.dumps(
+                ["{Dạ chào bạn|Chào bạn nhé|Xin chào bạn}, {inbox page để được tư vấn chi tiết nhé|nhắn tin cho shop để được hỗ trợ ngay nha}!"],
+                ensure_ascii=False
+            )
+        ))
+    conn.close()
+    return {"page_id": target_page_id, "action": result_action}
+
+
 def get_all_pages() -> List[Dict[str, Any]]:
     conn = get_connection()
     cursor = conn.cursor()
@@ -162,12 +270,14 @@ def get_all_pages() -> List[Dict[str, Any]]:
                p.missing_permissions, p.expires_at, p.last_synced_at, p.last_seen_post_time,
                p.last_comment_at, p.comments_today_count, p.comments_today_date,
                p.api_usage_percent, p.status_note, p.updated_at,
+               p.connection_mode, p.antidetect_profile_id, p.antidetect_profile_name,
+               p.page_url, p.fb_profile_id,
                a.account_name, r.delay_minutes, r.templates, r.max_comments_per_day,
                r.is_enabled as rule_enabled
         FROM pages p
         LEFT JOIN accounts a ON p.account_id = a.id
         LEFT JOIN page_rules r ON p.page_id = r.page_id
-        ORDER BY p.updated_at DESC
+        ORDER BY p.updated_at DESC, p.page_name ASC
     """)
     rows = [dict(row) for row in cursor.fetchall()]
     conn.close()
@@ -182,14 +292,17 @@ def get_page(page_id: str) -> Optional[Dict[str, Any]]:
                p.missing_permissions, p.expires_at, p.last_synced_at, p.last_seen_post_time,
                p.last_comment_at, p.comments_today_count, p.comments_today_date,
                p.api_usage_percent, p.status_note, p.updated_at,
+               p.connection_mode, p.antidetect_profile_id, p.antidetect_profile_name,
+               p.page_url, p.fb_profile_id,
                r.delay_minutes, r.templates, r.max_comments_per_day, r.is_enabled as rule_enabled
         FROM pages p
         LEFT JOIN page_rules r ON p.page_id = r.page_id
-        WHERE p.page_id = ?
-    """, (page_id,))
+        WHERE p.page_id = ? OR p.fb_profile_id = ?
+    """, (page_id, page_id))
     row = cursor.fetchone()
     conn.close()
     return dict(row) if row else None
+
 
 
 def get_page_with_decrypted_token(page_id: str) -> Optional[Dict[str, Any]]:
@@ -298,7 +411,8 @@ def create_task(
     source: str = "AUTO",
     batch_id: Optional[str] = None,
     post_created_time: Optional[str] = None,
-    dedupe_key: Optional[str] = None
+    dedupe_key: Optional[str] = None,
+    post_url: Optional[str] = None
 ) -> bool:
     """
     Creates a task using dedupe_key.
@@ -316,9 +430,9 @@ def create_task(
     try:
         with conn:
             conn.execute("""
-                INSERT INTO tasks (page_id, post_id, dedupe_key, source, batch_id, comment_content, scheduled_at, post_created_time, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
-            """, (page_id, post_id, dedupe_key, source, batch_id, comment_content, scheduled_at, post_created_time))
+                INSERT INTO tasks (page_id, post_id, post_url, dedupe_key, source, batch_id, comment_content, scheduled_at, post_created_time, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+            """, (page_id, post_id, post_url, dedupe_key, source, batch_id, comment_content, scheduled_at, post_created_time))
         return True
     except sqlite3.IntegrityError:
         return False
@@ -332,7 +446,10 @@ def get_due_tasks(limit: int = 10) -> List[Dict[str, Any]]:
     now_utc = datetime.now(timezone.utc).isoformat()
     cursor.execute("""
         SELECT t.*, p.page_access_token_enc, p.page_name, p.last_comment_at,
-               p.comments_today_count, p.comments_today_date, r.max_comments_per_day
+               p.comments_today_count, p.comments_today_date,
+               p.connection_mode, p.antidetect_profile_id, p.antidetect_profile_name,
+               p.page_url, p.fb_profile_id,
+               r.max_comments_per_day
         FROM tasks t
         JOIN pages p ON t.page_id = p.page_id
         LEFT JOIN page_rules r ON p.page_id = r.page_id
@@ -347,6 +464,7 @@ def get_due_tasks(limit: int = 10) -> List[Dict[str, Any]]:
         rows.append(d)
     conn.close()
     return rows
+
 
 
 def lock_task_for_sending(task_id: int) -> bool:
@@ -454,14 +572,15 @@ def get_all_tasks(page_id: Optional[str] = None, status: Optional[str] = None, s
     conn = get_connection()
     cursor = conn.cursor()
     query = """
-        SELECT t.id, t.page_id, t.post_id, t.dedupe_key, t.source, t.batch_id,
+        SELECT t.id, t.page_id, t.post_id, t.post_url, t.dedupe_key, t.source, t.batch_id,
                t.post_created_time, t.comment_content, t.scheduled_at, t.status,
                t.locked_at, t.comment_id, t.error_message, t.retry_count, t.updated_at,
-               p.page_name
+               p.page_name, p.connection_mode, p.antidetect_profile_name
         FROM tasks t
         JOIN pages p ON t.page_id = p.page_id
         WHERE 1=1
     """
+
     params = []
     if page_id:
         query += " AND t.page_id = ?"

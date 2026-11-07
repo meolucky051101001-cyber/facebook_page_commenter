@@ -44,3 +44,10 @@ SHEET_SYNC_INTERVAL_SEC = int(os.getenv("SHEET_SYNC_INTERVAL_SEC", "300"))
 MAX_POST_AGE_MIN = int(os.getenv("MAX_POST_AGE_MIN", "120"))
 MIN_GAP_PER_PAGE_SEC = int(os.getenv("MIN_GAP_PER_PAGE_SEC", "45"))
 MAX_COMMENTS_PER_PAGE_PER_DAY = int(os.getenv("MAX_COMMENTS_PER_PAGE_PER_DAY", "20"))
+
+# 5. Antidetect Python Integration
+ANTIDETECT_DIR = os.getenv("ANTIDETECT_DIR", r"C:\Projects\Tools\Antidetect Python").strip()
+ANTIDETECT_AUTO_CLOSE_BROWSER = os.getenv("ANTIDETECT_AUTO_CLOSE_BROWSER", "1").strip() in ("1", "true", "yes", "on")
+ANTIDETECT_AUTO_SCAN_POSTS = os.getenv("ANTIDETECT_AUTO_SCAN_POSTS", "0").strip() in ("1", "true", "yes", "on")
+
+

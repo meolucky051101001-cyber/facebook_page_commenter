@@ -21,6 +21,34 @@ def run_migrations(conn: sqlite3.Connection):
         conn.execute("INSERT INTO schema_version (version) VALUES (1)")
         conn.commit()
 
+    if current_version < 2:
+        _apply_migration_v2(conn)
+        conn.execute("INSERT INTO schema_version (version) VALUES (2)")
+        conn.commit()
+
+
+def _apply_migration_v2(conn: sqlite3.Connection):
+    """Adds Antidetect Python integration columns to pages and tasks."""
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(pages)")
+    p_cols = [col[1] for col in cur.fetchall()]
+    page_new_cols = {
+        "connection_mode": "TEXT DEFAULT 'GRAPH_API'",
+        "antidetect_profile_id": "TEXT",
+        "antidetect_profile_name": "TEXT",
+        "page_url": "TEXT",
+        "fb_profile_id": "TEXT",
+    }
+    for col_name, col_def in page_new_cols.items():
+        if col_name not in p_cols:
+            conn.execute(f"ALTER TABLE pages ADD COLUMN {col_name} {col_def}")
+
+    cur.execute("PRAGMA table_info(tasks)")
+    t_cols = [col[1] for col in cur.fetchall()]
+    if "post_url" not in t_cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN post_url TEXT")
+
+
 def _apply_migration_v1(conn: sqlite3.Connection):
     # Create accounts table
     conn.execute("""
