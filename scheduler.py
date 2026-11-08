@@ -45,10 +45,14 @@ def _detect_new_posts_and_schedule():
     Scans all active pages incrementally, detecting newly published posts.
     Calculates target delay and creates deduplicated auto-tasks.
     """
+    if SCHEDULER_METRICS["paused_all"]:
+        return
     pages = db.get_all_pages()
     now_utc = datetime.now(timezone.utc)
 
     for p in pages:
+        if SCHEDULER_METRICS["paused_all"]:
+            break
         if not p.get("is_active") or not p.get("rule_enabled"):
             continue
 
@@ -188,11 +192,16 @@ def _execute_due_tasks():
     before each task so multiple due tasks for the same page never violate constraints,
     then posts comments to Meta.
     """
+    if SCHEDULER_METRICS["paused_all"]:
+        return
     due_tasks = db.get_due_tasks(limit=10)
     now_utc = datetime.now(timezone.utc)
     today_str = db.local_day_key(now_utc)
 
     for task in due_tasks:
+        # Emergency pause must stop the batch before the next task is touched.
+        if SCHEDULER_METRICS["paused_all"]:
+            break
         task_id = task["id"]
         page_id = task["page_id"]
         post_id = task["post_id"]
@@ -256,8 +265,15 @@ def _execute_due_tasks():
             content = spintax.spin(content)
 
         # 5. Lock task for sending
+        if SCHEDULER_METRICS["paused_all"]:
+            break
         if not db.lock_task_for_sending(task_id):
             continue
+        # A pause may land right after the lock: give the task back so it is not
+        # left in SENDING (which later becomes a false NEED_CHECK).
+        if SCHEDULER_METRICS["paused_all"]:
+            db.release_task_lock(task_id)
+            break
 
         # 6. Post comment to Meta (via Graph API if token available, else via Antidetect CDP)
         profile_id = fresh_page.get("antidetect_profile_id") or task.get("antidetect_profile_id")
@@ -354,6 +370,9 @@ def run_manual_sync_cycle():
         return
     with _SCAN_LOCK:
         _detect_new_posts_and_schedule()
+    # Pause toggled while scanning: do not start posting the freshly scheduled tasks.
+    if SCHEDULER_METRICS["paused_all"]:
+        return
     with _EXEC_LOCK:
         _execute_due_tasks()
 

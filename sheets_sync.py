@@ -89,6 +89,37 @@ def _get_col(row: Dict[str, str], candidates: set, default: str = "") -> str:
     return default
 
 
+def _get_explicit_col(row: Dict[str, str], candidates: set) -> Optional[str]:
+    """Returns the cell value only when the column exists and is non-empty."""
+    for c in candidates:
+        if c in row:
+            value = (row[c] or "").strip()
+            if value:
+                return value
+    return None
+
+
+TRUE_VALUES = {
+    "true", "1", "bật", "bat", "yes", "ok", "có", "co", "on",
+    "hoạt động", "hoat dong", "active",
+}
+FALSE_VALUES = {
+    "false", "0", "tắt", "tat", "không", "khong", "no", "off",
+    "tạm dừng", "tam dung", "inactive", "khóa", "khoa",
+}
+
+
+def _parse_enabled(value: Optional[str], default: bool) -> Tuple[bool, Optional[str]]:
+    if value is None:
+        return default, None
+    normalized = value.strip().lower()
+    if normalized in TRUE_VALUES:
+        return True, None
+    if normalized in FALSE_VALUES:
+        return False, None
+    return default, f"Giá trị 'Bật tự động' '{value}' không hợp lệ (dùng TRUE/FALSE)."
+
+
 def fetch_sheet_csv(sheet_id: str, tab_name: str = "", gid: Optional[str] = None) -> Tuple[List[Dict[str, str]], Optional[str]]:
     """
     Fetches a tab from Google Sheet as CSV (either by tab_name or by gid).
@@ -434,9 +465,21 @@ def sync_from_google_sheet(sheet_url_or_id: str) -> Dict[str, Any]:
             prev_cfg = aggregated_configs.get(canonical_pid)
             max_per_day = prev_cfg["max_per_day"] if prev_cfg else (matched_page.get("max_comments_per_day") or 20)
 
-        # Parse is_enabled
-        enabled_val = _get_col(r, ENABLED_COLS, "true").strip().lower()
-        is_enabled = enabled_val in ["true", "1", "bật", "yes", "ok", "có"]
+        # Parse is_enabled. Column absent/empty => keep current state, so a periodic
+        # sync cannot silently re-enable a rule the operator disabled in the Tool.
+        prev_cfg = aggregated_configs.get(canonical_pid)
+        existing_enabled = (
+            prev_cfg["is_enabled"] if prev_cfg
+            else bool(matched_page.get("rule_enabled", 1))
+        )
+        raw_enabled = _get_explicit_col(r, ENABLED_COLS)
+        if raw_enabled is not None:
+            is_enabled, enabled_err = _parse_enabled(raw_enabled, existing_enabled)
+            if enabled_err:
+                errors.append(f"Dòng {idx}: {enabled_err}")
+                continue
+        else:
+            is_enabled = existing_enabled
 
         if unified_mode:
             tpl = _get_col(r, COMMENT_TPL_COLS).strip()

@@ -505,6 +505,22 @@ def lock_task_for_sending(task_id: int) -> bool:
     return affected
 
 
+def release_task_lock(task_id: int) -> bool:
+    """Returns a locked-but-not-sent task to PENDING (used when an emergency pause lands)."""
+    conn = get_connection()
+    with conn:
+        cursor = conn.cursor()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        cursor.execute("""
+            UPDATE tasks
+            SET status = 'PENDING', locked_at = NULL, updated_at = ?
+            WHERE id = ? AND status = 'SENDING'
+        """, (now_iso, task_id))
+        released = cursor.rowcount > 0
+    conn.close()
+    return released
+
+
 def update_task_result(task_id: int, status: str, comment_id: Optional[str] = None, error_message: Optional[str] = None):
     conn = get_connection()
     now_dt = datetime.now(timezone.utc)

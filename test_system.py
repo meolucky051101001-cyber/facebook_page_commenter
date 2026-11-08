@@ -23,7 +23,9 @@ def setup_test_db(tmp_path):
     test_db_path = tmp_path / "test_commenter.db"
     db.DB_PATH = test_db_path
     db.init_db()
+    scheduler.SCHEDULER_METRICS["paused_all"] = False
     yield
+    scheduler.SCHEDULER_METRICS["paused_all"] = False
 
 
 def test_spintax_parsing():
@@ -627,9 +629,66 @@ def test_manual_sync_cycle_honors_pause(monkeypatch):
     monkeypatch.setitem(scheduler.SCHEDULER_METRICS, "paused_all", True)
     with patch("meta_client.post_comment") as mock_post:
         scheduler.run_manual_sync_cycle()
+        scheduler.execute_due_tasks()
         mock_post.assert_not_called()
 
     assert db.get_all_tasks(page_id="page_mp")[0]["status"] == "PENDING"
+
+
+def test_pause_stops_batch_before_next_task(monkeypatch):
+    acc_id = db.upsert_account("Nick Pause Batch")
+    db.upsert_page("page_pa", "Page Pause A", "token_pa", acc_id)
+    db.upsert_page("page_pb", "Page Pause B", "token_pb", acc_id)
+    past_iso = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+    db.create_task("page_pa", "post_pa", "Msg A", past_iso)
+    db.create_task("page_pb", "post_pb", "Msg B", past_iso)
+
+    posted = []
+
+    def fake_post(post_id, page_id, page_access_token, message):
+        posted.append(page_id)
+        monkeypatch.setitem(scheduler.SCHEDULER_METRICS, "paused_all", True)
+        return {"success": True, "comment_id": f"c_{post_id}", "usage_pct": None}
+
+    with patch("meta_client.post_comment", side_effect=fake_post):
+        scheduler.execute_due_tasks()
+
+    assert len(posted) == 1
+    statuses = sorted(t["status"] for t in db.get_all_tasks())
+    assert statuses == ["PENDING", "SUCCESS"]
+
+
+def test_pause_after_lock_releases_task(monkeypatch):
+    acc_id = db.upsert_account("Nick Pause Lock")
+    db.upsert_page("page_pl", "Page Pause Lock", "token_pl", acc_id)
+    past_iso = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+    db.create_task("page_pl", "post_pl", "Msg", past_iso)
+
+    real_lock = db.lock_task_for_sending
+
+    def lock_then_pause(task_id):
+        locked = real_lock(task_id)
+        monkeypatch.setitem(scheduler.SCHEDULER_METRICS, "paused_all", True)
+        return locked
+
+    monkeypatch.setattr(db, "lock_task_for_sending", lock_then_pause)
+    with patch("meta_client.post_comment") as mock_post:
+        scheduler.execute_due_tasks()
+        mock_post.assert_not_called()
+
+    task = db.get_all_tasks(page_id="page_pl")[0]
+    assert task["status"] == "PENDING"
+    assert task["locked_at"] is None
+
+
+def test_manual_sync_skips_execution_if_paused_during_scan():
+    def fake_scan():
+        scheduler.SCHEDULER_METRICS["paused_all"] = True
+
+    with patch.object(scheduler, "_detect_new_posts_and_schedule", side_effect=fake_scan):
+        with patch.object(scheduler, "_execute_due_tasks") as mock_exec:
+            scheduler.run_manual_sync_cycle()
+            mock_exec.assert_not_called()
 
 
 def test_maintenance_keeps_hybrid_page_active_on_cdp(monkeypatch):
@@ -712,21 +771,21 @@ def _mock_cdp_environment(monkeypatch):
     return antidetect_client
 
 
-def _cdp_page_state(acting_as_page):
+def _cdp_page_state(actor_names, actor_button=None, switch_button=None, comment_box=True):
     return {
         "url": "https://www.facebook.com/example/posts/1",
         "accessState": "ok",
-        "actingAsPage": acting_as_page,
-        "actorButtonRect": None,
-        "switchProfileButtonRect": None,
-        "commentBoxRect": {"x": 10, "y": 20, "w": 200, "h": 30},
+        "actorNames": list(actor_names),
+        "actorButtonRect": actor_button,
+        "switchProfileButtonRect": switch_button,
+        "commentBoxRect": {"x": 10, "y": 20, "w": 200, "h": 30} if comment_box else None,
         "commentBoxPlaceholder": "Bình luận dưới tên Page Mẫu",
     }
 
 
 def test_cdp_comment_blocked_when_actor_not_confirmed(monkeypatch):
     ad = _mock_cdp_environment(monkeypatch)
-    state = _cdp_page_state(False)
+    state = _cdp_page_state(["Nick Cá Nhân"])
 
     async def fake_eval(ws, msg_id, expression, timeout=10.0):
         return dict(state)
@@ -757,7 +816,7 @@ def test_cdp_comment_blocked_when_actor_not_confirmed(monkeypatch):
 
 def test_cdp_comment_sends_when_actor_confirmed(monkeypatch):
     ad = _mock_cdp_environment(monkeypatch)
-    state = _cdp_page_state(True)
+    state = _cdp_page_state(["Page Mẫu"])
     calls = {"evaluations": 0}
     typed = []
 
@@ -787,6 +846,99 @@ def test_cdp_comment_sends_when_actor_confirmed(monkeypatch):
 
     assert res["success"] is True
     assert typed == ["Xin chào"]
+
+
+def test_cdp_actor_name_matching_is_exact():
+    import antidetect_client as ad
+
+    assert ad._actor_names_match(["Page Mẫu"], "Page Mẫu") is True
+    assert ad._actor_names_match(["  page   mẫu "], "Page Mẫu") is True
+    assert ad._actor_names_match(["Page Mẫu Outlet"], "Page Mẫu") is False
+    assert ad._actor_names_match(["Nick Cá Nhân"], "Page Mẫu") is False
+    assert ad._actor_names_match([], "Page Mẫu") is False
+    assert ad._actor_names_match(["Page Mẫu", "Page Mẫu Outlet"], "Page Mẫu") is False
+    assert ad._actor_names_match(["Page Mẫu"], "") is False
+
+    options = [
+        {"text": "Page Mẫu", "x": 100, "y": 200},
+        {"text": "Page Mẫu Outlet", "x": 100, "y": 260},
+    ]
+    matches = ad._select_exact_actor_option(options, "Page Mẫu")
+    assert matches == [{"text": "Page Mẫu", "x": 100, "y": 200}]
+
+    duplicate_options = options + [{"text": "page   mẫu", "x": 100, "y": 300}]
+    assert len(ad._select_exact_actor_option(duplicate_options, "Page Mẫu")) == 2
+
+
+def test_cdp_comment_blocks_prefix_actor_name(monkeypatch):
+    ad = _mock_cdp_environment(monkeypatch)
+    state = _cdp_page_state(["Page Mẫu Outlet"])
+
+    async def fake_eval(ws, msg_id, expression, timeout=10.0):
+        return dict(state)
+
+    async def fake_type(ws, msg_id, text, human_helper=None):
+        raise AssertionError("must never type when actor name only matches as a prefix")
+
+    monkeypatch.setattr(ad, "_cdp_eval", fake_eval)
+    monkeypatch.setattr(ad, "_human_type_and_submit_on_ws", fake_type)
+
+    res = ad.post_comment_cdp(
+        post_id="post_prefix",
+        page_id="page_actor",
+        page_name="Page Mẫu",
+        page_url=None,
+        profile_id="prof_actor",
+        message="Xin chào",
+    )
+
+    assert res["success"] is False
+    assert res["category"] == "INVALID_TARGET"
+    assert "Page khác" in res["error"]
+
+
+def test_cdp_comment_blocks_ambiguous_actor_menu(monkeypatch):
+    ad = _mock_cdp_environment(monkeypatch)
+    state = _cdp_page_state(["Nick Cá Nhân"], actor_button={"x": 5, "y": 6})
+    menu_options = [
+        {"text": "Page Mẫu", "x": 100, "y": 200},
+        {"text": "Page Mẫu", "x": 100, "y": 320},
+    ]
+    calls = {"evaluations": 0}
+    typed = []
+
+    async def fake_eval(ws, msg_id, expression, timeout=10.0):
+        calls["evaluations"] += 1
+        if calls["evaluations"] == 1:
+            return dict(state)
+        if calls["evaluations"] == 2:
+            return list(menu_options)
+        return dict(state)
+
+    async def fake_click(ws, msg_id, x, y, human_helper=None):
+        return msg_id + 1
+
+    async def fake_type(ws, msg_id, text, human_helper=None):
+        typed.append(text)
+        return msg_id + 1
+
+    monkeypatch.setattr(ad, "_cdp_eval", fake_eval)
+    monkeypatch.setattr(ad, "_human_click_on_ws", fake_click)
+    monkeypatch.setattr(ad, "_human_type_and_submit_on_ws", fake_type)
+
+    res = ad.post_comment_cdp(
+        post_id="post_ambiguous",
+        page_id="page_actor",
+        page_name="Page Mẫu",
+        page_url=None,
+        profile_id="prof_actor",
+        message="Xin chào",
+    )
+
+    assert res["success"] is False
+    assert res["category"] == "INVALID_TARGET"
+    assert "trùng" in res["error"]
+    assert typed == []
 
 
 def test_google_sheet_unified_disables_pages_missing_from_sheet():
@@ -834,5 +986,66 @@ def test_google_sheet_rejects_ambiguous_page_name():
     assert any("trùng" in e for e in res["errors"])
     assert json.loads(db.get_page("100000000000003")["templates"]) == ["Rule A"]
     assert json.loads(db.get_page("100000000000004")["templates"]) == ["Rule B"]
+
+
+def test_sheet_sync_preserves_disabled_rule_when_enabled_column_absent():
+    acc_id = db.upsert_account("Nick Keep Disabled", "u_kd", "tok")
+    db.upsert_page("100000000000005", "Page Giữ Tắt", "tok_kd", acc_id)
+    db.update_page_rule("100000000000005", 10, ["Mẫu cũ"], 20, False)
+
+    unified_rows = [{
+        "page id": "'100000000000005",
+        "tên fanpage": "Page Giữ Tắt",
+        "mẫu bình luận": "Mẫu mới",
+    }]
+
+    with patch("sheets_sync.fetch_sheet_csv", return_value=(unified_rows, None)):
+        res = sheets_sync.sync_from_google_sheet("https://docs.google.com/spreadsheets/d/mock123/edit")
+
+    assert res["success"] is True
+    assert res["errors"] == []
+    page = db.get_page("100000000000005")
+    assert page["rule_enabled"] == 0
+    assert json.loads(page["templates"]) == ["Mẫu mới"]
+
+
+def test_sheet_sync_preserves_disabled_rule_when_enabled_cell_blank():
+    acc_id = db.upsert_account("Nick Keep Blank", "u_kb", "tok")
+    db.upsert_page("100000000000006", "Page Giữ Tắt 2", "tok_kb", acc_id)
+    db.update_page_rule("100000000000006", 10, ["Mẫu cũ"], 20, False)
+
+    unified_rows = [{
+        "page id": "'100000000000006",
+        "tên fanpage": "Page Giữ Tắt 2",
+        "mẫu bình luận": "Mẫu mới",
+        "bật tự động": "",
+    }]
+
+    with patch("sheets_sync.fetch_sheet_csv", return_value=(unified_rows, None)):
+        res = sheets_sync.sync_from_google_sheet("https://docs.google.com/spreadsheets/d/mock123/edit")
+
+    assert res["success"] is True
+    assert res["errors"] == []
+    assert db.get_page("100000000000006")["rule_enabled"] == 0
+
+
+def test_sheet_sync_explicit_false_disables_rule():
+    acc_id = db.upsert_account("Nick Explicit False", "u_ef", "tok")
+    db.upsert_page("100000000000007", "Page Tắt Chủ Động", "tok_ef", acc_id)
+    assert db.get_page("100000000000007")["rule_enabled"] == 1
+
+    unified_rows = [{
+        "page id": "'100000000000007",
+        "tên fanpage": "Page Tắt Chủ Động",
+        "mẫu bình luận": "Mẫu mới",
+        "bật tự động": "FALSE",
+    }]
+
+    with patch("sheets_sync.fetch_sheet_csv", return_value=(unified_rows, None)):
+        res = sheets_sync.sync_from_google_sheet("https://docs.google.com/spreadsheets/d/mock123/edit")
+
+    assert res["success"] is True
+    assert res["errors"] == []
+    assert db.get_page("100000000000007")["rule_enabled"] == 0
 
 

@@ -736,7 +736,7 @@ _INSPECT_POST_AND_ACTOR_JS = r"""
     const out = {
         url: location.href,
         accessState: 'ok',
-        actingAsPage: false,
+        actorNames: [],
         actorButtonRect: null,
         switchProfileButtonRect: null,
         commentBoxRect: null,
@@ -752,12 +752,60 @@ _INSPECT_POST_AND_ACTOR_JS = r"""
         return out;
     }
 
-    const norm = (s) => String(s || '').toLowerCase().trim().replace(/\s+/g, ' ');
+    const norm = (s) => String(s || '')
+        .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
+        .toLowerCase()
+        .replace(/\s+/g, ' ')
+        .trim();
+
     const targetName = norm(expectedPageName);
 
-    const rectOf = (el) => {
+    const markers = [
+        'đang tương tác dưới tên ',
+        'bình luận dưới tên ',
+        'bình luận với tư cách ',
+        'viết bình luận dưới tên ',
+        'bình luận bằng tài khoản ',
+        'interacting as ',
+        'commenting as ',
+        'comment as ',
+        'posting as ',
+        'writing as ',
+    ];
+
+    // Extracts the actor name that follows a known "acting as ..." phrase.
+    // Returns '' when no phrase is present so callers cannot guess an identity.
+    const extractActor = (raw) => {
+        const text = norm(raw);
+        if (!text) return '';
+        let bestIndex = -1;
+        let bestMarker = '';
+        for (const marker of markers) {
+            const idx = text.indexOf(marker);
+            if (idx >= 0 && (bestIndex === -1 || idx < bestIndex)) {
+                bestIndex = idx;
+                bestMarker = marker;
+            }
+        }
+        if (bestIndex === -1) return '';
+        let rest = text.slice(bestIndex + bestMarker.length);
+        rest = rest.split(/[.!?·|\n]/)[0];
+        rest = rest.replace(/(nhấn|bấm|click|tap)\s+(để\s+)?(thay đổi|chuyển|đổi).*$/, '');
+        rest = rest.replace(/^(là|as)\s+/, '');
+        rest = rest.replace(/^["'“”‘’]+|["'“”‘’]+$/g, '').trim();
+        return rest;
+    };
+
+    const addActor = (raw) => {
+        const actor = extractActor(raw);
+        if (actor && !out.actorNames.includes(actor)) {
+            out.actorNames.push(actor);
+        }
+    };
+
+    const rectOf = (el, allowScroll) => {
         if (!el) return null;
-        el.scrollIntoView({block: 'center', inline: 'center'});
+        if (allowScroll !== false) el.scrollIntoView({block: 'center', inline: 'center'});
         const r = el.getBoundingClientRect();
         if (r.width <= 2 || r.height <= 2) return null;
         return {
@@ -768,67 +816,67 @@ _INSPECT_POST_AND_ACTOR_JS = r"""
         };
     };
 
-    // 1. Check if page header has "Đang tương tác dưới tên..." or "Chuyển ngay" / "Switch Now"
-    const bodyText = norm(document.body ? document.body.innerText : '');
-    if (targetName && (
-        bodyText.includes('đang tương tác dưới tên ' + targetName) ||
-        bodyText.includes('interacting as ' + targetName) ||
-        bodyText.includes('bình luận dưới tên ' + targetName) ||
-        bodyText.includes('comment as ' + targetName)
-    )) {
-        out.actingAsPage = true;
-    }
-
-    // 2. Find comment textbox (contenteditable="true" and role="textbox")
+    // 1. Comment textbox: its aria-label is the most reliable actor hint.
     const boxes = Array.from(document.querySelectorAll('div[contenteditable="true"][role="textbox"]'));
     let targetBox = null;
     for (const b of boxes) {
-        const label = norm(b.getAttribute('aria-label') || b.getAttribute(' aria-placeholder') || '');
+        const label = norm(b.getAttribute('aria-label') || b.getAttribute('aria-placeholder') || b.getAttribute('data-placeholder') || '');
         if (label.includes('bình luận') || label.includes('comment') || label.includes('trả lời') || label.includes('reply')) {
             targetBox = b;
             out.commentBoxPlaceholder = label;
-            if (targetName && label.includes(targetName)) {
-                out.actingAsPage = true;
-            }
+            addActor(label);
             break;
         }
     }
     if (!targetBox && boxes.length > 0) {
         targetBox = boxes[0];
         out.commentBoxPlaceholder = norm(targetBox.getAttribute('aria-label') || '');
+        addActor(out.commentBoxPlaceholder);
     }
     if (targetBox) {
         out.commentBoxRect = rectOf(targetBox);
     }
 
-    // 3. Look for inline Actor Switcher button near the comment area
-    const buttons = Array.from(document.querySelectorAll('[role="button"], button'));
-    for (const btn of buttons) {
-        const aria = norm(btn.getAttribute('aria-label') || btn.textContent || '');
-        if (
+    // 2. Inline actor switcher controls. Only control elements and live regions are
+    // inspected; user-written comment text never contributes an actor name.
+    for (const btn of Array.from(document.querySelectorAll('[role="button"], button'))) {
+        const aria = norm(btn.getAttribute('aria-label') || '');
+        const text = norm(btn.innerText || btn.textContent || '');
+        const looksLikeActorControl = (
             aria.includes('tư cách') ||
             aria.includes('đang tương tác') ||
             aria.includes('bình luận dưới tên') ||
+            aria.includes('bình luận với tư cách') ||
             aria.includes('comment as') ||
+            aria.includes('commenting as') ||
             aria.includes('interacting as') ||
-            aria.includes('chọn người bình luận')
-        ) {
-            if (targetName && aria.includes(targetName)) {
-                out.actingAsPage = true;
-            }
-            const rc = rectOf(btn);
-            if (rc) {
-                out.actorButtonRect = rc;
-                break;
-            }
+            aria.includes('chọn người bình luận') ||
+            text.includes('đang tương tác dưới tên') ||
+            text.includes('bình luận dưới tên')
+        );
+        if (!looksLikeActorControl) continue;
+        addActor(aria);
+        addActor(text);
+        if (!out.actorButtonRect) {
+            out.actorButtonRect = rectOf(btn, false);
         }
     }
+    for (const region of Array.from(document.querySelectorAll('[role="status"], [aria-live]'))) {
+        addActor(region.innerText || region.textContent || '');
+    }
 
-    // 4. Look for Page-level "Chuyển ngay" / "Switch Now" / "Chuyển" button if not acting as page
-    if (!out.actingAsPage) {
-        for (const btn of buttons) {
+    // 3. Page-level "Chuyển ngay" / "Switch Now" button, only when the exact target
+    // Page name is not confirmed yet and it follows "chuyển sang" / "switch to".
+    const confirmedTarget = targetName && out.actorNames.some((name) => name === targetName);
+    if (!confirmedTarget) {
+        for (const btn of Array.from(document.querySelectorAll('[role="button"], button'))) {
             const txt = norm(btn.getAttribute('aria-label') || btn.textContent || '');
-            if (txt === 'chuyển ngay' || txt === 'switch now' || txt === 'chuyển sang trang' || txt.includes('chuyển sang ' + targetName)) {
+            const isGenericSwitch = txt === 'chuyển ngay' || txt === 'switch now' || txt === 'chuyển sang trang';
+            const isTargetSwitch = targetName && (
+                txt === 'chuyển sang ' + targetName ||
+                txt === 'switch to ' + targetName
+            );
+            if (isGenericSwitch || isTargetSwitch) {
                 const rc = rectOf(btn);
                 if (rc) {
                     out.switchProfileButtonRect = rc;
@@ -843,26 +891,63 @@ _INSPECT_POST_AND_ACTOR_JS = r"""
 """
 
 _FIND_ACTOR_MENU_OPTION_JS = r"""
-((expectedPageName) => {
-    const norm = (s) => String(s || '').toLowerCase().trim().replace(/\s+/g, ' ');
-    const targetName = norm(expectedPageName);
-    if (!targetName) return null;
+(() => {
+    const norm = (s) => String(s || '')
+        .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
+        .toLowerCase()
+        .replace(/\s+/g, ' ')
+        .trim();
 
-    const candidates = Array.from(document.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="option"], [role="dialog"] [role="button"], [role="menu"] [role="button"]'));
-    for (const el of candidates) {
-        const txt = norm(el.innerText || el.textContent || el.getAttribute('aria-label') || '');
-        if (txt.includes(targetName)) {
-            el.scrollIntoView({block: 'center', inline: 'center'});
-            const r = el.getBoundingClientRect();
-            if (r.width > 4 && r.height > 4) {
-                return {
-                    x: Math.round(r.left + r.width / 2),
-                    y: Math.round(r.top + r.height / 2)
-                };
+    const markers = [
+        'đang tương tác dưới tên ',
+        'bình luận dưới tên ',
+        'bình luận với tư cách ',
+        'viết bình luận dưới tên ',
+        'bình luận bằng tài khoản ',
+        'interacting as ',
+        'commenting as ',
+        'comment as ',
+        'posting as ',
+        'writing as ',
+    ];
+
+    const labelOf = (el) => {
+        const raw = String(el.innerText || el.textContent || el.getAttribute('aria-label') || '');
+        const text = norm(raw);
+        let bestIndex = -1;
+        let bestMarker = '';
+        for (const marker of markers) {
+            const idx = text.indexOf(marker);
+            if (idx >= 0 && (bestIndex === -1 || idx < bestIndex)) {
+                bestIndex = idx;
+                bestMarker = marker;
             }
         }
+        let label = '';
+        if (bestIndex >= 0) {
+            label = text.slice(bestIndex + bestMarker.length).split(/[.!?·|\n]/)[0];
+            label = label.replace(/(nhấn|bấm|click|tap)\s+(để\s+)?(thay đổi|chuyển|đổi).*$/, '');
+        } else {
+            label = norm(raw.split('\n').find((line) => norm(line)) || '');
+        }
+        return label.replace(/^["'“”‘’]+|["'“”‘’]+$/g, '').trim();
+    };
+
+    const options = [];
+    const seenRects = new Set();
+    for (const el of Array.from(document.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="option"]'))) {
+        const r = el.getBoundingClientRect();
+        if (r.width <= 4 || r.height <= 4) continue;
+        const key = Math.round(r.left / 10) + ':' + Math.round(r.top / 10);
+        if (seenRects.has(key)) continue;
+        seenRects.add(key);
+        options.push({
+            text: labelOf(el),
+            x: Math.round(r.left + r.width / 2),
+            y: Math.round(r.top + r.height / 2)
+        });
     }
-    return null;
+    return options;
 })
 """
 
@@ -966,6 +1051,44 @@ async def _human_type_and_submit_on_ws(ws, msg_id: int, text: str, human_helper=
     return msg_id
 
 
+def _normalize_actor_name(name: str) -> str:
+    text = (name or "").replace("\u200b", "").replace("\u200c", "").replace("\u200d", "").replace("\ufeff", "")
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def _actor_names_match(actor_names: List[str], page_name: str) -> bool:
+    """True only when every detected actor name is exactly the target Page name."""
+    target = _normalize_actor_name(page_name)
+    if not target:
+        return False
+    names = [_normalize_actor_name(n) for n in (actor_names or []) if isinstance(n, str)]
+    names = [n for n in names if n]
+    return bool(names) and all(n == target for n in names)
+
+
+def _select_exact_actor_option(candidates: Any, page_name: str) -> List[Dict[str, Any]]:
+    """Keeps only actor-menu items whose label exactly equals the target Page name."""
+    target = _normalize_actor_name(page_name)
+    if not target or not isinstance(candidates, list):
+        return []
+    picked: List[Dict[str, Any]] = []
+    seen = set()
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        if _normalize_actor_name(candidate.get("text") or "") != target:
+            continue
+        try:
+            key = (int(float(candidate.get("x") or 0)) // 10, int(float(candidate.get("y") or 0)) // 10)
+        except (TypeError, ValueError):
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        picked.append(candidate)
+    return picked
+
+
 def post_comment_cdp(
     post_id: str,
     page_id: str,
@@ -1034,16 +1157,29 @@ def post_comment_cdp(
                         "usage_pct": None,
                     }
 
-                # Try switching actor to Fanpage if not already acting as the Fanpage
-                if not state.get("actingAsPage"):
+                # Try switching actor to Fanpage unless the exact Page identity is confirmed
+                if not _actor_names_match(state.get("actorNames"), page_name):
                     if state.get("actorButtonRect"):
                         rc = state["actorButtonRect"]
                         msg_id = await _human_click_on_ws(ws, msg_id, rc["x"], rc["y"], human_helper)
                         await asyncio.sleep(1.2)
                         msg_id += 1
-                        opt_rc = await _cdp_eval(ws, msg_id, f"{_FIND_ACTOR_MENU_OPTION_JS}({escaped_name})")
-                        if isinstance(opt_rc, dict) and opt_rc.get("x") and opt_rc.get("y"):
-                            msg_id = await _human_click_on_ws(ws, msg_id, opt_rc["x"], opt_rc["y"], human_helper)
+                        options = await _cdp_eval(ws, msg_id, _FIND_ACTOR_MENU_OPTION_JS)
+                        matches = _select_exact_actor_option(options, page_name)
+                        if len(matches) > 1:
+                            return {
+                                "success": False,
+                                "category": "INVALID_TARGET",
+                                "error": (
+                                    f"Menu chọn Page có {len(matches)} mục trùng khớp chính xác với tên "
+                                    f"'{page_name}'. Đã chặn gửi để tránh bình luận sai Page."
+                                ),
+                                "usage_pct": None,
+                            }
+                        if len(matches) == 1:
+                            msg_id = await _human_click_on_ws(
+                                ws, msg_id, matches[0]["x"], matches[0]["y"], human_helper
+                            )
                             await asyncio.sleep(1.8)
                     elif state.get("switchProfileButtonRect"):
                         rc = state["switchProfileButtonRect"]
@@ -1054,8 +1190,8 @@ def post_comment_cdp(
                     msg_id += 1
                     state = await _cdp_eval(ws, msg_id, f"{_INSPECT_POST_AND_ACTOR_JS}({escaped_name})") or state
 
-                # Hard safety gate: never type a comment unless the page identity is confirmed.
-                if not state.get("actingAsPage"):
+                # Hard safety gate: never type a comment unless the exact page identity is confirmed.
+                if not _actor_names_match(state.get("actorNames"), page_name):
                     return {
                         "success": False,
                         "category": "INVALID_TARGET",
