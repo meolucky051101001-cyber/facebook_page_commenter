@@ -36,6 +36,11 @@ SLUG_ALIASES = {
 }
 
 
+# Avoid inheriting malformed OS proxy settings that crash httpx 0.28 on client init.
+def _http_client(timeout: float) -> httpx.Client:
+    return httpx.Client(timeout=timeout, follow_redirects=True, trust_env=False)
+
+
 def _normalize_slug(text: str) -> str:
     """Strips Vietnamese diacritics, spaces, and punctuation for fuzzy Page name/slug matching."""
     if not text:
@@ -65,7 +70,7 @@ def _discover_sheet_gids(sheet_id: str) -> List[str]:
     """Discovers non-zero GIDs from a public Google Sheet HTML page when gid=0 is empty."""
     gids: List[str] = ["1405549804"]
     try:
-        with httpx.Client(timeout=10.0, follow_redirects=True) as client:
+        with _http_client(10.0) as client:
             resp = client.get(f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit")
             if resp.status_code == 200:
                 found = re.findall(r'gid["\s:=]+(\d{5,})', resp.text)
@@ -96,7 +101,7 @@ def fetch_sheet_csv(sheet_id: str, tab_name: str = "", gid: Optional[str] = None
         url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={tab_name}"
         label = tab_name
     try:
-        with httpx.Client(timeout=15.0, follow_redirects=True) as client:
+        with _http_client(15.0) as client:
             resp = client.get(url)
             if resp.status_code in (401, 403):
                 return [], (

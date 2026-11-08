@@ -12,6 +12,12 @@ GRAPH_API_BASE = f"https://graph.facebook.com/{config.GRAPH_API_VERSION}"
 REQUIRED_SCOPES = {"pages_show_list", "pages_read_engagement", "pages_manage_engagement"}
 
 
+# httpx 0.28 eagerly parses OS proxy settings, which crash the client when Windows
+# has a malformed registry proxy. Meta Graph calls must not inherit that proxy.
+def _http_client(timeout: float) -> httpx.Client:
+    return httpx.Client(timeout=timeout, trust_env=False)
+
+
 class MetaAPIError(Exception):
     def __init__(self, code: int, subcode: Optional[int], message: str, category: str):
         super().__init__(message)
@@ -94,7 +100,7 @@ def exchange_for_long_lived_user_token(short_lived_token: str) -> Tuple[str, Opt
         "client_secret": config.META_APP_SECRET,
         "fb_exchange_token": short_lived_token
     }
-    with httpx.Client(timeout=15.0) as client:
+    with _http_client(15.0) as client:
         resp = client.get(url, params=params)
         data = resp.json()
         if "error" in data:
@@ -122,7 +128,7 @@ def debug_token(token: str) -> Dict[str, Any]:
         "access_token": app_access_token
     }
     try:
-        with httpx.Client(timeout=15.0) as client:
+        with _http_client(15.0) as client:
             resp = client.get(url, params=params)
             data = resp.json()
     except Exception as e:
@@ -182,7 +188,7 @@ def get_user_info(user_token: str) -> Dict[str, Any]:
     """Fetches user ID and Name for the current user token."""
     url = f"{GRAPH_API_BASE}/me"
     params = {"access_token": user_token, "fields": "id,name"}
-    with httpx.Client(timeout=15.0) as client:
+    with _http_client(15.0) as client:
         resp = client.get(url, params=params)
         data = resp.json()
         if "error" in data:
@@ -202,7 +208,7 @@ def get_user_pages(user_access_token: str) -> List[Dict[str, Any]]:
         "fields": "id,name,access_token,category,tasks",
         "limit": 100
     }
-    with httpx.Client(timeout=15.0) as client:
+    with _http_client(15.0) as client:
         resp = client.get(url, params=params)
         data = resp.json()
         if "error" in data:
@@ -257,7 +263,7 @@ def verify_post_belongs_to_page(post_id_or_url: str, page_id: str, page_access_t
         "access_token": page_access_token,
         "fields": "id,from,created_time,message,permalink_url"
     }
-    with httpx.Client(timeout=15.0) as client:
+    with _http_client(15.0) as client:
         resp = client.get(url, params=params)
         data = resp.json()
         if "error" in data:
@@ -290,7 +296,7 @@ def get_recent_posts(page_id: str, page_access_token: str, since_timestamp: Opti
     if since_timestamp:
         params["since"] = since_timestamp
 
-    with httpx.Client(timeout=15.0) as client:
+    with _http_client(15.0) as client:
         resp = client.get(url, params=params)
         data = resp.json()
         if "error" in data:
@@ -312,7 +318,7 @@ def check_comment_exists(post_id: str, page_id: str, page_access_token: str, mes
         "fields": "id,from,message,created_time"
     }
     try:
-        with httpx.Client(timeout=15.0) as client:
+        with _http_client(15.0) as client:
             resp = client.get(url, params=params)
             data = resp.json()
             comments = data.get("data", [])
@@ -345,7 +351,7 @@ def post_comment(post_id: str, page_id: str, page_access_token: str, message: st
     }
 
     try:
-        with httpx.Client(timeout=20.0) as client:
+        with _http_client(20.0) as client:
             resp = client.post(url, data=data)
 
             usage_pct = parse_usage_header(resp.headers)
