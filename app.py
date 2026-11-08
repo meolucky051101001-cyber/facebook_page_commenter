@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.responses import HTMLResponse
 
 import config
@@ -103,10 +103,9 @@ def toggle_pause():
 
 
 @app.post("/api/sync")
-def trigger_manual_sync():
-    scheduler.detect_new_posts_and_schedule()
-    scheduler.execute_due_tasks()
-    return {"success": True, "message": "Đã quét bài mới và thực thi các tác vụ đến hạn."}
+def trigger_manual_sync(background_tasks: BackgroundTasks):
+    background_tasks.add_task(scheduler.run_manual_sync_cycle)
+    return {"success": True, "message": "Đã bắt đầu quét bài mới và thực thi các tác vụ đến hạn."}
 
 
 @app.get("/api/antidetect/status")
@@ -170,8 +169,47 @@ def resume_page_tasks(page_id: str):
     page = db.get_page(page_id)
     if not page:
         raise HTTPException(status_code=404, detail="Không tìm thấy Page")
-    resumed = db.resume_paused_tasks_for_page(page_id)
+    resumed = db.resume_paused_tasks_for_page(page["page_id"])
     return {"success": True, "resumed_count": resumed, "message": f"Đã khôi phục {resumed} tác vụ tạm dừng về hàng đợi."}
+
+
+@app.post("/api/pages/{page_id}/reactivate")
+def reactivate_page(page_id: str):
+    page = db.get_page(page_id)
+    if not page:
+        raise HTTPException(status_code=404, detail="Không tìm thấy Page")
+
+    canonical_id = page["page_id"]
+    if page.get("is_active"):
+        return {
+            "success": True,
+            "message": "Page đang ở trạng thái hoạt động.",
+            "is_active": True,
+            "token_status": page.get("token_status"),
+        }
+
+    profile_id = page.get("antidetect_profile_id")
+    token_status = page.get("token_status") or "OK"
+
+    if profile_id and token_status in ("EXPIRED", "MISSING_PERMISSIONS"):
+        # Token Graph chết nhưng vẫn còn Profile Antidetect: chuyển hẳn sang CDP
+        token_status = "ANTIDETECT_READY"
+        note = "Đã kích hoạt lại thủ công; token Graph không khả dụng nên chuyển sang Antidetect CDP."
+    elif not profile_id and token_status in ("EXPIRED", "MISSING_PERMISSIONS"):
+        raise HTTPException(
+            status_code=400,
+            detail="Page không có Profile Antidetect và token Graph đang hết hạn/thiếu quyền. Hãy kết nối lại tài khoản để nạp token mới trước khi kích hoạt."
+        )
+    else:
+        note = "Đã kích hoạt lại thủ công."
+
+    db.update_page_status(canonical_id, is_active=True, token_status=token_status, status_note=note)
+    return {
+        "success": True,
+        "message": "Đã kích hoạt lại Page.",
+        "is_active": True,
+        "token_status": token_status,
+    }
 
 
 @app.post("/api/accounts/connect")
@@ -580,10 +618,11 @@ def index():
                                             <th>Nick / Profile nguồn</th>
                                             <th>Chế độ & Trạng thái</th>
                                             <th>Tự động</th>
+                                            <th>Thao tác</th>
                                         </tr>
                                     </thead>
                                     <tbody id="pageTableBody">
-                                        <tr><td colspan="4" class="text-center text-muted">Đang tải danh sách...</td></tr>
+                                        <tr><td colspan="5" class="text-center text-muted">Đang tải danh sách...</td></tr>
                                     </tbody>
                                 </table>
                             </div>
@@ -781,8 +820,7 @@ def index():
             const res = await fetch('/api/sync', { method: 'POST' });
             const data = await res.json();
             alert(data.message);
-            loadTasks();
-            fetchMetrics();
+            setTimeout(() => { loadTasks(); fetchMetrics(); }, 2000);
         }
 
         async function fetchPages() {
@@ -802,11 +840,12 @@ def index():
             filterPage.innerHTML = '<option value="">Tất cả Fanpage</option>';
 
             if (cachedPages.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted py-4">Chưa có Page nào. Hãy thêm User Access Token bên trái để nạp Page.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted py-4">Chưa có Page nào. Hãy thêm User Access Token bên trái để nạp Page.</td></tr>';
                 return;
             }
 
             cachedPages.forEach(p => {
+                const isPageActive = Number(p.is_active) === 1;
                 let badgeToken = '<span class="badge bg-success">Graph API (OK)</span>';
                 if (p.connection_mode === 'HYBRID') {
                     badgeToken = '<span class="badge bg-primary">Hybrid (API + Antidetect)</span>';
@@ -818,12 +857,19 @@ def index():
                 else if (p.token_status === 'EXPIRING_SOON') badgeToken = '<span class="badge bg-warning text-dark">Sắp hết hạn</span>';
 
                 const srcLabel = p.antidetect_profile_name || p.account_name || 'N/A';
+                const activeBadge = isPageActive
+                    ? '<span class="badge bg-success">Đang hoạt động</span>'
+                    : '<span class="badge bg-danger">Đã khóa</span>';
+                const actionCell = isPageActive
+                    ? '<span class="text-muted">—</span>'
+                    : `<button class="btn btn-sm btn-outline-success" onclick="reactivatePage('${escapeHtml(p.page_id)}')"><i class="fa-solid fa-rotate-right"></i> Kích hoạt lại</button>`;
                 const tr = document.createElement('tr');
                 tr.innerHTML = `
                     <td><strong>${escapeHtml(p.page_name)}</strong><br><small class="text-muted">ID: ${escapeHtml(p.page_id)}</small></td>
                     <td><span class="badge bg-light text-dark border text-wrap text-start">${escapeHtml(srcLabel)}</span></td>
-                    <td>${badgeToken}<br><small class="text-muted">${escapeHtml(p.status_note || '')}</small></td>
+                    <td>${activeBadge}<br>${badgeToken}<br><small class="text-muted">${escapeHtml(p.status_note || '')}</small></td>
                     <td>${p.rule_enabled ? `<span class="badge bg-primary">Chờ ${p.delay_minutes}p (Tối đa ${p.max_comments_per_day}/ngày)</span>` : '<span class="badge bg-secondary">Tắt</span>'}</td>
+                    <td>${actionCell}</td>
                 `;
                 tbody.appendChild(tr);
 
@@ -835,6 +881,19 @@ def index():
 
             loadPageRule();
             loadRecentPostsForManual();
+        }
+
+        async function reactivatePage(pageId) {
+            if (!confirm('Kích hoạt lại Fanpage này? Hệ thống sẽ quét bài mới và có thể gửi bình luận theo cấu hình.')) return;
+            const res = await fetch(`/api/pages/${encodeURIComponent(pageId)}/reactivate`, { method: 'POST' });
+            const data = await res.json();
+            if (res.ok) {
+                alert(data.message);
+                fetchPages();
+                fetchMetrics();
+            } else {
+                alert('Lỗi: ' + (data.detail || 'Không thể kích hoạt lại Page'));
+            }
         }
 
         async function fetchAntidetectStatus() {

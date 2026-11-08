@@ -44,6 +44,8 @@ SHEET_SYNC_INTERVAL_SEC = int(os.getenv("SHEET_SYNC_INTERVAL_SEC", "300"))
 MAX_POST_AGE_MIN = int(os.getenv("MAX_POST_AGE_MIN", "120"))
 MIN_GAP_PER_PAGE_SEC = int(os.getenv("MIN_GAP_PER_PAGE_SEC", "45"))
 MAX_COMMENTS_PER_PAGE_PER_DAY = int(os.getenv("MAX_COMMENTS_PER_PAGE_PER_DAY", "20"))
+# Daily comment counter follows this UTC offset (default 7 = giờ Việt Nam)
+DAILY_COUNTER_UTC_OFFSET_HOURS = int(os.getenv("DAILY_COUNTER_UTC_OFFSET_HOURS", "7"))
 
 # 5. Antidetect Python Integration
 ANTIDETECT_DIR = os.getenv("ANTIDETECT_DIR", r"C:\Projects\Tools\Antidetect Python").strip()

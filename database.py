@@ -4,10 +4,23 @@ import json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional, Any
+import config
 import crypto
 import migrations
 
 DB_PATH = Path(__file__).parent / "fb_commenter.db"
+
+
+def local_day_key(dt_utc: datetime) -> str:
+    """Returns the counter date for the configured local day (default UTC+7)."""
+    return (dt_utc + timedelta(hours=config.DAILY_COUNTER_UTC_OFFSET_HOURS)).strftime("%Y-%m-%d")
+
+
+def next_daily_reset_utc(dt_utc: datetime) -> str:
+    """Returns the next local midnight expressed in UTC ISO format."""
+    offset = timedelta(hours=config.DAILY_COUNTER_UTC_OFFSET_HOURS)
+    local_next = (dt_utc + offset + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return (local_next - offset).isoformat()
 
 
 def get_connection():
@@ -484,7 +497,8 @@ def lock_task_for_sending(task_id: int) -> bool:
 
 def update_task_result(task_id: int, status: str, comment_id: Optional[str] = None, error_message: Optional[str] = None):
     conn = get_connection()
-    now_utc = datetime.now(timezone.utc).isoformat()
+    now_dt = datetime.now(timezone.utc)
+    now_utc = now_dt.isoformat()
     with conn:
         cursor = conn.cursor()
         cursor.execute("""
@@ -499,7 +513,7 @@ def update_task_result(task_id: int, status: str, comment_id: Optional[str] = No
             t_row = cursor.fetchone()
             if t_row:
                 pid = t_row["page_id"]
-                today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                today_str = local_day_key(now_dt)
                 cursor.execute("""
                     UPDATE pages
                     SET last_comment_at = ?,
@@ -564,6 +578,18 @@ def resolve_task(task_id: int, comment_id: Optional[str] = None) -> bool:
             WHERE id = ? AND status IN ('NEED_CHECK', 'FAILED', 'PAUSED')
         """, (comment_id or "MANUAL_VERIFIED", now_iso, task_id))
         success = cursor.rowcount > 0
+        if success:
+            cursor.execute("SELECT page_id FROM tasks WHERE id = ?", (task_id,))
+            t_row = cursor.fetchone()
+            if t_row:
+                today_str = local_day_key(datetime.now(timezone.utc))
+                cursor.execute("""
+                    UPDATE pages
+                    SET last_comment_at = ?,
+                        comments_today_count = (CASE WHEN comments_today_date = ? THEN comments_today_count + 1 ELSE 1 END),
+                        comments_today_date = ?
+                    WHERE page_id = ?
+                """, (now_iso, today_str, today_str, t_row["page_id"]))
     conn.close()
     return success
 

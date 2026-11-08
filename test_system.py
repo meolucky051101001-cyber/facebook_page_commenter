@@ -304,6 +304,87 @@ def test_retry_and_resolve_task_status_guards():
         assert "Đã đăng" in resp.json()["detail"]
 
 
+def test_reactivate_page_endpoint_hybrid_and_graph_guard():
+    acc_id = db.upsert_account("Nick Reactivate", "u_reactivate", "user_tok")
+    db.upsert_page("page_rx_hybrid", "Page Reactivate Hybrid", "page_tok_hybrid", acc_id, token_status="OK")
+    linked = db.upsert_antidetect_page(
+        fb_page_id="fb_rx_hybrid",
+        page_name="Page Reactivate Hybrid",
+        page_url="https://www.facebook.com/fb_rx_hybrid",
+        antidetect_profile_id="prof-rx",
+        antidetect_profile_name="Profile Reactivate",
+        account_id=acc_id,
+    )
+    assert linked["action"] == "linked_hybrid"
+    db.update_page_status("page_rx_hybrid", False, "EXPIRED", "Token Graph hết hạn")
+    assert db.get_page("page_rx_hybrid")["is_active"] == 0
+
+    db.upsert_page("page_rx_graph", "Page Reactivate Graph", "page_tok_graph", acc_id, token_status="EXPIRED")
+    assert db.get_page("page_rx_graph")["is_active"] == 0
+
+    db.upsert_page("page_rx_manual", "Page Reactivate Manual", "page_tok_manual", acc_id)
+    db.update_page_status("page_rx_manual", False, "OK", "Tạm khóa thủ công")
+
+    with TestClient(fastapi_app.app) as client:
+        # HYBRID + token chết: kích hoạt lại và chuyển hẳn sang CDP
+        resp = client.post("/api/pages/page_rx_hybrid/reactivate")
+        assert resp.status_code == 200
+        assert resp.json()["token_status"] == "ANTIDETECT_READY"
+        p = db.get_page("page_rx_hybrid")
+        assert p["is_active"] == 1
+        assert p["token_status"] == "ANTIDETECT_READY"
+
+        # Graph-only + token chết: chặn, giữ nguyên khóa
+        resp = client.post("/api/pages/page_rx_graph/reactivate")
+        assert resp.status_code == 400
+        assert "Profile Antidetect" in resp.json()["detail"]
+        assert db.get_page("page_rx_graph")["is_active"] == 0
+
+        # Page bị khóa thủ công dù token OK: kích hoạt lại, giữ nguyên token_status
+        resp = client.post("/api/pages/page_rx_manual/reactivate")
+        assert resp.status_code == 200
+        p = db.get_page("page_rx_manual")
+        assert p["is_active"] == 1
+        assert p["token_status"] == "OK"
+
+        # Gọi lại lần hai vẫn an toàn (idempotent)
+        resp = client.post("/api/pages/page_rx_manual/reactivate")
+        assert resp.status_code == 200
+        assert resp.json()["is_active"] is True
+
+        # Page không tồn tại
+        resp = client.post("/api/pages/khong_ton_tai/reactivate")
+        assert resp.status_code == 404
+
+
+def test_manual_resolve_updates_page_counters():
+    acc_id = db.upsert_account("Nick Manual Resolve")
+    db.upsert_page("page_rsv", "Page Resolve", "token_rsv", acc_id)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    db.create_task("page_rsv", "post_rsv", "Msg", now_iso)
+    task_id = db.get_all_tasks(page_id="page_rsv")[0]["id"]
+
+    db.update_task_result(task_id, "NEED_CHECK", error_message="Chưa xác định được kết quả")
+    assert db.get_page("page_rsv")["comments_today_count"] == 0
+
+    assert db.resolve_task(task_id, comment_id="verified_by_operator") is True
+    page = db.get_page("page_rsv")
+    assert page["comments_today_count"] == 1
+    assert page["last_comment_at"] is not None
+    assert page["comments_today_date"] == db.local_day_key(datetime.now(timezone.utc))
+
+
+def test_local_day_counter_and_reset_boundary(monkeypatch):
+    monkeypatch.setattr(config, "DAILY_COUNTER_UTC_OFFSET_HOURS", 7)
+    before_midnight = datetime(2026, 11, 8, 16, 59, tzinfo=timezone.utc)
+    at_midnight = datetime(2026, 11, 8, 17, 0, tzinfo=timezone.utc)
+
+    assert db.local_day_key(before_midnight) == "2026-11-08"
+    assert db.next_daily_reset_utc(before_midnight) == "2026-11-08T17:00:00+00:00"
+    assert db.local_day_key(at_midnight) == "2026-11-09"
+    assert db.next_daily_reset_utc(at_midnight) == "2026-11-09T17:00:00+00:00"
+
+
 def test_scheduler_post_belongs_verification_and_pfbid_url():
     # Verify URL extraction supports pfbid
     extracted = meta_client.extract_post_id_from_input(
@@ -404,6 +485,65 @@ def test_antidetect_hybrid_linking_and_cdp_execution():
         assert tasks[0]["comment_id"] == "cdp_61594671061927_999"
 
 
+def test_hybrid_scanner_falls_back_to_cdp_after_token_expiry(monkeypatch):
+    acc_id = db.upsert_account("Nick Hybrid Scan", "u_hscan", "user_tok")
+    db.upsert_page("page_hscan", "Page Hybrid Scan", "page_tok_hscan", acc_id, token_status="OK")
+    linked = db.upsert_antidetect_page(
+        fb_page_id="fb_hscan",
+        page_name="Page Hybrid Scan",
+        page_url="https://www.facebook.com/fb_hscan",
+        antidetect_profile_id="prof-hscan",
+        antidetect_profile_name="Profile Hybrid Scan",
+        account_id=acc_id,
+    )
+    assert linked["action"] == "linked_hybrid"
+    monkeypatch.setattr(config, "ANTIDETECT_AUTO_SCAN_POSTS", True)
+    fresh_time = datetime.now(timezone.utc).isoformat()
+
+    with patch("antidetect_client._read_runtime_readonly", return_value={}), \
+         patch("antidetect_client._probe_cdp_port", return_value=False), \
+         patch(
+             "meta_client.get_recent_posts",
+             side_effect=meta_client.MetaAPIError(190, 463, "expired", "TOKEN_EXPIRED"),
+         ) as mock_graph, \
+         patch("antidetect_client.get_recent_posts_cdp", return_value=[{
+             "id": "post_hscan_1",
+             "created_time": fresh_time,
+             "permalink_url": "https://www.facebook.com/fb_hscan/posts/1",
+         }]) as mock_cdp:
+        scheduler.detect_new_posts_and_schedule()
+
+    mock_graph.assert_called_once()
+    mock_cdp.assert_called_once()
+    page = db.get_page("page_hscan")
+    assert page["is_active"] == 1
+    assert page["token_status"] == "ANTIDETECT_READY"
+    tasks = db.get_all_tasks(page_id="page_hscan")
+    assert any(t["post_id"] == "post_hscan_1" for t in tasks)
+
+
+def test_single_flight_executor_skips_overlapping_run():
+    acc_id = db.upsert_account("Nick Single Flight")
+    db.upsert_page("page_sf", "Page Single Flight", "token_sf", acc_id)
+    past_iso = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+    db.create_task("page_sf", "post_sf", "Msg", past_iso)
+
+    assert scheduler._EXEC_LOCK.acquire(blocking=False)
+    try:
+        with patch("meta_client.post_comment") as mock_post:
+            scheduler.execute_due_tasks()
+            mock_post.assert_not_called()
+    finally:
+        scheduler._EXEC_LOCK.release()
+
+    assert db.get_all_tasks(page_id="page_sf")[0]["status"] == "PENDING"
+
+    with patch("meta_client.post_comment") as mock_post:
+        mock_post.return_value = {"success": True, "comment_id": "c_sf"}
+        scheduler.execute_due_tasks()
+        mock_post.assert_called_once()
+
+
 def test_google_sheet_unified_single_tab_mode():
     acc_id = db.upsert_account("Nick Test Unified", "u_uni", "tok")
     db.upsert_page("61594671061927", "Tiện Ích Ngôi Nhà", "tok_p", acc_id)
@@ -439,5 +579,78 @@ def test_google_sheet_unified_single_tab_mode():
     assert p["delay_minutes"] == 15
     assert p["max_comments_per_day"] == 12
     assert json.loads(p["templates"]) == ["{Chào|Xin chào} bạn, mẫu 1!", "Mẫu 2 {nhé|nha}!"]
+
+
+def test_maintenance_skips_auto_sheet_sync_while_paused(monkeypatch):
+    monkeypatch.setitem(
+        scheduler.SCHEDULER_METRICS["sheet_sync"],
+        "sheet_url",
+        "https://docs.google.com/spreadsheets/d/mock123/edit",
+    )
+    with patch("sheets_sync.sync_from_google_sheet") as mock_sync:
+        monkeypatch.setitem(scheduler.SCHEDULER_METRICS, "paused_all", True)
+        scheduler.run_maintenance_cycle()
+        mock_sync.assert_not_called()
+
+        monkeypatch.setitem(scheduler.SCHEDULER_METRICS, "paused_all", False)
+        mock_sync.return_value = {"success": True}
+        scheduler.run_maintenance_cycle()
+        mock_sync.assert_called_once()
+
+
+def test_manual_sync_endpoint_schedules_background_cycle():
+    with TestClient(fastapi_app.app) as client:
+        with patch("scheduler.run_manual_sync_cycle") as mock_cycle:
+            resp = client.post("/api/sync")
+            assert resp.status_code == 200
+            assert "bắt đầu" in resp.json()["message"]
+            mock_cycle.assert_called_once()
+
+
+def test_google_sheet_unified_disables_pages_missing_from_sheet():
+    acc_id = db.upsert_account("Nick Unified Drop", "u_drop", "tok")
+    db.upsert_page("100000000000001", "Page Keep Unified", "tok_keep", acc_id)
+    db.upsert_page("100000000000002", "Page Drop Unified", "tok_drop", acc_id)
+
+    unified_rows = [{
+        "page id": "'100000000000001",
+        "tên fanpage": "Page Keep Unified",
+        "sau bao lâu comment (phút)": "10",
+        "mỗi ngày mấy comment": "20",
+        "mẫu bình luận": "Mẫu giữ lại",
+        "bật tự động": "TRUE",
+    }]
+
+    with patch("sheets_sync.fetch_sheet_csv", return_value=(unified_rows, None)):
+        res = sheets_sync.sync_from_google_sheet("https://docs.google.com/spreadsheets/d/mock123/edit")
+
+    assert res["success"] is True
+    assert res["pages_synced"] == 1
+    assert res["pages_disabled"] == 1
+    assert db.get_page("100000000000001")["rule_enabled"] == 1
+    assert db.get_page("100000000000002")["rule_enabled"] == 0
+
+
+def test_google_sheet_rejects_ambiguous_page_name():
+    acc_id = db.upsert_account("Nick Ambiguous", "u_amb", "tok")
+    db.upsert_page("100000000000003", "Page Trùng Tên", "tok_a", acc_id)
+    db.upsert_page("100000000000004", "Page Trùng Tên", "tok_b", acc_id)
+    db.update_page_rule("100000000000003", 10, ["Rule A"], 20, True)
+    db.update_page_rule("100000000000004", 10, ["Rule B"], 20, True)
+
+    unified_rows = [{
+        "tên fanpage": "Page Trùng Tên",
+        "mẫu bình luận": "Mẫu mới",
+        "bật tự động": "TRUE",
+    }]
+
+    with patch("sheets_sync.fetch_sheet_csv", return_value=(unified_rows, None)):
+        res = sheets_sync.sync_from_google_sheet("https://docs.google.com/spreadsheets/d/mock123/edit")
+
+    assert res["success"] is True
+    assert res["pages_synced"] == 0
+    assert any("trùng" in e for e in res["errors"])
+    assert json.loads(db.get_page("100000000000003")["templates"]) == ["Rule A"]
+    assert json.loads(db.get_page("100000000000004")["templates"]) == ["Rule B"]
 
 

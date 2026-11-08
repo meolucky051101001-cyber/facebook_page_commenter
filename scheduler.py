@@ -1,6 +1,7 @@
 import json
 import random
 import asyncio
+import threading
 from datetime import datetime, timezone, timedelta
 from dateutil import parser as date_parser
 from typing import Dict, Any, Optional
@@ -25,7 +26,21 @@ SCHEDULER_METRICS: Dict[str, Any] = {
 }
 
 
+_SCAN_LOCK = threading.Lock()
+_EXEC_LOCK = threading.Lock()
+
+
 def detect_new_posts_and_schedule():
+    """Single-flight wrapper: a background loop and a manual sync must not scan concurrently."""
+    if not _SCAN_LOCK.acquire(blocking=False):
+        return
+    try:
+        _detect_new_posts_and_schedule()
+    finally:
+        _SCAN_LOCK.release()
+
+
+def _detect_new_posts_and_schedule():
     """
     Scans all active pages incrementally, detecting newly published posts.
     Calculates target delay and creates deduplicated auto-tasks.
@@ -61,22 +76,31 @@ def detect_new_posts_and_schedule():
             continue
 
         posts = []
-        if token:
+        token_status = p.get("token_status") or "OK"
+        use_graph = bool(token) and token_status not in ("EXPIRED", "MISSING_PERMISSIONS", "ANTIDETECT_READY")
+
+        if use_graph:
             try:
                 posts = meta_client.get_recent_posts(page_id, token, since_timestamp=since_ts, limit=5)
             except meta_client.MetaAPIError as e:
                 if e.category == "TOKEN_EXPIRED":
                     if profile_id:
-                        # Hybrid fallback: keep active on Antidetect if Graph token expired
+                        # Token chết nhưng còn Profile: chuyển sang CDP và quét ngay trong vòng này
                         db.update_page_status(page_id, is_active=True, token_status="ANTIDETECT_READY", status_note="Token API hết hạn, đã chuyển sang chế độ Antidetect CDP")
+                        use_graph = False
                     else:
                         db.update_page_status(page_id, is_active=False, token_status="EXPIRED", status_note=e.message)
-                continue
+                        continue
+                else:
+                    continue
             except Exception:
                 continue
-        elif profile_id:
-            # For Antidetect-only pages, scan automatically if the profile is currently open
-            # or if ANTIDETECT_AUTO_SCAN_POSTS is enabled
+
+        if not use_graph:
+            if not profile_id:
+                continue
+            # Antidetect-only pages, or HYBRID with a dead Graph token: scan when the profile
+            # is already open or when auto-scan of closed profiles is explicitly enabled.
             rt = antidetect_client._read_runtime_readonly().get(profile_id) or {}
             is_open = antidetect_client._probe_cdp_port(rt.get("port"))
             if not is_open and not config.ANTIDETECT_AUTO_SCAN_POSTS:
@@ -149,6 +173,16 @@ def detect_new_posts_and_schedule():
 
 
 def execute_due_tasks():
+    """Single-flight wrapper: manual sync and the background loop must not execute concurrently."""
+    if not _EXEC_LOCK.acquire(blocking=False):
+        return
+    try:
+        _execute_due_tasks()
+    finally:
+        _EXEC_LOCK.release()
+
+
+def _execute_due_tasks():
     """
     Fetches tasks that are due, re-verifies live per-page rate limits & minimum gap
     before each task so multiple due tasks for the same page never violate constraints,
@@ -156,7 +190,7 @@ def execute_due_tasks():
     """
     due_tasks = db.get_due_tasks(limit=10)
     now_utc = datetime.now(timezone.utc)
-    today_str = now_utc.strftime("%Y-%m-%d")
+    today_str = db.local_day_key(now_utc)
 
     for task in due_tasks:
         task_id = task["id"]
@@ -174,7 +208,7 @@ def execute_due_tasks():
         max_per_day = fresh_page.get("max_comments_per_day") or config.MAX_COMMENTS_PER_PAGE_PER_DAY
         today_comments = fresh_page.get("comments_today_count") or 0
         if fresh_page.get("comments_today_date") == today_str and today_comments >= max_per_day:
-            tomorrow_utc = (now_utc + timedelta(days=1)).replace(hour=1, minute=0, second=0).isoformat()
+            tomorrow_utc = db.next_daily_reset_utc(now_utc)
             conn = db.get_connection()
             with conn:
                 conn.execute("UPDATE tasks SET scheduled_at = ? WHERE id = ?", (tomorrow_utc, task_id))
@@ -314,12 +348,20 @@ def execute_due_tasks():
                 db.update_task_result(task_id=task_id, status="FAILED", error_message=err_msg)
 
 
+def run_manual_sync_cycle():
+    """Manual 'scan & run now' waits for in-flight loops instead of racing them."""
+    with _SCAN_LOCK:
+        _detect_new_posts_and_schedule()
+    with _EXEC_LOCK:
+        _execute_due_tasks()
+
+
 def run_maintenance_cycle():
     """
     Runs periodic maintenance:
     1. Recovers only tasks stuck in SENDING for > 5 minutes (startup=False).
     2. Checks token health ONLY when debug_token actually succeeded (`checked=True`).
-    3. Auto-syncs Google Sheet if a Sheet URL is saved.
+    3. Auto-syncs Google Sheet if a Sheet URL is saved (paused system skips config drift).
     """
     db.recover_stale_tasks(startup=False, stale_after_seconds=300)
 
@@ -344,7 +386,7 @@ def run_maintenance_cycle():
                     db.update_page_status(pid, True, info.get("status", "OK"), None)
 
     sheet_url = SCHEDULER_METRICS["sheet_sync"].get("sheet_url")
-    if sheet_url:
+    if sheet_url and not SCHEDULER_METRICS["paused_all"]:
         res = sheets_sync.sync_from_google_sheet(sheet_url)
         SCHEDULER_METRICS["sheet_sync"]["last_run"] = datetime.now(timezone.utc).isoformat()
         SCHEDULER_METRICS["sheet_sync"]["last_error"] = None if res.get("success") else res.get("error")

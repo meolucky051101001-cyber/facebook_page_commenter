@@ -212,6 +212,8 @@ def _resolve_page_from_identifier(
     existing_pages_map: Dict[str, Dict[str, Any]],
     existing_by_name: Dict[str, Dict[str, Any]],
     existing_by_slug: Dict[str, Dict[str, Any]],
+    ambiguous_names: Optional[set] = None,
+    ambiguous_slugs: Optional[set] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
     """
     Resolves a row's Page identifier (which can be a numeric Page ID, an accented Page Name
@@ -234,20 +236,29 @@ def _resolve_page_from_identifier(
         return existing_pages_map.get(clean_pid), clean_pid, None
 
     # 3. Try matching `cand` or `name_cand` by exact lowercase name or normalized slug
+    ambiguous_label = None
     for text in (cand, name_cand):
         if not text:
             continue
         low = text.lower().strip()
+        if ambiguous_names and low in ambiguous_names:
+            ambiguous_label = ambiguous_label or text
+            continue
         if low in existing_by_name:
             p = existing_by_name[low]
             return p, p["page_id"], None
         slug = _normalize_slug(text)
         if slug in SLUG_ALIASES:
             slug = SLUG_ALIASES[slug]
+        if ambiguous_slugs and slug in ambiguous_slugs:
+            ambiguous_label = ambiguous_label or text
+            continue
         if slug and slug in existing_by_slug:
             p = existing_by_slug[slug]
             return p, p["page_id"], None
 
+    if ambiguous_label:
+        return None, (cand or name_cand), f"Tên Page '{ambiguous_label}' đang trùng với nhiều Page trong Tool; vui lòng dùng Page ID để đồng bộ chính xác."
     return None, (cand or name_cand), None
 
 
@@ -271,6 +282,8 @@ def sync_from_google_sheet(sheet_url_or_id: str) -> Dict[str, Any]:
     existing_pages_map: Dict[str, Dict[str, Any]] = {}
     existing_by_name: Dict[str, Dict[str, Any]] = {}
     existing_by_slug: Dict[str, Dict[str, Any]] = {}
+    ambiguous_names: set = set()
+    ambiguous_slugs: set = set()
     for p in all_db_pages:
         existing_pages_map[p["page_id"]] = p
         if p.get("fb_profile_id"):
@@ -278,11 +291,18 @@ def sync_from_google_sheet(sheet_url_or_id: str) -> Dict[str, Any]:
         pname = (p.get("page_name") or "").strip()
         if pname:
             low = pname.lower()
-            if low not in existing_by_name:
+            if low in existing_by_name:
+                if existing_by_name[low]["page_id"] != p["page_id"]:
+                    ambiguous_names.add(low)
+            else:
                 existing_by_name[low] = p
             slug = _normalize_slug(pname)
-            if slug and slug not in existing_by_slug:
-                existing_by_slug[slug] = p
+            if slug:
+                if slug in existing_by_slug:
+                    if existing_by_slug[slug]["page_id"] != p["page_id"]:
+                        ambiguous_slugs.add(slug)
+                else:
+                    existing_by_slug[slug] = p
 
     # 1. Fetch primary tab: if `gid` is in URL, try that `gid` first; else try `Pages`, then discovered GIDs
     pages_rows: List[Dict[str, str]] = []
@@ -343,7 +363,8 @@ def sync_from_google_sheet(sheet_url_or_id: str) -> Dict[str, Any]:
                 continue
 
             matched_p, clean_pid, pid_err = _resolve_page_from_identifier(
-                pid_raw, pname_raw, existing_pages_map, existing_by_name, existing_by_slug
+                pid_raw, pname_raw, existing_pages_map, existing_by_name, existing_by_slug,
+                ambiguous_names, ambiguous_slugs
             )
             if pid_err:
                 errors.append(f"Tab Comments dòng {idx}: {pid_err}")
@@ -368,7 +389,8 @@ def sync_from_google_sheet(sheet_url_or_id: str) -> Dict[str, Any]:
             continue
 
         matched_page, clean_pid, pid_err = _resolve_page_from_identifier(
-            pid_raw, pname_raw, existing_pages_map, existing_by_name, existing_by_slug
+            pid_raw, pname_raw, existing_pages_map, existing_by_name, existing_by_slug,
+            ambiguous_names, ambiguous_slugs
         )
         if pid_err:
             errors.append(f"Dòng {idx}: {pid_err}")
@@ -471,8 +493,8 @@ def sync_from_google_sheet(sheet_url_or_id: str) -> Dict[str, Any]:
                 )
                 synced_count += 1
 
-            # In classic 2-tab mode, soft-disable previously active pages removed from the Pages tab
-            if not unified_mode and seen_sheet_pids and not errors:
+            # Soft-disable previously active pages no longer present in the Sheet (both modes)
+            if seen_sheet_pids and not errors:
                 for pdata in all_db_pages:
                     pid = pdata["page_id"]
                     if pid not in seen_sheet_pids and pdata.get("rule_enabled") == 1:
