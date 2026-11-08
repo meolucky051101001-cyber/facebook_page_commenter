@@ -10,11 +10,11 @@ Codebase hoàn chỉnh ở mức **production-ready**, 17/17 bài kiểm thử t
 ---
 
 ## 2. Thông tin môi trường & Đường dẫn cốt lõi
-- **Thư mục mã nguồn:** `C:\Users\admin\.gemini\antigravity\scratch\facebook_page_commenter`
+- **Thư mục mã nguồn:** `C:\Users\admin\Documents\Qoder\2026-11-08\9e7447c1\facebook_page_commenter`
 - **Môi trường Python:** Python 3.10.11 (`fastapi`, `uvicorn`, `httpx`, `cryptography`, `python-dateutil`, `websockets`, `pytest`)
 - **Phần mềm Antidetect tích hợp:** `C:\Projects\Tools\Antidetect Python` (bảo tồn nguyên trạng, `profiles.json` hash `B26426E4...` không bị thay đổi).
 - **Google Sheet cấu hình:** `https://docs.google.com/spreadsheets/d/1Qq1lkhVzlDe0FJ5k3HDDkBiGYDqTItO2ycQMDQHATD0/edit?usp=sharing` (tab `gid=1405549804`).
-- **Cơ sở dữ liệu SQLite:** `C:\Users\admin\.gemini\antigravity\scratch\facebook_page_commenter\fb_commenter.db`
+- **Cơ sở dữ liệu SQLite:** `C:\Users\admin\Documents\Qoder\2026-11-08\9e7447c1\facebook_page_commenter\fb_commenter.db`
 
 ---
 
@@ -47,16 +47,16 @@ Codebase hoàn chỉnh ở mức **production-ready**, 17/17 bài kiểm thử t
 ---
 
 ## 4. Danh mục File mã nguồn chính
-- [`run.py`](file:///C:/Users/admin/.gemini/antigravity/scratch/facebook_page_commenter/run.py): Entry point khởi chạy Dashboard, tự động chọn cổng 8000/8080 và tự mở trình duyệt.
-- [`app.py`](file:///C:/Users/admin/.gemini/antigravity/scratch/facebook_page_commenter/app.py): FastAPI app + Dashboard UI tiếng Việt tích hợp đầy đủ các chức năng quản lý, hẹn giờ thủ công và giám sát hàng đợi.
-- [`scheduler.py`](file:///C:/Users/admin/.gemini/antigravity/scratch/facebook_page_commenter/scheduler.py): 3 vòng lặp ngầm (`loop_post_scanner`, `loop_task_executor`, `loop_maintenance`) dùng `asyncio.to_thread`.
-- [`antidetect_client.py`](file:///C:/Users/admin/.gemini/antigravity/scratch/facebook_page_commenter/antidetect_client.py): Cầu nối CDP với `Antidetect Python`, tích hợp `HumanInput` và cơ chế quản lý tab tạm.
-- [`sheets_sync.py`](file:///C:/Users/admin/.gemini/antigravity/scratch/facebook_page_commenter/sheets_sync.py): Đồng bộ cấu hình và mẫu comment từ Google Sheet không để lộ token.
-- [`database.py`](file:///C:/Users/admin/.gemini/antigravity/scratch/facebook_page_commenter/database.py): SQLite CRUD, khóa gửi `SENDING`, phục hồi stale task và quản lý trạng thái Page.
-- [`meta_client.py`](file:///C:/Users/admin/.gemini/antigravity/scratch/facebook_page_commenter/meta_client.py): Meta Graph API v19.0 client.
-- [`crypto.py`](file:///C:/Users/admin/.gemini/antigravity/scratch/facebook_page_commenter/crypto.py): Mã hóa token bằng Fernet (`ENCRYPTION_KEY` lưu trong `.env`).
-- [`spintax.py`](file:///C:/Users/admin/.gemini/antigravity/scratch/facebook_page_commenter/spintax.py): Trộn nội dung Spintax đa tầng `{A|B}`.
-- [`test_system.py`](file:///C:/Users/admin/.gemini/antigravity/scratch/facebook_page_commenter/test_system.py): Bộ kiểm thử tự động 17 test cases bao quát toàn bộ chức năng.
+- [`run.py`](file:///C:/Users/admin/Documents/Qoder/2026-11-08/9e7447c1/facebook_page_commenter/run.py): Entry point khởi chạy Dashboard, tự động chọn cổng 8000/8080 và tự mở trình duyệt.
+- [`app.py`](file:///C:/Users/admin/Documents/Qoder/2026-11-08/9e7447c1/facebook_page_commenter/app.py): FastAPI app + Dashboard UI tiếng Việt tích hợp đầy đủ các chức năng quản lý, hẹn giờ thủ công và giám sát hàng đợi.
+- [`scheduler.py`](file:///C:/Users/admin/Documents/Qoder/2026-11-08/9e7447c1/facebook_page_commenter/scheduler.py): 3 vòng lặp ngầm (`loop_post_scanner`, `loop_task_executor`, `loop_maintenance`) dùng `asyncio.to_thread`.
+- [`antidetect_client.py`](file:///C:/Users/admin/Documents/Qoder/2026-11-08/9e7447c1/facebook_page_commenter/antidetect_client.py): Cầu nối CDP với `Antidetect Python`, tích hợp `HumanInput` và cơ chế quản lý tab tạm.
+- [`sheets_sync.py`](file:///C:/Users/admin/Documents/Qoder/2026-11-08/9e7447c1/facebook_page_commenter/sheets_sync.py): Đồng bộ cấu hình và mẫu comment từ Google Sheet không để lộ token.
+- [`database.py`](file:///C:/Users/admin/Documents/Qoder/2026-11-08/9e7447c1/facebook_page_commenter/database.py): SQLite CRUD, khóa gửi `SENDING`, phục hồi stale task và quản lý trạng thái Page.
+- [`meta_client.py`](file:///C:/Users/admin/Documents/Qoder/2026-11-08/9e7447c1/facebook_page_commenter/meta_client.py): Meta Graph API v19.0 client.
+- [`crypto.py`](file:///C:/Users/admin/Documents/Qoder/2026-11-08/9e7447c1/facebook_page_commenter/crypto.py): Mã hóa token bằng Fernet (`ENCRYPTION_KEY` lưu trong `.env`).
+- [`spintax.py`](file:///C:/Users/admin/Documents/Qoder/2026-11-08/9e7447c1/facebook_page_commenter/spintax.py): Trộn nội dung Spintax đa tầng `{A|B}`.
+- [`test_system.py`](file:///C:/Users/admin/Documents/Qoder/2026-11-08/9e7447c1/facebook_page_commenter/test_system.py): Bộ kiểm thử tự động 17 test cases bao quát toàn bộ chức năng.
 
 ---
 
@@ -64,12 +64,12 @@ Codebase hoàn chỉnh ở mức **production-ready**, 17/17 bài kiểm thử t
 
 ### 5.1. Chạy kiểm thử hệ thống:
 ```powershell
-pytest C:\Users\admin\.gemini\antigravity\scratch\facebook_page_commenter\test_system.py -v
+pytest C:\Users\admin\Documents\Qoder\2026-11-08\9e7447c1\facebook_page_commenter\test_system.py -v
 ```
 
 ### 5.2. Khởi động Dashboard quản trị:
 ```powershell
-python C:\Users\admin\.gemini\antigravity\scratch\facebook_page_commenter\run.py
+python C:\Users\admin\Documents\Qoder\2026-11-08\9e7447c1\facebook_page_commenter\run.py
 ```
 Dashboard mở tại: `http://127.0.0.1:8000` (hoặc `8080`).
 
