@@ -350,6 +350,8 @@ def _execute_due_tasks():
 
 def run_manual_sync_cycle():
     """Manual 'scan & run now' waits for in-flight loops instead of racing them."""
+    if SCHEDULER_METRICS["paused_all"]:
+        return
     with _SCAN_LOCK:
         _detect_new_posts_and_schedule()
     with _EXEC_LOCK:
@@ -373,15 +375,32 @@ def run_maintenance_cycle():
             info = meta_client.debug_token(full_p["page_access_token"])
             # CRITICAL: Only act if Meta explicitly returned a token inspection result (`checked=True`)
             if info.get("checked") is True:
-                if not info.get("is_valid"):
-                    db.update_page_status(pid, False, "EXPIRED", "Token không còn hợp lệ hoặc đã hết hạn")
-                elif info.get("missing_scopes"):
-                    db.update_page_status(
-                        pid,
-                        False,
-                        "MISSING_PERMISSIONS",
-                        f"Thiếu quyền: {', '.join(info['missing_scopes'])}"
-                    )
+                invalid_token = not info.get("is_valid")
+                missing_scopes = info.get("missing_scopes") or []
+
+                if invalid_token or missing_scopes:
+                    # HYBRID pages can keep running through Antidetect CDP even when Graph is dead.
+                    if p.get("antidetect_profile_id"):
+                        keep_active = bool(p.get("is_active"))
+                        already_cdp = (
+                            keep_active and p.get("token_status") == "ANTIDETECT_READY"
+                        )
+                        if not already_cdp:
+                            db.update_page_status(
+                                pid,
+                                keep_active,
+                                "ANTIDETECT_READY",
+                                "Token Graph không hợp lệ hoặc thiếu quyền; Page tiếp tục chạy qua Antidetect CDP."
+                            )
+                    elif invalid_token:
+                        db.update_page_status(pid, False, "EXPIRED", "Token không còn hợp lệ hoặc đã hết hạn")
+                    else:
+                        db.update_page_status(
+                            pid,
+                            False,
+                            "MISSING_PERMISSIONS",
+                            f"Thiếu quyền: {', '.join(missing_scopes)}"
+                        )
                 else:
                     db.update_page_status(pid, True, info.get("status", "OK"), None)
 

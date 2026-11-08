@@ -32,16 +32,30 @@ Hệ thống quản lý Fanpage đa tài khoản độc lập, định tuyến k
 
 ### 1. Cài đặt thư viện phụ thuộc (nếu chưa có)
 ```bash
-pip install fastapi uvicorn httpx python-dateutil
+pip install -r requirements.txt
 ```
 
-### 2. Khởi chạy ứng dụng
+### 2. Cấu hình biến môi trường
+Sao chép `.env.example` thành `.env` rồi điền các giá trị cần thiết. Nếu chưa có `.env`, hệ thống tự tạo từ file mẫu ở lần khởi động đầu tiên.
+
+### 3. Khởi chạy ứng dụng
 ```bash
-cd C:\Users\admin\.gemini\antigravity\scratch\facebook_page_commenter
+cd C:\Users\admin\Documents\Qoder\2026-11-08\9e7447c1\facebook_page_commenter
 python run.py
 ```
 
 Ứng dụng sẽ chạy tại địa chỉ: **[http://127.0.0.1:8000](http://127.0.0.1:8000)**
+
+> **Lưu ý bảo mật:** Dashboard hiện không có lớp xác thực. Chỉ chạy trên máy cục bộ, không mở cổng ra LAN/Internet. `run.py` đã bind sẵn `127.0.0.1`; nếu chạy thủ công bằng uvicorn, luôn dùng `--host 127.0.0.1`.
+
+---
+
+## Kiểm thử
+```bash
+pytest test_system.py -q
+```
+
+Bộ test dùng database tạm, không ảnh hưởng dữ liệu vận hành. Hiện có 32 test (kỳ vọng `32 passed`).
 
 ---
 

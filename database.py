@@ -393,13 +393,14 @@ def update_page_rule(
     max_comments_per_day: int = 20,
     is_enabled: bool = True,
     conn: Optional[sqlite3.Connection] = None
-):
+) -> int:
     should_close = False
     if conn is None:
         conn = get_connection()
         should_close = True
 
     now = datetime.now(timezone.utc).isoformat()
+    cancelled_auto = 0
     with conn:
         conn.execute("""
             INSERT INTO page_rules (page_id, delay_minutes, templates, max_comments_per_day, is_enabled, updated_at)
@@ -412,8 +413,17 @@ def update_page_rule(
                 updated_at = excluded.updated_at
         """, (page_id, delay_minutes, json.dumps(templates, ensure_ascii=False), max_comments_per_day, 1 if is_enabled else 0, now))
 
+        if not is_enabled:
+            cursor = conn.execute("""
+                UPDATE tasks
+                SET status = 'CANCELLED', updated_at = ?
+                WHERE page_id = ? AND status = 'PENDING' AND source = 'AUTO'
+            """, (now, page_id))
+            cancelled_auto = cursor.rowcount
+
     if should_close:
         conn.close()
+    return cancelled_auto
 
 
 def create_task(

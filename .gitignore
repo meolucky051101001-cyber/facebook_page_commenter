@@ -1,5 +1,6 @@
 .env
 *.db
+*.bak
 *.sqlite3
 __pycache__/
 *.pyc

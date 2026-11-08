@@ -1054,6 +1054,18 @@ def post_comment_cdp(
                     msg_id += 1
                     state = await _cdp_eval(ws, msg_id, f"{_INSPECT_POST_AND_ACTOR_JS}({escaped_name})") or state
 
+                # Hard safety gate: never type a comment unless the page identity is confirmed.
+                if not state.get("actingAsPage"):
+                    return {
+                        "success": False,
+                        "category": "INVALID_TARGET",
+                        "error": (
+                            f"Không xác nhận được đang bình luận dưới tên Page '{page_name}'. "
+                            "Đã chặn gửi để tránh bình luận bằng tài khoản cá nhân hoặc Page khác."
+                        ),
+                        "usage_pct": None,
+                    }
+
                 box_rect = state.get("commentBoxRect")
                 if not box_rect:
                     # Scroll down a bit and look for the comment box again

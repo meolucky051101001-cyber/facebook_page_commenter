@@ -104,6 +104,11 @@ def toggle_pause():
 
 @app.post("/api/sync")
 def trigger_manual_sync(background_tasks: BackgroundTasks):
+    if scheduler.SCHEDULER_METRICS["paused_all"]:
+        raise HTTPException(
+            status_code=409,
+            detail="Hệ thống đang tạm dừng. Hãy bấm 'Tiếp tục chạy' trước khi quét và gửi bình luận."
+        )
     background_tasks.add_task(scheduler.run_manual_sync_cycle)
     return {"success": True, "message": "Đã bắt đầu quét bài mới và thực thi các tác vụ đến hạn."}
 
@@ -327,8 +332,11 @@ def update_rule(page_id: str, req: UpdateRuleRequest):
                 status_code=400,
                 detail=f"Mẫu bình luận dòng {idx} bị lỗi đóng/mở ngoặc nhọn Spintax '{{...}}'."
             )
-    db.update_page_rule(page_id, req.delay_minutes, req.templates, req.max_comments_per_day, req.is_enabled)
-    return {"success": True, "message": "Đã cập nhật kịch bản bình luận thành công"}
+    cancelled = db.update_page_rule(page_id, req.delay_minutes, req.templates, req.max_comments_per_day, req.is_enabled)
+    message = "Đã cập nhật kịch bản bình luận thành công"
+    if cancelled:
+        message += f" Đã hủy {cancelled} tác vụ tự động đang chờ."
+    return {"success": True, "message": message, "cancelled_auto_tasks": cancelled}
 
 
 @app.post("/api/spintax/preview")
@@ -819,6 +827,10 @@ def index():
         async function triggerManualSync() {
             const res = await fetch('/api/sync', { method: 'POST' });
             const data = await res.json();
+            if (!res.ok) {
+                alert('Không thể chạy: ' + (data.detail || 'Lỗi không xác định'));
+                return;
+            }
             alert(data.message);
             setTimeout(() => { loadTasks(); fetchMetrics(); }, 2000);
         }
@@ -1044,7 +1056,7 @@ def index():
             });
             const data = await res.json();
             if (res.ok) {
-                alert('Đã lưu cấu hình kịch bản!');
+                alert(data.message || 'Đã lưu cấu hình kịch bản!');
                 fetchPages();
             } else {
                 alert('Lỗi: ' + data.detail);

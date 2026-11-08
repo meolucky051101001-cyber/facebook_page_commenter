@@ -598,13 +598,195 @@ def test_maintenance_skips_auto_sheet_sync_while_paused(monkeypatch):
         mock_sync.assert_called_once()
 
 
-def test_manual_sync_endpoint_schedules_background_cycle():
+def test_manual_sync_endpoint_schedules_background_cycle(monkeypatch):
+    monkeypatch.setitem(scheduler.SCHEDULER_METRICS, "paused_all", False)
     with TestClient(fastapi_app.app) as client:
         with patch("scheduler.run_manual_sync_cycle") as mock_cycle:
             resp = client.post("/api/sync")
             assert resp.status_code == 200
             assert "bắt đầu" in resp.json()["message"]
             mock_cycle.assert_called_once()
+
+
+def test_manual_sync_blocked_while_paused(monkeypatch):
+    monkeypatch.setitem(scheduler.SCHEDULER_METRICS, "paused_all", True)
+    with TestClient(fastapi_app.app) as client:
+        with patch("scheduler.run_manual_sync_cycle") as mock_cycle:
+            resp = client.post("/api/sync")
+            assert resp.status_code == 409
+            assert "tạm dừng" in resp.json()["detail"].lower()
+            mock_cycle.assert_not_called()
+
+
+def test_manual_sync_cycle_honors_pause(monkeypatch):
+    acc_id = db.upsert_account("Nick Manual Pause")
+    db.upsert_page("page_mp", "Page Manual Pause", "token_mp", acc_id)
+    past_iso = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+    db.create_task("page_mp", "post_mp", "Msg", past_iso)
+
+    monkeypatch.setitem(scheduler.SCHEDULER_METRICS, "paused_all", True)
+    with patch("meta_client.post_comment") as mock_post:
+        scheduler.run_manual_sync_cycle()
+        mock_post.assert_not_called()
+
+    assert db.get_all_tasks(page_id="page_mp")[0]["status"] == "PENDING"
+
+
+def test_maintenance_keeps_hybrid_page_active_on_cdp(monkeypatch):
+    monkeypatch.setitem(scheduler.SCHEDULER_METRICS["sheet_sync"], "sheet_url", "")
+    acc_id = db.upsert_account("Nick Maint Hybrid", "u_mh", "tok")
+    db.upsert_page("page_mh", "Page Maint Hybrid", "token_mh", acc_id, token_status="OK")
+    db.upsert_antidetect_page(
+        fb_page_id="fb_mh",
+        page_name="Page Maint Hybrid",
+        page_url="https://www.facebook.com/fb_mh",
+        antidetect_profile_id="prof_mh",
+        antidetect_profile_name="Profile Maint Hybrid",
+        account_id=acc_id,
+    )
+    now_iso = datetime.now(timezone.utc).isoformat()
+    db.create_task("page_mh", "post_mh", "Msg", now_iso)
+
+    with patch(
+        "meta_client.debug_token",
+        return_value={"checked": True, "is_valid": False, "status": "EXPIRED", "missing_scopes": []},
+    ):
+        scheduler.run_maintenance_cycle()
+
+    page = db.get_page("page_mh")
+    assert page["is_active"] == 1
+    assert page["token_status"] == "ANTIDETECT_READY"
+    assert db.get_all_tasks(page_id="page_mh")[0]["status"] == "PENDING"
+
+
+def test_disabling_auto_rule_cancels_pending_auto_only():
+    acc_id = db.upsert_account("Nick Kill Switch")
+    db.upsert_page("page_ks", "Page Kill Switch", "token_ks", acc_id)
+    past_iso = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+    db.create_task("page_ks", "post_auto_ks", "Auto message", past_iso, source="AUTO")
+    db.create_task("page_ks", "post_manual_ks", "Manual message", past_iso, source="MANUAL", batch_id="b_ks")
+
+    cancelled = db.update_page_rule("page_ks", 10, ["Mẫu"], 20, False)
+    assert cancelled == 1
+
+    tasks = {t["source"]: t for t in db.get_all_tasks(page_id="page_ks")}
+    assert tasks["AUTO"]["status"] == "CANCELLED"
+    assert tasks["MANUAL"]["status"] == "PENDING"
+
+    with patch("meta_client.post_comment", return_value={"success": True, "comment_id": "c_manual_ks"}) as mock_post:
+        scheduler.execute_due_tasks()
+        assert mock_post.call_count == 1
+
+    tasks = {t["source"]: t for t in db.get_all_tasks(page_id="page_ks")}
+    assert tasks["AUTO"]["status"] == "CANCELLED"
+    assert tasks["MANUAL"]["status"] == "SUCCESS"
+
+
+def _mock_cdp_environment(monkeypatch):
+    import antidetect_client
+
+    class FakeWebSocket:
+        pass
+
+    class FakeConnect:
+        async def __aenter__(self):
+            return FakeWebSocket()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    async def fake_cdp_call(ws, msg_id, method, params=None, timeout=10.0):
+        return {"id": msg_id, "result": {}}
+
+    async def fake_sleep(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(antidetect_client, "acquire_profile_cdp_port", lambda pid: (9222, False, None))
+    monkeypatch.setattr(antidetect_client, "_open_transient_tab", lambda port: ("t1", "ws://fake"))
+    monkeypatch.setattr(antidetect_client, "_ensure_antidetect_sys_path", lambda: False)
+    monkeypatch.setattr(antidetect_client, "_close_transient_tab", lambda *args: None)
+    monkeypatch.setattr(antidetect_client, "release_profile_cdp_port", lambda *args: None)
+    monkeypatch.setattr(antidetect_client, "_cdp_call", fake_cdp_call)
+    monkeypatch.setattr(antidetect_client.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr("websockets.connect", lambda *args, **kwargs: FakeConnect())
+    return antidetect_client
+
+
+def _cdp_page_state(acting_as_page):
+    return {
+        "url": "https://www.facebook.com/example/posts/1",
+        "accessState": "ok",
+        "actingAsPage": acting_as_page,
+        "actorButtonRect": None,
+        "switchProfileButtonRect": None,
+        "commentBoxRect": {"x": 10, "y": 20, "w": 200, "h": 30},
+        "commentBoxPlaceholder": "Bình luận dưới tên Page Mẫu",
+    }
+
+
+def test_cdp_comment_blocked_when_actor_not_confirmed(monkeypatch):
+    ad = _mock_cdp_environment(monkeypatch)
+    state = _cdp_page_state(False)
+
+    async def fake_eval(ws, msg_id, expression, timeout=10.0):
+        return dict(state)
+
+    typed = []
+
+    async def fake_type(ws, msg_id, text, human_helper=None):
+        typed.append(text)
+        return msg_id + 1
+
+    monkeypatch.setattr(ad, "_cdp_eval", fake_eval)
+    monkeypatch.setattr(ad, "_human_type_and_submit_on_ws", fake_type)
+
+    res = ad.post_comment_cdp(
+        post_id="post_actor",
+        page_id="page_actor",
+        page_name="Page Mẫu",
+        page_url=None,
+        profile_id="prof_actor",
+        message="Xin chào",
+    )
+
+    assert res["success"] is False
+    assert res["category"] == "INVALID_TARGET"
+    assert "tài khoản cá nhân" in res["error"]
+    assert typed == []
+
+
+def test_cdp_comment_sends_when_actor_confirmed(monkeypatch):
+    ad = _mock_cdp_environment(monkeypatch)
+    state = _cdp_page_state(True)
+    calls = {"evaluations": 0}
+    typed = []
+
+    async def fake_eval(ws, msg_id, expression, timeout=10.0):
+        calls["evaluations"] += 1
+        return dict(state) if calls["evaluations"] == 1 else {"found": True}
+
+    async def fake_click(ws, msg_id, x, y, human_helper=None):
+        return msg_id + 1
+
+    async def fake_type(ws, msg_id, text, human_helper=None):
+        typed.append(text)
+        return msg_id + 1
+
+    monkeypatch.setattr(ad, "_cdp_eval", fake_eval)
+    monkeypatch.setattr(ad, "_human_click_on_ws", fake_click)
+    monkeypatch.setattr(ad, "_human_type_and_submit_on_ws", fake_type)
+
+    res = ad.post_comment_cdp(
+        post_id="post_actor",
+        page_id="page_actor",
+        page_name="Page Mẫu",
+        page_url=None,
+        profile_id="prof_actor",
+        message="Xin chào",
+    )
+
+    assert res["success"] is True
+    assert typed == ["Xin chào"]
 
 
 def test_google_sheet_unified_disables_pages_missing_from_sheet():
