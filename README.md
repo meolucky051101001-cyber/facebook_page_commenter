@@ -83,6 +83,8 @@ Token lỗi giải mã sẽ được đánh dấu INVALID_SECRET và tác vụ G
 
 Tool xác minh numeric ID Page, bài viết, người bình luận và nội dung ngay trước Enter. Tên Page giống nhau không đủ để xác minh. Mỗi profile chỉ xử lý một thao tác cùng lúc. Tool chỉ đóng phiên browser có `launch_id` do nó sở hữu. Đổi cách gửi tạm dừng tác vụ đang chờ; cần **Khôi phục tác vụ** riêng sau khi kiểm tra, quota và lịch sử vẫn giữ.
 
+Khi đổi cách gửi, lịch AUTO còn đối chiếu permalink trong cùng Page để tránh tạo lại chuỗi nếu Graph ID khác Reel ID. Chuỗi cũ giữ nguyên nội dung và thời gian. Việc đối chiếu link không thay thế bước xác minh bài và người đăng trước khi gửi.
+
 Chỉ ghi SUCCESS khi thấy ID bình luận mới đúng Page/nội dung. Kết quả không rõ sau Enter chuyển NEED_CHECK và không tự gửi lại. Layout thiếu ID hoặc timestamp tuyệt đối sẽ bị chặn; hiện chưa hỗ trợ link `pfbid`/rút gọn qua trình duyệt. Cần nghiệm thu layout trên phiên Facebook đã đăng nhập trước khi bật nhiều Page. Xem `docs/KE-HOACH-BINH-LUAN-TRINH-DUYET.md`.
 
 Ứng dụng khóa theo đường dẫn DB trước khi recovery, kể cả chạy qua `run.py`, `run_background.pyw` hoặc Uvicorn trực tiếp. Chỉ một tiến trình được dùng DB. Trạng thái chạy được lưu trong DB: chưa có trạng thái thì tạm dừng, đã có thì khôi phục trạng thái đã lưu. Để cập nhật dịch vụ, tạm dừng trước, sao lưu bằng SQLite Backup API và kiểm tra bản sao. Nếu đã gửi sau nâng cấp, phải giữ lịch sử gửi mới khi rollback để tránh mất khóa chống trùng.

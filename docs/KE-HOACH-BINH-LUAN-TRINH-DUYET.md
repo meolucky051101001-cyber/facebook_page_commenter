@@ -47,13 +47,30 @@ Diễn tập migration trên bản sao giữ nguyên mọi cột cũ và lịch 
 Bước 7 đã triển khai dịch vụ schema 7 tại localhost:8080; cách gửi của 65 Page vẫn là
 Graph API cho đến khi từng Page được lựa chọn và xác minh riêng.
 
-Probe thực tế chỉ đọc Profile 2 trả `LOGIN_REQUIRED`. Cần đăng nhập Facebook lại trong
-profile này để tiếp tục nghiệm thu giao diện và gửi qua trình duyệt. Chưa có bằng chứng
-gửi Browser thật. Hiện chỉ nhận link numeric, chưa nhận `pfbid` hoặc link rút gọn.
+Probe ban đầu chỉ đọc Profile 2 trả `LOGIN_REQUIRED`. Người dùng đã đăng nhập lại;
+lần probe kế tiếp chưa có numeric actor ID, bài hoặc timestamp để xác minh.
+Chưa có bằng chứng gửi Browser thật. Hiện chỉ nhận link numeric, chưa nhận `pfbid`
+hoặc link rút gọn.
 
 Yêu cầu gửi riêng Chị Đẹp Thích Doll đã hoàn thành qua Graph: hai bài hôm nay 15/11
 lúc 13:00 và 18:00, mỗi bài ba câu từ Sheet, tổng sáu bình luận đã GET xác minh
 đúng nội dung và tác giả. Người dùng xác nhận không lấy bài hôm qua.
+
+## Tiếp tục nghiệm thu sau đăng nhập — 15/11/2026
+
+- Hoàn tất chờ nội dung Facebook tải xong thay mốc chờ cố định; nhận diện màn hình
+  đăng nhập/checkpoint và thử lại lỗi context tạm thời trong lúc chuyển trang.
+- Hoàn tất chống tạo lịch AUTO trùng khi Graph ID và Reel ID khác nhau nhưng cùng
+  permalink trong cùng Page. Giữ nguyên snapshot chuỗi cũ; không nới điều kiện gửi.
+- Toàn bộ 264 kiểm thử cô lập đạt. Dịch vụ được khôi phục lúc 23:51, API 200,
+  schema 7, 18 task giữ nguyên; 65 Page vẫn Graph API, chỉ Vẽ bật AUTO.
+- Nghiệm thu trực tiếp còn bị chặn: Browser Use từ chối origin localhost:8000 vì
+  quyền đã lưu/chính sách ngay cả sau xác nhận mở quyền của người dùng. Chưa thể
+  kiểm tra giao diện Profile 2, bổ sung adapter Reel/actor/timestamp có bằng chứng,
+  hoặc gửi thử Browser. Không chuyển sang cách khác để vượt cổng quyền.
+- Khi quyền thực tế được khôi phục: kiểm tra chỉ đọc trước, xác minh đúng Page và
+  thời gian bài; chọn mục tiêu/nội dung chưa gửi trùng để nghiệm thu có kiểm soát.
+  Không đăng lại sáu bình luận Doll hay chuỗi Vẽ đã hoàn thành.
 
 ## Cách sử dụng sau khi triển khai
 

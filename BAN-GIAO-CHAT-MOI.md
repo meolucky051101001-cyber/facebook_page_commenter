@@ -10,7 +10,8 @@ Cập nhật: 15/11/2026, Asia/Bangkok. Thư mục làm việc và chạy dịch
 Thông tin dưới đây thay thế các ghi nhận vận hành trước đó.
 
 - Dịch vụ `pythonw run_background.pyw` tại `http://127.0.0.1:8080`, schema 7,
-  PID mới 12412 trong `backups/browser-transport-20261115/service.pid`. Kiểm tra lại khi tiếp tục.
+  đã khôi phục lúc 23:51 ngày 15/11 sau khi phát hiện tiến trình cũ tắt.
+  PID 12000 trong `backups/browser-followup-20261115/service.pid`. Kiểm tra lại khi tiếp tục.
 - Hệ thống đang chạy; 65 Page, 65 rule, 8 tài khoản, tất cả send_mode=GRAPH_API.
   Chỉ Chị Đẹp Thích Vẽ bật AUTO. Doll gửi theo đợt thủ công đã được người dùng yêu cầu.
 - 18 tasks: 17 SUCCESS, 1 CANCELLED; không còn PENDING/SENDING/NEED_CHECK sau khi hoàn tất chuỗi Vẽ mới.
@@ -49,9 +50,14 @@ cooldown,lịch sử,opt-in. Graph giữ nội dung đã claim; browser kiểm t
 actor,post,focus,nội dung trước Enter. Không rõ sau Enter => NEED_CHECK, không auto retry.
 
 Antidetect cài C:\Projects\Tools\Antidetect Python; không sửa mã/metadata ngoài repo.
-Đã mở app bằng entrypoint có sẵn; PID 36052 trong backup/antidetect-service.pid.
-Probe chỉ đọc Profile 2 c25eebac-3cec-43ec-8d73-51f914b5437b trả LOGIN_REQUIRED.
-Cần người dùng đăng nhập Facebook lại trong profile này trước khi nghiệm thu layout/gửi Browser.
+Tiến trình cũ đã tắt; lần kiểm tra gần nhất server mới ở cổng 8000, PID 23580.
+Profile 2: c25eebac-3cec-43ec-8d73-51f914b5437b. Người dùng đã đăng nhập lại.
+Probe trước khi gặp cổng quyền chỉ trả access_state=ok nhưng không có actor ID,
+bài số hoặc timestamp; chưa đủ xác minh phiên đăng nhập và khả năng gửi.
+Browser Use vẫn từ chối origin http://127.0.0.1:8000 vì quyền đã lưu/chính sách,
+kể cả sau khi user trả lời “Cho phép kiểm tra Antidetect” rồi “Đã mở quyền”.
+Không dùng raw CDP, terminal hay cửa sổ khác để vượt chặn. Chỉ thử lại khi quyền
+thực tế của công cụ được gỡ; chưa nghiệm thu actor/Reel/timestamp hoặc gửi Browser.
 Chưa bật browser cho Page nào. Không hỏi lại user tên tool: user chưa có tool,
 đang nhờ xây auto comment trong project này.
 
@@ -65,9 +71,20 @@ Báo cáo trong backups/profile-catalog-review-20261115.
 
 ## Kiểm thử và bảo toàn
 
-192 tests passed, 1 Starlette/AnyIO deprecation. Python/JS syntax OK. Browser tests mô phỏng,
+264 tests passed, 1 Starlette/AnyIO deprecation. Browser tests mô phỏng,
 không chứng minh layout thật. Migration 6→7 diễn tập giữ mọi cột cũ/history/rule/quota/settings.
 Dịch vụ mới API200,schema 7,65Page,không tự đổi mode.
+
+Đợt tiếp tục sau đăng nhập bổ sung chờ DOM tải xong thay sleep cố định, nhận diện
+URL đăng nhập/checkpoint, thử lại lỗi JS context do điều hướng trong giới hạn.
+AUTO/publication chống trùng thêm theo permalink đã chuẩn hóa trong cùng Page:
+Graph post ID và Reel ID khác nhau nhưng cùng link chỉ giữ một chuỗi.
+Không coi mọi Reel/video/post có cùng số là một bài; không nới xác minh trước gửi.
+Việc gửi qua Browser với Graph canonical ID khác Reel ID vẫn cần ánh xạ được xác minh.
+
+Backups/browser-followup-20261115 có before-restore.sqlite3, after-restore.sqlite3,
+before-restore.json, restored-health.json. quick_check=ok, toàn bộ 18 task giữ nguyên
+từng giá trị qua restart; 17 SUCCESS, 1 CANCELLED; Vẽ AUTO, Doll tắt AUTO.
 
 Backups/browser-transport-20261115 có schema 7-source.zip,before-schema 7.sqlite3,
 before-deploy.sqlite3,migration-report.json,deployed-health.json,thich-ve-sequence.json,
@@ -80,6 +97,5 @@ Không xóa khóa khi process còn chạy. Không rollbackDB cũ làm mất 11 b
 Không in/commit .env,token,cookie,proxy secret,DB hoặc rawlogs.
 
 Git dùng git -c safe.directory='C:/Projects/Tools/facebook comment/facebook_page_commenter'.
-HEAD push trước Browser:c12c2c16f3652ea67dcaba70e7ec81c871dab47a.
-Đợt Browser được commit cùng cập nhật vận hành này; xem Git log để lấy mã commit.
+Browser ban đầu đã push ở 9456d0a; xem Git log để lấy commit đợt tiếp tục.
 Giữ nguyên legacy untracked. Không rollback về backup trước đợt gửi mới.

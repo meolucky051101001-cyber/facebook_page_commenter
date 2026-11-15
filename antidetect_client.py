@@ -605,6 +605,15 @@ async def _cdp_eval(ws, msg_id: int, expression: str, timeout: float = 10.0) -> 
 
 # DOM evidence is restricted to rendered controls and the selected post. No
 # cookies, credentials, private endpoints, or application internals are read.
+_BROWSER_READINESS_JS = r"""
+(() => ({url: location.href, readyState: document.readyState,
+  mainPresent: Boolean(document.querySelector('[role="main"]')),
+  loginPresent: /^\/(login|login\.php)(\/|$)/i.test(location.pathname) ||
+    Boolean(document.querySelector('input[name="email"]') && document.querySelector('input[name="pass"]')),
+  checkpointPresent: /^\/(checkpoint|two_step_verification|recover)(\/|$)/i.test(location.pathname)
+}))()
+"""
+
 _BROWSER_EVIDENCE_JS = r"""
 ((expectedPost, message) => {
   const out = {url: location.href, accessState: 'ok', actorIds: [],
@@ -613,7 +622,7 @@ _BROWSER_EVIDENCE_JS = r"""
   if (/^\/(checkpoint|two_step_verification|recover)(\/|$)/i.test(location.pathname)) {
     out.accessState = 'checkpoint'; return out;
   }
-  if (/^\/(login|login.php)(\/|$)/i.test(location.pathname) ||
+  if (/^\/(login|login\.php)(\/|$)/i.test(location.pathname) ||
       (document.querySelector('input[name="email"]') && document.querySelector('input[name="pass"]'))) {
     out.accessState = 'login_required'; return out;
   }
@@ -950,6 +959,42 @@ class _BrowserSession:
         _validate_state(state)
         return state
 
+    async def wait_until_loaded(self):
+        # A fixed sleep can inspect the blank shell before React or a slow
+        # profile connection finishes loading, misreporting a logged-in Page.
+        for attempt in range(20):
+            self.msg_id += 1
+            try:
+                state = await _cdp_eval(self.ws, self.msg_id, _BROWSER_READINESS_JS)
+            except RuntimeError as exc:
+                # Navigation can replace the JS context after Page.navigate
+                # returns. Only these specific protocol errors are transient.
+                if not str(exc).startswith((
+                    "CDP Runtime.evaluate failed: Execution context was destroyed",
+                    "CDP Runtime.evaluate failed: Cannot find context with specified id",
+                )):
+                    raise
+                state = None
+            if isinstance(state, dict):
+                if state.get("checkpointPresent"):
+                    raise BrowserAutomationError("Profile đang ở bước xác minh Facebook.", "TOKEN_EXPIRED", "CHECKPOINT")
+                if state.get("loginPresent"):
+                    raise BrowserAutomationError("Profile cần đăng nhập Facebook lại.", "TOKEN_EXPIRED", "LOGIN_REQUIRED")
+                try:
+                    _facebook_url(state.get("url"))
+                except BrowserAutomationError:
+                    # about:blank may still be visible before navigation commits.
+                    if state.get("url") not in ("about:blank", ""):
+                        raise
+                else:
+                    if state.get("readyState") == "complete" and state.get("mainPresent"):
+                        return
+            if attempt < 19:
+                await asyncio.sleep(1)
+        raise BrowserAutomationError(
+            "Facebook chưa tải xong vùng nội dung sau 20 lần kiểm tra; chưa xác minh hoặc gửi bình luận.",
+            "NETWORK_RETRYABLE")
+
     async def click(self, point):
         for kind in ("mousePressed", "mouseReleased"):
             await self.call("Input.dispatchMouseEvent", {"type": kind, "x": float(point["x"]),
@@ -967,7 +1012,7 @@ async def _with_browser_tab(context, url, operation):
             response = await session.call("Page.navigate", {"url": _facebook_url(url)})
             if (response.get("result") or {}).get("errorText"):
                 raise BrowserAutomationError("Không mở được trang Facebook.", "NETWORK_RETRYABLE")
-            await asyncio.sleep(3)
+            await session.wait_until_loaded()
             return await operation(session)
     finally:
         if target_id:

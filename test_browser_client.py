@@ -31,7 +31,8 @@ def harness(monkeypatch):
              "commentBoxRect": {"x": 100, "y": 200}, "commentIds": [], "comments": []}
     h = SimpleNamespace(page=page, metadata=metadata, state=state, calls=[], opened=[], closed=[], released=[],
                         draft="", focused=False, submitted=False, after_comments=None,
-                        fail_method=None, fail_after_insert=None, before_eval=None, opened_by_us=False)
+                        fail_method=None, fail_after_insert=None, before_eval=None, opened_by_us=False,
+                        readiness=[], readiness_reads=0)
 
     class FakeConnection:
         async def __aenter__(self):
@@ -60,6 +61,16 @@ def harness(monkeypatch):
         return {"id": msg_id, "result": {}}
 
     async def evaluate(ws, msg_id, expression, timeout=10):
+        if expression == browser._BROWSER_READINESS_JS:
+            h.readiness_reads += 1
+            if h.readiness:
+                result = h.readiness[0]
+                if len(h.readiness) > 1:
+                    h.readiness.pop(0)
+                if isinstance(result, Exception):
+                    raise result
+                return result
+            return {"url": h.state["url"], "readyState": "complete", "mainPresent": True}
         if h.before_eval:
             h.before_eval()
         result = copy.deepcopy(h.state)
@@ -105,6 +116,71 @@ def test_success_requires_observed_real_comment_id_and_releases_only_owned_tab(h
     assert len(enters(h)) == 1
     assert h.closed == [(9222, "owned-tab")]
     assert h.released == [(PROFILE, False, None)]
+
+
+def test_loading_document_and_react_shell_wait_before_actor_or_input(harness):
+    harness.readiness = [
+        {"url": "about:blank", "readyState": "complete", "mainPresent": False},
+        {"url": URL, "readyState": "loading", "mainPresent": False},
+        {"url": URL, "readyState": "complete", "mainPresent": False},
+        {"url": URL, "readyState": "complete", "mainPresent": True},
+    ]
+    assert send(harness)["success"]
+    assert harness.readiness_reads == 4
+    assert len(enters(harness)) == 1
+
+
+def test_loading_timeout_never_types_and_cleans_up_owned_tab(harness):
+    harness.readiness = [{"url": URL, "readyState": "complete", "mainPresent": False}]
+    result = send(harness)
+    assert result["category"] == "NETWORK_RETRYABLE"
+    assert harness.readiness_reads == 20
+    assert harness.draft == "" and enters(harness) == []
+    assert harness.closed == [(9222, "owned-tab")]
+    assert harness.released == [(PROFILE, False, None)]
+
+
+@pytest.mark.parametrize("error", [
+    "Execution context was destroyed.", "Cannot find context with specified id",
+])
+def test_navigation_context_replacement_is_retried_before_input(harness, error):
+    harness.readiness = [RuntimeError("CDP Runtime.evaluate failed: " + error),
+                         {"url": URL, "readyState": "complete", "mainPresent": True}]
+    assert send(harness)["success"]
+    assert harness.readiness_reads == 2
+    assert len(enters(harness)) == 1
+
+
+def test_persistent_navigation_context_errors_stop_with_cleanup(harness):
+    harness.readiness = [RuntimeError("CDP Runtime.evaluate failed: Execution context was destroyed.")]
+    assert send(harness)["category"] == "NETWORK_RETRYABLE"
+    assert harness.readiness_reads == 20
+    assert harness.draft == "" and enters(harness) == []
+    assert harness.closed == [(9222, "owned-tab")]
+
+
+def test_non_navigation_protocol_error_is_not_retried(harness):
+    harness.readiness = [RuntimeError("CDP Runtime.evaluate failed: Unsupported operation")]
+    assert not send(harness)["success"]
+    assert harness.readiness_reads == 1
+    assert harness.draft == "" and enters(harness) == []
+    assert harness.closed == [(9222, "owned-tab")]
+
+
+@pytest.mark.parametrize("field,status", [("loginPresent", "LOGIN_REQUIRED"), ("checkpointPresent", "CHECKPOINT")])
+def test_auth_page_during_navigation_stops_without_waiting_or_input(harness, field, status):
+    harness.readiness = [{"url": URL, "readyState": "loading", "mainPresent": False, field: True}]
+    result = send(harness)
+    assert result["browser_status"] == status
+    assert harness.readiness_reads == 1
+    assert enters(harness) == []
+
+
+def test_navigation_to_non_facebook_domain_stops_before_input(harness):
+    harness.readiness = [{"url": "https://outside.invalid/", "readyState": "complete", "mainPresent": True}]
+    assert send(harness)["category"] == "INVALID_TARGET"
+    assert harness.readiness_reads == 1
+    assert enters(harness) == []
 
 
 @pytest.mark.parametrize("identity", [ALIAS, CANONICAL])
@@ -486,6 +562,26 @@ def test_strict_url_builder_rejects_arbitrary_database_urls():
     with pytest.raises(browser.BrowserAutomationError):
         browser.build_facebook_post_url(CANONICAL, POST, post_url="https://evil.invalid")
     assert browser.build_facebook_post_url(CANONICAL, POST).endswith(f"story_fbid={POST}&id={CANONICAL}")
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="Node is needed to execute the mock DOM fixture")
+def test_readiness_dom_detects_login_routes_without_form_fields():
+    fixture = r"""
+const source = require('fs').readFileSync(0, 'utf8');
+global.document = {readyState:'complete', querySelector:() => null};
+const result = ['/login', '/login.php', '/login/device-based/', '/loginXphp', '/checkpoint/'].map(path => {
+  global.location = {href:'https://www.facebook.com' + path, pathname:path};
+  return eval(source);
+});
+process.stdout.write(JSON.stringify(result));
+"""
+    completed = subprocess.run([shutil.which("node"), "-e", fixture], input=browser._BROWSER_READINESS_JS,
+                               capture_output=True, text=True, encoding="utf-8", timeout=15)
+    assert completed.returncode == 0, completed.stderr
+    states = json.loads(completed.stdout)
+    assert [state["loginPresent"] for state in states] == [True, True, True, False, False]
+    assert states[-1]["checkpointPresent"]
+    assert all(not state["mainPresent"] for state in states)
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="Node is needed to execute the mock DOM fixture")

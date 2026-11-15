@@ -8,6 +8,7 @@ import config
 import crypto
 import migrations
 import comment_content
+import post_identity
 
 DB_PATH = Path(__file__).parent / "fb_commenter.db"
 
@@ -904,6 +905,17 @@ def insert_auto_post_tasks(conn: sqlite3.Connection, page_id: str, post: Dict[st
     """, (page_id, post["id"])).fetchone()
     if existing:
         return False
+    page = conn.execute("SELECT fb_profile_id FROM pages WHERE page_id = ?", (page_id,)).fetchone()
+    owner_ids = (page_id, page["fb_profile_id"] if page else None)
+    permalink_key = post_identity.facebook_post_key(post.get("url"), allowed_owner_ids=owner_ids)
+    if permalink_key is not None:
+        existing_urls = conn.execute("""
+            SELECT DISTINCT post_url FROM tasks WHERE page_id = ? AND post_url IS NOT NULL
+              AND (source = 'AUTO' OR dedupe_key LIKE 'publication:%')
+        """, (page_id,))
+        if any(post_identity.facebook_post_key(row["post_url"], allowed_owner_ids=owner_ids) == permalink_key
+               for row in existing_urls):
+            return False
     pending_publication = conn.execute("""
         SELECT 1 FROM publications WHERE page_id = ? AND status = 'PROCESSING'
           AND first_comment <> '' AND (post_id = ? OR ? = page_id || '_' || post_id)
