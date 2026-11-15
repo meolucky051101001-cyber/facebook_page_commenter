@@ -18,7 +18,8 @@ load_dotenv(ENV_FILE)
 # 1. Meta Credentials
 META_APP_ID = os.getenv("META_APP_ID", "").strip()
 META_APP_SECRET = os.getenv("META_APP_SECRET", "").strip()
-GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v19.0").strip()
+META_OAUTH_REDIRECT_URI = os.getenv("META_OAUTH_REDIRECT_URI", "").strip()
+GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v26.0").strip()
 
 
 def has_app_credentials() -> bool:
@@ -44,6 +45,7 @@ SHEET_SYNC_INTERVAL_SEC = int(os.getenv("SHEET_SYNC_INTERVAL_SEC", "300"))
 MAX_POST_AGE_MIN = int(os.getenv("MAX_POST_AGE_MIN", "120"))
 MIN_GAP_PER_PAGE_SEC = int(os.getenv("MIN_GAP_PER_PAGE_SEC", "45"))
 MAX_COMMENTS_PER_PAGE_PER_DAY = int(os.getenv("MAX_COMMENTS_PER_PAGE_PER_DAY", "20"))
+SEND_BACKOFF_MAX_MINUTES = max(16, int(os.getenv("SEND_BACKOFF_MAX_MINUTES", "30")))
 # Daily comment counter follows this UTC offset (default 7 = giờ Việt Nam)
 DAILY_COUNTER_UTC_OFFSET_HOURS = int(os.getenv("DAILY_COUNTER_UTC_OFFSET_HOURS", "7"))
 
@@ -53,11 +55,15 @@ ANTIDETECT_AUTO_CLOSE_BROWSER = os.getenv("ANTIDETECT_AUTO_CLOSE_BROWSER", "1").
 ANTIDETECT_AUTO_SCAN_POSTS = os.getenv("ANTIDETECT_AUTO_SCAN_POSTS", "0").strip() in ("1", "true", "yes", "on")
 
 # 6. Default Google Sheet URL & Startup Mode
-DEFAULT_SHEET_URL = os.getenv(
-    "DEFAULT_SHEET_URL",
-    "https://docs.google.com/spreadsheets/d/1Qq1lkhVzlDe0FJ5k3HDDkBiGYDqTItO2ycQMDQHATD0/edit?pli=1&gid=1405549804#gid=1405549804"
-).strip()
+DEFAULT_SHEET_URL = os.getenv("DEFAULT_SHEET_URL", "").strip()
+DASHBOARD_ADMIN_KEY = os.getenv("DASHBOARD_ADMIN_KEY", "").strip()
+MULTI_PAGE_SHEET_URL = os.getenv("MULTI_PAGE_SHEET_URL", "").strip()
+PILOT_SHEET_URL = os.getenv("PILOT_SHEET_URL", "").strip()
+PILOT_PAGE_ID = os.getenv("PILOT_PAGE_ID", "").strip()
+PILOT_AUTO_SCAN = os.getenv("PILOT_AUTO_SCAN", "0").strip() == "1"
 PAUSED_BY_DEFAULT = os.getenv("PAUSED_BY_DEFAULT", "1").strip() in ("1", "true", "yes", "on")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "").strip()
 
 
 

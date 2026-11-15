@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="vi">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vận hành Fanpage</title>
+<style>
+body{max-width:1050px;margin:32px auto;padding:0 16px;background:#f5f7fb;color:#182536;font:15px system-ui,sans-serif}
+header,nav,.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+header{justify-content:space-between}section{background:white;padding:22px;margin-top:16px;border-radius:12px}
+h1,h2{margin:.4em 0}label{display:grid;gap:4px}input,select,button,textarea{font:inherit;padding:8px}
+textarea{box-sizing:border-box;width:100%;min-height:75px}button{cursor:pointer}a{color:#174da1}
+.record{padding:12px 0;border-bottom:1px solid #e4e9f0;overflow-wrap:anywhere}.record p{white-space:pre-wrap;margin:7px 0}
+.muted{color:#506079}#message{white-space:pre-wrap}
+</style>
+<header><h1>Vận hành Fanpage</h1><a href="/">Danh sách Page và hàng đợi</a></header>
+<nav>
+    <button type="button" data-tab="publish">Lịch xuất bản</button>
+    <button type="button" data-tab="inbox">Hộp thư bình luận</button>
+    <button type="button" data-tab="reports">Báo cáo</button>
+    <button id="unlock" type="button">Nhập khóa dashboard</button>
+</nav>
+<p id="message" role="status"></p>
+<section id="publish">
+    <h2>Lịch xuất bản</h2>
+    <form id="publishForm">
+        <div class="row">
+            <label>Fanpage<select id="publishPage" name="page_id" required></select></label>
+            <label>Loại bài<select name="media_type"><option value="text">Văn bản</option><option value="photo">Ảnh</option><option value="reel">Reel</option></select></label>
+            <label>Giờ đăng (GMT+7)<input type="datetime-local" name="scheduled_at" required></label>
+        </div>
+        <p><label>URL HTTPS của ảnh hoặc Reel<input type="url" name="media_url"></label></p>
+        <p><label>Nội dung bài<textarea name="caption"></textarea></label></p>
+        <p><label>Bình luận kèm bài<textarea name="first_comment"></textarea></label></p>
+        <div class="row">
+            <label>Số phút chờ bình luận<input type="number" min="0" max="1440" value="0" name="comment_delay_minutes"></label>
+            <button>Lưu lịch</button>
+        </div>
+    </form>
+    <p><label>Nhập CSV từ lịch đăng<input type="file" id="publicationCsv" accept=".csv,text/csv"></label></p>
+    <p class="muted">Cột CSV: external_key, page_id, media_type, media_url, caption, first_comment, comment_delay_minutes, scheduled_at. Dùng giờ ISO có múi giờ, ví dụ 2026-11-14T10:00:00+07:00.</p>
+    <div id="publicationList"></div>
+</section>
+<section id="inbox" hidden>
+    <h2>Hộp thư bình luận</h2>
+    <div class="row">
+        <label>Fanpage<select id="inboxPage"><option value="">Tất cả Page</option></select></label>
+        <button id="refreshInbox" type="button">Đọc bình luận 7 ngày</button>
+        <label>Trạng thái<select id="inboxFilter"><option value="all">Tất cả</option><option value="waiting">Chưa trả lời</option><option value="phone">Có số điện thoại</option><option value="hidden">Đã ẩn</option></select></label>
+        <label><span><input type="checkbox" id="inboxMonitor"> Tự đồng bộ Page đã bật</span></label>
+    </div>
+    <form id="inboxRules" hidden>
+        <p><label><span><input name="hide_phone" type="checkbox"> Tự ẩn bình luận mới chứa số điện thoại</span></label></p>
+        <div class="row">
+            <label>Từ khóa để tự trả lời<input name="keyword" maxlength="100"></label>
+            <label>Nội dung trả lời<input name="reply" maxlength="8000"></label>
+            <button>Lưu quy tắc</button>
+        </div>
+        <p class="muted">Áp dụng cho bình luận đến sau khi lưu, khi Page và đồng bộ hộp thư đều bật.</p>
+    </form>
+    <div id="inboxList"></div>
+</section>
+<section id="reports" hidden>
+    <h2>Báo cáo bình luận</h2>
+    <label>Khoảng thời gian<select id="reportDays"><option value="7">7 ngày gần nhất</option><option value="1">24 giờ gần nhất</option></select></label>
+    <div id="reportList"></div>
+</section>
+<script>
+const el = id => document.getElementById(id);
+let pages = [];
+let publicationKey = null;
+const replyDrafts = new Map();
+const messages = el('message');
+const formatTime = value => new Date(value).toLocaleString('vi-VN', {timeZone: 'Asia/Bangkok'});
+
+async function api(path, body) {
+    const headers = {'X-Dashboard-Key': sessionStorage.getItem('dashboardAdminKey') || ''};
+    const options = {headers};
+    if (body !== undefined) {
+        options.method = 'POST';
+        headers['Content-Type'] = 'application/json';
+        options.body = JSON.stringify(body);
+    }
+    const response = await fetch(path, options);
+    const data = await response.json();
+    if (!response.ok) throw new Error((typeof data.detail === 'string' ? data.detail : 'Yêu cầu không hợp lệ.') +
+        (data.retry_at ? ' Thử tiếp: ' + formatTime(data.retry_at) : ''));
+    return data;
+}
+
+async function act(action) {
+    messages.textContent = '';
+    try { await action(); }
+    catch (error) { messages.textContent = error.message; }
+}
+
+function line(container, value, body) {
+    const record = document.createElement('div');
+    record.className = 'record';
+    const title = document.createElement('strong');
+    title.textContent = value;
+    record.append(title);
+    if (body) {
+        const description = document.createElement('p');
+        description.textContent = body;
+        record.append(description);
+    }
+    container.append(record);
+    return record;
+}
+
+function button(container, label, handler) {
+    const control = document.createElement('button');
+    control.type = 'button';
+    control.textContent = label;
+    control.addEventListener('click', async () => {
+        control.disabled = true;
+        try { await act(handler); } finally { control.disabled = false; }
+    });
+    container.append(control);
+}
+
+async function loadPages() {
+    pages = (await api('/api/pages')).pages;
+    el('publishPage').replaceChildren();
+    el('inboxPage').replaceChildren(new Option('Tất cả Page', ''));
+    for (const page of pages) {
+        if (!page.graph_ready) continue;
+        el('publishPage').append(new Option(page.page_name, page.page_id));
+        el('inboxPage').append(new Option(page.page_name, page.page_id));
+    }
+}
+
+async function loadPublications() {
+    const data = await api('/api/publications');
+    const list = el('publicationList');
+    list.replaceChildren();
+    for (const job of data.publications) {
+        const record = line(list, job.page_name + ' · ' + formatTime(job.scheduled_at) + ' · ' + job.status,
+            [job.caption, job.post_id, job.error].filter(Boolean).join('\n'));
+        if (job.status === 'PENDING') button(record, 'Hủy lịch', async () => {
+            await api('/api/publications/' + job.id + '/cancel', {});
+            await loadPublications();
+        });
+    }
+}
+
+el('publishForm').addEventListener('input', () => { publicationKey = null; });
+el('publicationCsv').onchange = () => act(async () => {
+    const input = el('publicationCsv');
+    const file = input.files[0];
+    if (!file) return;
+    if (file.size > 500000) throw new Error('CSV quá 500 KB.');
+    input.disabled = true;
+    try {
+        const result = await api('/api/publications/import', {content: await file.text()});
+        await loadPublications();
+        messages.textContent = 'Đã nhập ' + result.inserted + ' lịch mới.';
+    } finally {
+        input.value = '';
+        input.disabled = false;
+    }
+});
+el('publishForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const submit = event.submitter;
+    submit.disabled = true;
+    try { await act(async () => {
+        const entry = Object.fromEntries(new FormData(form));
+        publicationKey ||= crypto.randomUUID();
+        entry.external_key = publicationKey;
+        entry.scheduled_at += ':00+07:00';
+        entry.comment_delay_minutes = Number(entry.comment_delay_minutes);
+        const result = await api('/api/publications', {entries: [entry]});
+        publicationKey = null;
+        form.reset();
+        await loadPublications();
+        messages.textContent = result.inserted ? 'Đã lưu lịch.' : 'Lịch này đã được lưu.';
+    }); } finally { submit.disabled = false; }
+});
+
+async function loadInbox(loadRules = false) {
+    const page = el('inboxPage').value;
+    const data = await api('/api/inbox' + (page ? '?page_id=' + encodeURIComponent(page) : ''));
+    el('inboxMonitor').checked = data.monitor_enabled;
+    const form = el('inboxRules');
+    form.hidden = !page;
+    if (page && loadRules) {
+        const rules = await api('/api/inbox/rules/' + encodeURIComponent(page));
+        form.elements.hide_phone.checked = Boolean(rules.hide_phone);
+        form.elements.keyword.value = rules.keyword || '';
+        form.elements.reply.value = rules.reply || '';
+    }
+    const filter = el('inboxFilter').value;
+    const list = el('inboxList');
+    list.replaceChildren();
+    for (const item of data.comments) {
+        if (filter === 'waiting' && item.reply_id || filter === 'hidden' && !item.hidden || filter === 'phone' && !item.has_phone) continue;
+        const record = line(list, item.page_name + ' · ' + (item.author_name || 'Khách hàng'),
+            item.message + (item.action_pending ? '\nCần đối chiếu trên Facebook' : ''));
+        const waiting = data.page_waits?.[item.page_id];
+        if (!item.reply_id && waiting?.send_wait_reason) {
+            const note = document.createElement('p');
+            note.textContent = waiting.send_wait_reason + (waiting.next_send_at ? ' · Thử tiếp: ' + formatTime(waiting.next_send_at) : '');
+            record.append(note);
+        }
+        if (item.action_pending) continue;
+        const path = '/api/inbox/' + encodeURIComponent(item.comment_id) + '/moderate';
+        if (!item.reply_id) button(record, 'Trả lời', async () => {
+            const message = prompt('Nội dung trả lời', replyDrafts.get(item.comment_id) || '');
+            if (!message?.trim()) return;
+            replyDrafts.set(item.comment_id, message);
+            await api(path, {action: 'reply', message});
+            replyDrafts.delete(item.comment_id);
+            await loadInbox();
+        });
+        button(record, item.hidden ? 'Bỏ ẩn' : 'Ẩn', async () => {
+            await api(path, {action: item.hidden ? 'unhide' : 'hide'});
+            await loadInbox();
+        });
+        if (!item.reply_id) button(record, 'Gợi ý bản nháp', async () => {
+            const text = prompt('Nhập ý trả lời. Nội dung trong ô này được gửi tới Gemini.', '');
+            if (!text?.trim()) return;
+            const draft = await api('/api/drafts/rewrite', {text});
+            const reply = document.createElement('textarea');
+            reply.value = draft.text;
+            reply.setAttribute('aria-label', 'Bản nháp trả lời');
+            record.append(reply);
+            button(record, 'Gửi bản nháp đã sửa', async () => {
+                await api(path, {action: 'reply', message: reply.value});
+                await loadInbox();
+            });
+        });
+    }
+}
+
+el('refreshInbox').onclick = () => act(async () => {
+    const page = el('inboxPage').value;
+    if (!page) throw new Error('Chọn một Fanpage để đọc bình luận.');
+    el('refreshInbox').disabled = true;
+    try {
+        const data = await api('/api/inbox/refresh/' + encodeURIComponent(page), {});
+        await loadInbox();
+        messages.textContent = 'Đã đọc ' + data.read + ' bình luận.';
+    } finally { el('refreshInbox').disabled = false; }
+});
+el('inboxPage').onchange = () => act(() => loadInbox(true));
+el('inboxFilter').onchange = () => act(loadInbox);
+el('inboxRules').onsubmit = event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    return act(async () => {
+        await api('/api/inbox/rules/' + encodeURIComponent(el('inboxPage').value), {
+            hide_phone: form.elements.hide_phone.checked,
+            keyword: form.elements.keyword.value,
+            reply: form.elements.reply.value,
+        });
+        messages.textContent = 'Đã lưu quy tắc cho Fanpage.';
+    });
+};
+el('inboxMonitor').onchange = () => act(async () => {
+    const control = el('inboxMonitor');
+    control.disabled = true;
+    try {
+        const data = await api('/api/inbox/monitor', {enabled: control.checked});
+        control.checked = data.enabled;
+    } catch (error) {
+        control.checked = !control.checked;
+        throw error;
+    } finally { control.disabled = false; }
+});
+
+async function loadReport() {
+    const data = await api('/api/reports?days=' + el('reportDays').value);
+    const list = el('reportList');
+    list.replaceChildren();
+    const byPage = new Map();
+    for (const row of data.rows) {
+        if (!byPage.has(row.page_id)) byPage.set(row.page_id, {name: row.page_name, statuses: {}});
+        byPage.get(row.page_id).statuses[row.status] = row.total;
+    }
+    for (const {name, statuses} of byPage.values()) {
+        const success = statuses.SUCCESS || 0;
+        const finished = success + (statuses.FAILED || 0) + (statuses.NEED_CHECK || 0);
+        const summary = finished ? ' · Đã gửi ' + success + '/' + finished : '';
+        line(list, name + summary, Object.entries(statuses).map(([status, total]) => status + ' ' + total).join(' · '));
+    }
+    for (const errors of [data.scan_errors, data.send_errors, data.inbox_errors]) {
+        for (const [page, error] of Object.entries(errors)) {
+            line(list, pages.find(item => item.page_id === page)?.page_name || page, error);
+        }
+    }
+    if (data.publication_error) line(list, 'Lỗi lịch xuất bản', data.publication_error);
+}
+
+el('reportDays').onchange = () => act(loadReport);
+el('unlock').onclick = () => act(async () => {
+    const key = prompt('Nhập khóa DASHBOARD_ADMIN_KEY', '');
+    if (!key) return;
+    sessionStorage.setItem('dashboardAdminKey', key);
+    await loadPages();
+    await loadPublications();
+});
+for (const control of document.querySelectorAll('[data-tab]')) {
+    control.onclick = () => act(async () => {
+        for (const panel of document.querySelectorAll('section')) panel.hidden = panel.id !== control.dataset.tab;
+        const handlers = {publish: loadPublications, inbox: () => loadInbox(true), reports: loadReport};
+        await handlers[control.dataset.tab]();
+    });
+}
+act(async () => {
+    await loadPages();
+    await loadPublications();
+});
+</script>
+</html>

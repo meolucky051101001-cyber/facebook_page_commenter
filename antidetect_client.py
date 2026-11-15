@@ -154,6 +154,7 @@ def sync_pages_from_antidetect(export_csv: bool = True) -> Dict[str, Any]:
     linked_hybrid = 0
     updated = 0
     profiles_synced = 0
+    conflicts = []
 
     for prof in info["profiles"]:
         pid = prof["id"]
@@ -195,6 +196,8 @@ def sync_pages_from_antidetect(export_csv: bool = True) -> Dict[str, Any]:
                 inserted += 1
             elif act == "linked_hybrid":
                 linked_hybrid += 1
+            elif act == "conflict":
+                conflicts.append(fb_id)
             else:
                 updated += 1
 
@@ -211,6 +214,7 @@ def sync_pages_from_antidetect(export_csv: bool = True) -> Dict[str, Any]:
         "inserted": inserted,
         "linked_hybrid": linked_hybrid,
         "updated": updated,
+        "conflicting_page_ids": sorted(set(conflicts)),
         "total_pages_in_db": len(all_pages),
     }
 

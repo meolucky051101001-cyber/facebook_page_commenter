@@ -1,5 +1,6 @@
 .env
 *.db
+*.db.lock
 *.bak
 *.sqlite3
 __pycache__/
@@ -7,3 +8,5 @@ __pycache__/
 .pytest_cache/
 service_account.json
 logs/
+
+backups/

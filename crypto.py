@@ -1,7 +1,11 @@
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 import config
 
 _fernet = None
+
+
+class TokenDecryptionError(ValueError):
+    pass
 
 def get_fernet():
     global _fernet
@@ -27,9 +31,8 @@ def decrypt_token(enc_token: str) -> str:
     f = get_fernet()
     try:
         return f.decrypt(enc_token.encode("utf-8")).decode("utf-8")
-    except Exception:
-        # If decryption fails (e.g. legacy plain text), return as is or empty
-        return enc_token
+    except (InvalidToken, UnicodeDecodeError):
+        raise TokenDecryptionError("Không giải mã được token Page. Kiểm tra khóa Fernet hoặc kết nối lại.") from None
 
 def mask_token(token: str) -> str:
     """Returns a masked version of the token for logging/UI safety (e.g. '...4F7a9b')."""

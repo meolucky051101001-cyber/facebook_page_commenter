@@ -7,6 +7,7 @@ import httpx
 from typing import Dict, Any, List, Optional, Tuple
 
 import database as db
+import comment_content
 
 PAGE_ID_COLS = {"page id", "page_id", "id page", "id trang", "id", "mã trang", "ma trang"}
 PAGE_NAME_COLS = {
@@ -469,7 +470,7 @@ def sync_from_google_sheet(sheet_url_or_id: str) -> Dict[str, Any]:
         # sync cannot silently re-enable a rule the operator disabled in the Tool.
         prev_cfg = aggregated_configs.get(canonical_pid)
         existing_enabled = (
-            prev_cfg["is_enabled"] if prev_cfg
+            prev_cfg["is_enabled"] if prev_cfg and prev_cfg["is_enabled"] is not None
             else bool(matched_page.get("rule_enabled", 1))
         )
         raw_enabled = _get_explicit_col(r, ENABLED_COLS)
@@ -479,7 +480,7 @@ def sync_from_google_sheet(sheet_url_or_id: str) -> Dict[str, Any]:
                 errors.append(f"Dòng {idx}: {enabled_err}")
                 continue
         else:
-            is_enabled = existing_enabled
+            is_enabled = prev_cfg["is_enabled"] if prev_cfg else None
 
         if unified_mode:
             tpl = _get_col(r, COMMENT_TPL_COLS).strip()
@@ -536,20 +537,6 @@ def sync_from_google_sheet(sheet_url_or_id: str) -> Dict[str, Any]:
                 )
                 synced_count += 1
 
-            # Soft-disable previously active pages no longer present in the Sheet (both modes)
-            if seen_sheet_pids and not errors:
-                for pdata in all_db_pages:
-                    pid = pdata["page_id"]
-                    if pid not in seen_sheet_pids and pdata.get("rule_enabled") == 1:
-                        db.update_page_rule(
-                            page_id=pid,
-                            delay_minutes=pdata.get("delay_minutes", 10),
-                            templates=json.loads(pdata.get("templates") or "[]"),
-                            max_comments_per_day=pdata.get("max_comments_per_day", 20),
-                            is_enabled=False,
-                            conn=conn
-                        )
-                        disabled_count += 1
     finally:
         conn.close()
 
@@ -569,3 +556,344 @@ def sync_from_google_sheet(sheet_url_or_id: str) -> Dict[str, Any]:
         "errors": errors,
         "warnings": warnings
     }
+
+def pilot_comment_for_post(templates: List[str], post_id: str) -> str:
+    """Pick consistently so editing a Sheet row updates the matching queued content."""
+    return comment_content.select_template(templates, post_id)
+
+
+def sync_pilot_comment_sheet(sheet_url: str, page_id: str) -> Dict[str, Any]:
+    """Read one exact tab and apply its contents to one Page without changing rule state."""
+    from contextlib import closing
+    from datetime import datetime, timezone
+    from decimal import Decimal, InvalidOperation
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(sheet_url)
+    match = re.fullmatch(r"/spreadsheets/d/([A-Za-z0-9_-]+)(?:/edit)?/?", parsed.path)
+    gid = extract_sheet_gid(sheet_url)
+    if parsed.scheme != "https" or parsed.netloc != "docs.google.com" or not match or not gid or not page_id:
+        return {"success": False, "error": "Cấu hình Sheet pilot cần URL Google Sheets có gid và ID Page."}
+    url = f"https://docs.google.com/spreadsheets/d/{match.group(1)}/gviz/tq"
+    try:
+        with httpx.Client(timeout=10, follow_redirects=False, trust_env=False) as client:
+            response = client.get(url, params={
+                "tqx": "out:csv", "gid": gid, "range": "A1:D250", "headers": "1",
+            })
+        if response.status_code != 200 or "text/csv" not in response.headers.get("content-type", ""):
+            return {"success": False, "error": "Không đọc được tab bình luận đã cấu hình."}
+        rows = list(csv.reader(io.StringIO(response.text)))
+    except (httpx.HTTPError, csv.Error):
+        return {"success": False, "error": "Lỗi khi đọc tab bình luận từ Google."}
+    if not rows or rows[0] != ["ID trang", "Comment", "Tên Fanpage", "Số giờ chờ sau khi đăng bài"]:
+        return {"success": False, "error": "Tab bình luận sai tiêu đề A1:D1."}
+
+    templates: List[str] = []
+    delays = set()
+    for row_index, row in enumerate(rows[1:], 2):
+        pid, comment, _, hours = (row + [""] * 4)[:4]
+        if not comment.strip():
+            continue
+        if pid.strip() != page_id:
+            return {"success": False, "error": f"Dòng {row_index} không thuộc Page pilot."}
+        if len(comment) > 8000 or re.search(r"\bEA[A-Z][A-Za-z0-9]{30,}\b", comment):
+            return {"success": False, "error": f"Dòng {row_index} có nội dung không hợp lệ."}
+        if hours.strip():
+            try:
+                exact = Decimal(hours.strip().replace(",", ".")) * 60
+                if not exact.is_finite() or not 0 <= exact <= 1440:
+                    raise ValueError
+                minute = int(exact.to_integral_value())
+                if abs(exact - minute) > Decimal("0.001"):
+                    raise ValueError
+                delays.add(minute)
+            except (InvalidOperation, ValueError, OverflowError):
+                return {"success": False, "error": f"Số giờ chờ ở dòng {row_index} không đổi được thành số phút nguyên."}
+        if comment.strip() not in templates:
+            templates.append(comment.strip())
+    if not templates or len(delays) != 1:
+        return {"success": False, "error": "Cần ít nhất một mẫu và một thời gian chờ chung."}
+    delay = next(iter(delays))
+    now = datetime.now(timezone.utc).isoformat()
+    changed = 0
+    serialized = json.dumps(templates, ensure_ascii=False)
+    with closing(db.get_connection()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        rule = conn.execute("SELECT delay_minutes,templates FROM page_rules WHERE page_id=?", (page_id,)).fetchone()
+        if rule is None:
+            return {"success": False, "error": "Không tìm thấy rule của Page pilot."}
+        if rule["delay_minutes"] != delay or rule["templates"] != serialized:
+            conn.execute(
+                "UPDATE page_rules SET delay_minutes=?,templates=?,updated_at=? WHERE page_id=?",
+                (delay, serialized, now, page_id),
+            )
+        pending = conn.execute(
+            "SELECT id,post_id,comment_content FROM tasks WHERE page_id=? AND source='AUTO' AND status='PENDING'",
+            (page_id,),
+        ).fetchall()
+        for task in pending:
+            content = pilot_comment_for_post(templates, task["post_id"])
+            if task["comment_content"] != content:
+                conn.execute("UPDATE tasks SET comment_content=?,updated_at=? WHERE id=?", (content, now, task["id"]))
+                changed += 1
+    return {"success": True, "pages_synced": 1, "templates_count": len(templates), "delay_minutes": delay,
+            "pending_updated": changed, "errors": [], "warnings": [],
+            "message": f"Đã đồng bộ {len(templates)} mẫu cho Page pilot; cập nhật {changed} tác vụ đang chờ."}
+
+
+def _header_key(value: str) -> str:
+    text = str(value or "").strip().lower().replace("đ", "d")
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+def _parse_comment_delay(value: str, unit: str) -> Optional[int]:
+    from decimal import Decimal, InvalidOperation
+
+    try:
+        raw = (value or "").strip().replace(",", ".")
+        amount = Decimal(1) / 6 if unit == "hours" and raw == "1/6" else Decimal(raw)
+        exact_minutes = amount * (60 if unit == "hours" else 1)
+        if not exact_minutes.is_finite() or exact_minutes < 1 or exact_minutes > 1440:
+            return None
+        minutes = int(exact_minutes.to_integral_value())
+        if abs(exact_minutes - minutes) > Decimal("0.001"):
+            return None
+        return minutes
+    except (InvalidOperation, ValueError, OverflowError):
+        return None
+
+
+def sync_comment_sheet_rows(rows: List[List[str]], legacy_page_id: str = "", save_url: str = "") -> Dict[str, Any]:
+    """Apply a multi-Page comment tab while keeping automation permission in the dashboard."""
+    from contextlib import closing
+    from datetime import datetime, timedelta, timezone
+
+    if not rows:
+        return {"success": False, "error": "Tab bình luận không có hàng tiêu đề."}
+
+    header = [_header_key(cell) for cell in rows[0]]
+    id_col = next((i for i, key in enumerate(header) if key in ("id trang", "page id", "id page")), None)
+    name_col = next((i for i, key in enumerate(header) if key in ("ten fanpage", "page name", "ten trang")), None)
+    comment_col = next((i for i, key in enumerate(header) if key in ("comment", "mau binh luan", "noi dung binh luan")), None)
+    order_col = next((i for i, key in enumerate(header) if key in ("thu tu", "thu tu comment", "sequence step")), None)
+    minute_col = next((i for i, key in enumerate(header) if key in (
+        "so phut cho sau khi dang", "so phut cho sau khi dang bai", "delay minutes", "delay phut"
+    )), None)
+    hour_col = next((i for i, key in enumerate(header) if key in (
+        "so gio cho sau khi dang bai", "so gio cho", "delay hours"
+    )), None)
+    delay_col = minute_col if minute_col is not None else hour_col
+    delay_unit = "minutes" if minute_col is not None else "hours"
+    if id_col is None or name_col is None or comment_col is None or delay_col is None:
+        return {
+            "success": False,
+            "error": "Tab cần các cột ID trang, Tên Fanpage, Comment và Số phút chờ sau khi đăng.",
+        }
+
+    errors: List[str] = []
+    warnings: List[str] = []
+    grouped: Dict[str, Dict[str, Any]] = {}
+    row_page_ids = set()
+    pages = db.get_all_pages()
+    page_ids: Dict[str, set] = {}
+    canonical_names = {str(page["page_id"]): page["page_name"] for page in pages}
+    for page in pages:
+        canonical_id = str(page["page_id"])
+        for identifier in (canonical_id, page.get("fb_profile_id")):
+            if identifier:
+                page_ids.setdefault(str(identifier), set()).add(canonical_id)
+
+    for row_number, row in enumerate(rows[1:], start=2):
+        cells = list(row) + [""] * max(0, len(header) - len(row))
+        raw_id = str(cells[id_col] or "").strip().strip("'")
+        comment = str(cells[comment_col] or "").strip()
+        page_name = str(cells[name_col] or "").strip()
+        raw_delay = str(cells[delay_col] or "").strip()
+        if not any(str(cell or "").strip() for cell in cells):
+            continue
+        if not raw_id and not comment and not raw_delay:
+            continue
+        clean_id, id_error = validate_page_id(raw_id)
+        if id_error:
+            errors.append(f"Dòng {row_number}: {id_error}")
+            continue
+        candidates = page_ids.get(clean_id, set())
+        if len(candidates) != 1:
+            message = (
+                f"Dòng {row_number}: ID {clean_id} trùng giữa nhiều Page."
+                if candidates else f"Dòng {row_number}: ID {clean_id} chưa có trong danh sách Page."
+            )
+            errors.append(message)
+            for candidate in candidates:
+                row_page_ids.add(candidate)
+                grouped.setdefault(candidate, {"templates": [], "delays": set(), "errors": [], "names": set(), "steps": {}, "unordered": False})["errors"].append(message)
+            continue
+        clean_id = next(iter(candidates))
+        if delay_unit == "hours" and clean_id != legacy_page_id:
+            errors.append(f"Dòng {row_number}: tab tính theo giờ chỉ dùng cho Page pilot cũ.")
+            continue
+        row_page_ids.add(clean_id)
+        group = grouped.setdefault(clean_id, {"templates": [], "delays": set(), "errors": [], "names": set(), "steps": {}, "unordered": False})
+        if page_name:
+            group["names"].add(page_name)
+        if not comment:
+            group["errors"].append(f"Dòng {row_number}: thiếu nội dung Comment.")
+            continue
+        if len(comment) > 8000 or re.search(r"\bEA[A-Z][A-Za-z0-9]{30,}\b", comment):
+            group["errors"].append(f"Dòng {row_number}: nội dung không hợp lệ hoặc có vẻ chứa Access Token.")
+            continue
+        if not validate_spintax_braces(comment):
+            group["errors"].append(f"Dòng {row_number}: cú pháp Spintax không hợp lệ.")
+            continue
+        try:
+            comment_content.validate_template(comment, canonical_names[clean_id])
+        except ValueError as exc:
+            group["errors"].append(f"Dòng {row_number}: {exc}")
+            continue
+        delay = _parse_comment_delay(raw_delay, delay_unit)
+        if delay is None and (raw_delay or delay_unit != "hours"):
+            unit_name = "phút" if delay_unit == "minutes" else "giờ"
+            group["errors"].append(f"Dòng {row_number}: thời gian chờ {unit_name} phải quy đổi thành 1–1440 phút nguyên.")
+            continue
+        order = str(cells[order_col] or "").strip() if order_col is not None else ""
+        if order:
+            if delay_unit != "minutes" or not re.fullmatch(r"[1-9][0-9]{0,3}", order) or delay is None:
+                group["errors"].append(f"Dòng {row_number}: Thứ tự phải là số nguyên dương và thời gian chờ phải tính theo phút.")
+                continue
+            step = int(order)
+            if step in group["steps"]:
+                group["errors"].append(f"Dòng {row_number}: trùng bình luận thứ {step}.")
+                continue
+            group["steps"][step] = {"template": comment, "delay_minutes": delay}
+        else:
+            group["unordered"] = True
+        if delay is not None:
+            group["delays"].add(delay)
+        if comment not in group["templates"]:
+            group["templates"].append(comment)
+
+    valid: Dict[str, Dict[str, Any]] = {}
+    page_errors: Dict[str, str] = {}
+    for page_id, group in grouped.items():
+        steps = [group["steps"][key] for key in sorted(group["steps"])]
+        if group["errors"]:
+            page_errors[page_id] = " ".join(group["errors"])
+        elif steps:
+            if group["unordered"] or sorted(group["steps"]) != list(range(1, len(steps) + 1)):
+                page_errors[page_id] = "Chuỗi bình luận của Page phải đánh số liên tục từ 1 cho tất cả các dòng."
+            elif any(a["delay_minutes"] >= b["delay_minutes"] for a, b in zip(steps, steps[1:])):
+                page_errors[page_id] = "Số phút chờ phải tăng dần theo thứ tự bình luận."
+            else:
+                valid[page_id] = {
+                    "templates": [step["template"] for step in steps],
+                    "delay_minutes": steps[0]["delay_minutes"],
+                    "sequence": steps,
+                }
+        elif len(group["delays"]) != 1:
+            page_errors[page_id] = "Các dòng cùng Page phải có cùng một thời gian chờ từ 1 đến 1440 phút."
+        elif not group["templates"]:
+            page_errors[page_id] = "Page cần ít nhất một mẫu Comment hợp lệ."
+        else:
+            valid[page_id] = {
+                "templates": group["templates"],
+                "delay_minutes": next(iter(group["delays"])),
+                "sequence": [],
+            }
+            if len(group["names"]) > 1:
+                warnings.append(f"Page {page_id}: tên Fanpage không nhất quán giữa các dòng; dùng Page ID làm khóa.")
+
+    if not valid and save_url:
+        detail = errors + [f"Page {pid}: {message}" for pid, message in page_errors.items()]
+        return {"success": False, "error": "Không có Page nào có cấu hình hợp lệ để đồng bộ.", "errors": detail}
+
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    pending_updated = 0
+    with closing(db.get_connection()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for page_id in set(valid) | set(page_errors):
+            message = page_errors.get(page_id)
+            if message:
+                conn.execute(
+                    "UPDATE page_rules SET source_error = ?, source_synced_at = ?, updated_at = ? WHERE page_id = ?",
+                    (message, now, now, page_id),
+                )
+                errors.append(f"Page {page_id}: {message}")
+                continue
+            item = valid[page_id]
+            templates = item["templates"]
+            serialized = json.dumps(templates, ensure_ascii=False)
+            old = conn.execute("SELECT delay_minutes, comment_sequence FROM page_rules WHERE page_id = ?", (page_id,)).fetchone()
+            conn.execute("""
+                UPDATE page_rules
+                SET delay_minutes = ?, templates = ?, comment_sequence = ?, source_error = NULL,
+                    source_synced_at = ?, updated_at = ?
+                WHERE page_id = ?
+            """, (item["delay_minutes"], serialized, json.dumps(item["sequence"], ensure_ascii=False), now, now, page_id))
+            try:
+                pending_updated += db.refresh_single_task_content(
+                    conn, page_id, old_delay=old["delay_minutes"] if old else None,
+                    freeze=bool(item["sequence"] or (old and json.loads(old["comment_sequence"]))),
+                )
+            except ValueError as exc:
+                message = str(exc)
+                conn.execute("UPDATE page_rules SET source_error=? WHERE page_id=?", (message, page_id))
+                errors.append(f"Page {page_id}: {message}")
+
+        # A missing group blocks that Page until the source contains a valid configuration again.
+        for page in pages:
+            page_id = str(page["page_id"])
+            if page_id not in row_page_ids:
+                message = "Page không có mẫu trong tab bình luận hiện tại."
+                conn.execute(
+                    "UPDATE page_rules SET source_error = ?, source_synced_at = ?, updated_at = ? WHERE page_id = ?",
+                    (message, now, now, page_id),
+                )
+                if page.get("rule_enabled"):
+                    errors.append(f"Page {page_id}: {message}")
+        if save_url:
+            conn.execute("""
+                INSERT INTO app_settings (setting_key, setting_value, updated_at)
+                VALUES ('comment_sheet_url', ?, ?)
+                ON CONFLICT(setting_key) DO UPDATE SET setting_value = excluded.setting_value,
+                                                       updated_at = excluded.updated_at
+            """, (save_url, now))
+
+    templates_count = sum(len(item["templates"]) for item in valid.values())
+    if not valid:
+        return {"success": False, "error": "Không có Page nào có cấu hình hợp lệ để đồng bộ.", "errors": errors}
+    return {
+        "success": True,
+        "pages_synced": len(valid),
+        "templates_count": templates_count,
+        "pending_updated": pending_updated,
+        "errors": errors,
+        "warnings": warnings,
+        "sheet_mode": "MULTI_PAGE" if minute_col is not None else "LEGACY_HOURS",
+        "message": f"Đã đồng bộ {len(valid)} Page, {templates_count} mẫu; cập nhật {pending_updated} tác vụ tự động đang chờ.",
+    }
+
+
+def sync_comment_sheet(sheet_url: str, legacy_page_id: str = "", save_url: bool = False) -> Dict[str, Any]:
+    """Reads one configured Google Sheets tab and applies valid per-Page groups."""
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit((sheet_url or "").strip())
+    match = re.fullmatch(r"/spreadsheets/d/([A-Za-z0-9_-]+)(?:/edit)?/?", parsed.path)
+    gid = extract_sheet_gid(sheet_url or "")
+    if parsed.scheme != "https" or parsed.netloc != "docs.google.com" or not match or not gid:
+        return {"success": False, "error": "Cần URL Google Sheets hợp lệ có gid của tab bình luận."}
+    url = f"https://docs.google.com/spreadsheets/d/{match.group(1)}/gviz/tq"
+    try:
+        with httpx.Client(timeout=10, follow_redirects=False, trust_env=False) as client:
+            response = client.get(url, params={
+                "tqx": "out:csv", "gid": gid, "range": "A1:E2000", "headers": "1",
+            })
+        if response.status_code != 200 or "text/csv" not in response.headers.get("content-type", ""):
+            return {"success": False, "error": "Không đọc được tab bình luận đã cấu hình."}
+        rows = list(csv.reader(io.StringIO(response.text)))
+    except (httpx.HTTPError, csv.Error):
+        return {"success": False, "error": "Lỗi khi đọc tab bình luận từ Google."}
+    return sync_comment_sheet_rows(rows, legacy_page_id=legacy_page_id, save_url=sheet_url if save_url else "")

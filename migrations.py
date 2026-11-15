@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import crypto
 
-def run_migrations(conn: sqlite3.Connection):
+def run_migrations(conn: sqlite3.Connection, preserve_auto_page_id: str = ""):
     conn.execute("""
         CREATE TABLE IF NOT EXISTS schema_version (
             version INTEGER PRIMARY KEY,
@@ -25,6 +25,108 @@ def run_migrations(conn: sqlite3.Connection):
         _apply_migration_v2(conn)
         conn.execute("INSERT INTO schema_version (version) VALUES (2)")
         conn.commit()
+
+    if current_version < 3:
+        _apply_migration_v3(conn, preserve_auto_page_id)
+        conn.execute("INSERT INTO schema_version (version) VALUES (3)")
+        conn.commit()
+
+    if current_version < 4:
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("ALTER TABLE page_rules ADD COLUMN comment_sequence TEXT NOT NULL DEFAULT '[]'")
+            conn.execute("ALTER TABLE tasks ADD COLUMN sequence_step INTEGER")
+            conn.execute("ALTER TABLE tasks ADD COLUMN sequence_gap_minutes INTEGER")
+            conn.execute("""
+                CREATE UNIQUE INDEX idx_tasks_sequence_step ON tasks(page_id, post_id, sequence_step)
+                WHERE source = 'AUTO' AND sequence_step IS NOT NULL
+            """)
+            conn.execute("INSERT INTO schema_version (version) VALUES (4)")
+
+    if current_version < 5:
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS publications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    page_id TEXT NOT NULL REFERENCES pages(page_id),
+                    external_key TEXT NOT NULL UNIQUE,
+                    media_type TEXT NOT NULL,
+                    media_url TEXT NOT NULL DEFAULT '',
+                    caption TEXT NOT NULL,
+                    first_comment TEXT NOT NULL DEFAULT '',
+                    comment_delay_minutes INTEGER NOT NULL DEFAULT 0,
+                    scheduled_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'PENDING',
+                    post_id TEXT,
+                    error TEXT,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_publications_due ON publications(status, scheduled_at)")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS incoming_comments (
+                    comment_id TEXT PRIMARY KEY,
+                    page_id TEXT NOT NULL REFERENCES pages(page_id),
+                    post_id TEXT NOT NULL,
+                    author_name TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    has_phone INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    hidden INTEGER NOT NULL DEFAULT 0,
+                    reply_id TEXT,
+                    action_pending TEXT
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_inbox_created ON incoming_comments(created_at)")
+            conn.execute("INSERT INTO schema_version (version) VALUES (5)")
+
+    if current_version < 6:
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("ALTER TABLE pages ADD COLUMN send_cooldown_until TEXT")
+            conn.execute("ALTER TABLE pages ADD COLUMN send_backoff_attempts INTEGER NOT NULL DEFAULT 0")
+            conn.execute("ALTER TABLE page_rules ADD COLUMN content_revision TEXT NOT NULL DEFAULT ''")
+            conn.execute("ALTER TABLE tasks ADD COLUMN template_source TEXT")
+            conn.execute("ALTER TABLE tasks ADD COLUMN content_revision TEXT")
+            conn.execute("ALTER TABLE tasks ADD COLUMN content_delay_minutes INTEGER")
+            conn.execute("INSERT INTO schema_version (version) VALUES (6)")
+
+
+def _apply_migration_v3(conn: sqlite3.Connection, preserve_auto_page_id: str = ""):
+    """Adds per-Page connection/sheet state and defaults new automation to paused."""
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(page_rules)")
+    rule_cols = [col[1] for col in cur.fetchall()]
+    for col_name, col_def in {
+        "source_error": "TEXT",
+        "source_synced_at": "TIMESTAMP",
+    }.items():
+        if col_name not in rule_cols:
+            conn.execute(f"ALTER TABLE page_rules ADD COLUMN {col_name} {col_def}")
+
+    cur.execute("PRAGMA table_info(pages)")
+    page_cols = [col[1] for col in cur.fetchall()]
+    for col_name, col_def in {
+        "connection_checked_at": "TIMESTAMP",
+        "connection_error": "TEXT",
+    }.items():
+        if col_name not in page_cols:
+            conn.execute(f"ALTER TABLE pages ADD COLUMN {col_name} {col_def}")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS app_settings (
+            setting_key TEXT PRIMARY KEY,
+            setting_value TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Existing pilot behavior is kept. Other existing Pages must be explicitly enabled.
+    if preserve_auto_page_id:
+        conn.execute("UPDATE page_rules SET is_enabled = 0 WHERE page_id <> ?", (preserve_auto_page_id,))
+    else:
+        conn.execute("UPDATE page_rules SET is_enabled = 0")
 
 
 def _apply_migration_v2(conn: sqlite3.Connection):
@@ -119,7 +221,7 @@ def _apply_migration_v1(conn: sqlite3.Connection):
                 delay_minutes INTEGER DEFAULT 10,
                 templates TEXT NOT NULL DEFAULT '["Cảm ơn bạn đã quan tâm! Vui lòng inbox để được hỗ trợ nhanh nhất."]',
                 max_comments_per_day INTEGER DEFAULT 20,
-                is_enabled INTEGER DEFAULT 1,
+                is_enabled INTEGER DEFAULT 0,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)

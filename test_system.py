@@ -17,15 +17,27 @@ import sheets_sync
 import app as fastapi_app
 
 
-@pytest.fixture(autouse=True)
-def setup_test_db(tmp_path):
-    # Isolated test database for every test
-    test_db_path = tmp_path / "test_commenter.db"
-    db.DB_PATH = test_db_path
-    db.init_db()
-    scheduler.SCHEDULER_METRICS["paused_all"] = False
-    yield
-    scheduler.SCHEDULER_METRICS["paused_all"] = False
+@pytest.fixture
+def worker(monkeypatch):
+    monkeypatch.setattr(scheduler, "comment_sheet_url", lambda: "mock-sheet")
+    monkeypatch.setattr(scheduler, "refresh_comment_sheet", lambda **kw: {"success": True})
+    monkeypatch.setattr(scheduler, "_comment_sheet_result", {"success": True})
+    monkeypatch.setattr(meta_client, "verify_post_belongs_to_page", lambda post, *args: {"clean_post_id": post})
+
+    def prepare(page_id):
+        page = db.get_page(page_id)
+        db.update_page_connection_check(page_id, datetime.now(timezone.utc).isoformat(), token_status="OK")
+        db.update_page_rule(page_id, page["delay_minutes"], json.loads(page["templates"]), page["max_comments_per_day"], True)
+        with db.get_connection() as conn:
+            conn.execute("UPDATE page_rules SET source_synced_at=? WHERE page_id=?", (datetime.now(timezone.utc).isoformat(), page_id))
+    return prepare
+
+
+@pytest.fixture
+def client():
+    client = TestClient(fastapi_app.app, base_url="http://localhost", headers={"X-Dashboard-Key": config.DASHBOARD_ADMIN_KEY})
+    yield client
+    client.close()
 
 
 def test_spintax_parsing():
@@ -87,9 +99,10 @@ def test_deduplication_auto_vs_manual():
     assert created_manual2 is False
 
 
-def test_task_execution_lifecycle():
+def test_task_execution_lifecycle(worker):
     acc_id = db.upsert_account("Nick 2")
     db.upsert_page("page_888", "Shop Quần Áo", "token_888", acc_id)
+    worker("page_888")
 
     past_time = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
     db.create_task("page_888", "post_2002", "Test content", past_time)
@@ -106,6 +119,7 @@ def test_task_execution_lifecycle():
     page = db.get_page("page_888")
     assert page["comments_today_count"] == 1
     assert page["api_usage_percent"] == 12.5
+
 
 
 def test_task_cancellation():
@@ -240,9 +254,10 @@ def test_startup_vs_runtime_stale_task_recovery():
     assert after_startup["post_fresh"]["status"] == "NEED_CHECK"
 
 
-def test_min_gap_and_daily_limit_same_batch():
+def test_min_gap_and_daily_limit_same_batch(worker):
     acc_id = db.upsert_account("Nick Gap")
     db.upsert_page("page_gap", "Page Gap", "token_gap", acc_id)
+    worker("page_gap")
     db.update_page_rule("page_gap", delay_minutes=5, templates=["Hi"], max_comments_per_day=2, is_enabled=True)
 
     past_iso = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
@@ -261,9 +276,11 @@ def test_min_gap_and_daily_limit_same_batch():
     assert tasks["post_g2"]["status"] == "PENDING"
 
 
-def test_debug_token_failure_does_not_disable_pages():
+
+def test_debug_token_failure_does_not_disable_pages(worker):
     acc_id = db.upsert_account("Nick Health")
     db.upsert_page("page_h1", "Page Health", "token_h1", acc_id)
+    worker("page_h1")
     db.create_task("page_h1", "post_h1", "Hello", datetime.now(timezone.utc).isoformat())
 
     # 1. When debug_token fails to check (e.g. missing app credentials or network error -> checked=False)
@@ -281,82 +298,42 @@ def test_debug_token_failure_does_not_disable_pages():
         scheduler.run_maintenance_cycle()
 
     p_after = db.get_page("page_h1")
-    assert p_after["is_active"] == 0
+    assert not scheduler.graph_ready(db.get_page_with_decrypted_token("page_h1"))
     assert p_after["token_status"] == "EXPIRED"
     # Pending task for that page should now be PAUSED
     t_after = db.get_all_tasks(page_id="page_h1")[0]
     assert t_after["status"] == "PAUSED"
 
 
-def test_retry_and_resolve_task_status_guards():
-    acc_id = db.upsert_account("Nick Guard")
-    db.upsert_page("page_grd", "Page Guard", "token_grd", acc_id)
-    now_iso = datetime.now(timezone.utc).isoformat()
-    db.create_task("page_grd", "post_ok", "Already posted", now_iso)
-    task_id = db.get_all_tasks(page_id="page_grd")[0]["id"]
 
-    # Mark task as SUCCESS
-    db.update_task_result(task_id, "SUCCESS", comment_id="fb_c_999")
-
-    # Attempting to retry a SUCCESS task MUST fail (return False and HTTP 400)
-    assert db.retry_task(task_id) is False
-    with TestClient(fastapi_app.app) as client:
-        resp = client.post(f"/api/tasks/{task_id}/retry")
-        assert resp.status_code == 400
-        assert "Đã đăng" in resp.json()["detail"]
+def test_retry_and_resolve_task_status_guards(client):
+    account = db.upsert_account("Guard")
+    db.upsert_page("page_guard", "Guard", "mock", account)
+    db.create_task("page_guard", "post", "Already posted", datetime.now(timezone.utc).isoformat())
+    task_id = db.get_all_tasks()[0]["id"]
+    db.update_task_result(task_id, "SUCCESS", comment_id="mock")
+    assert not db.retry_task(task_id)
+    response = client.post(f"/api/tasks/{task_id}/retry")
+    assert response.status_code == 409
+    assert db.get_all_tasks()[0]["status"] == "SUCCESS"
 
 
-def test_reactivate_page_endpoint_hybrid_and_graph_guard():
-    acc_id = db.upsert_account("Nick Reactivate", "u_reactivate", "user_tok")
-    db.upsert_page("page_rx_hybrid", "Page Reactivate Hybrid", "page_tok_hybrid", acc_id, token_status="OK")
-    linked = db.upsert_antidetect_page(
-        fb_page_id="fb_rx_hybrid",
-        page_name="Page Reactivate Hybrid",
-        page_url="https://www.facebook.com/fb_rx_hybrid",
-        antidetect_profile_id="prof-rx",
-        antidetect_profile_name="Profile Reactivate",
-        account_id=acc_id,
-    )
-    assert linked["action"] == "linked_hybrid"
-    db.update_page_status("page_rx_hybrid", False, "EXPIRED", "Token Graph hết hạn")
-    assert db.get_page("page_rx_hybrid")["is_active"] == 0
-
-    db.upsert_page("page_rx_graph", "Page Reactivate Graph", "page_tok_graph", acc_id, token_status="EXPIRED")
-    assert db.get_page("page_rx_graph")["is_active"] == 0
-
-    db.upsert_page("page_rx_manual", "Page Reactivate Manual", "page_tok_manual", acc_id)
-    db.update_page_status("page_rx_manual", False, "OK", "Tạm khóa thủ công")
-
-    with TestClient(fastapi_app.app) as client:
-        # HYBRID + token chết: kích hoạt lại và chuyển hẳn sang CDP
-        resp = client.post("/api/pages/page_rx_hybrid/reactivate")
-        assert resp.status_code == 200
-        assert resp.json()["token_status"] == "ANTIDETECT_READY"
-        p = db.get_page("page_rx_hybrid")
-        assert p["is_active"] == 1
-        assert p["token_status"] == "ANTIDETECT_READY"
-
-        # Graph-only + token chết: chặn, giữ nguyên khóa
-        resp = client.post("/api/pages/page_rx_graph/reactivate")
-        assert resp.status_code == 400
-        assert "Profile Antidetect" in resp.json()["detail"]
-        assert db.get_page("page_rx_graph")["is_active"] == 0
-
-        # Page bị khóa thủ công dù token OK: kích hoạt lại, giữ nguyên token_status
-        resp = client.post("/api/pages/page_rx_manual/reactivate")
-        assert resp.status_code == 200
-        p = db.get_page("page_rx_manual")
-        assert p["is_active"] == 1
-        assert p["token_status"] == "OK"
-
-        # Gọi lại lần hai vẫn an toàn (idempotent)
-        resp = client.post("/api/pages/page_rx_manual/reactivate")
-        assert resp.status_code == 200
-        assert resp.json()["is_active"] is True
-
-        # Page không tồn tại
-        resp = client.post("/api/pages/khong_ton_tai/reactivate")
-        assert resp.status_code == 404
+def test_reactivate_page_endpoint_requires_graph_verification(client, monkeypatch):
+    account = db.upsert_account("Reactivate")
+    for pid in ("hybrid", "graph", "manual"):
+        db.upsert_page(pid, pid, "mock-" + pid, account)
+        db.update_page_status(pid, False, "EXPIRED")
+    assert db.upsert_antidetect_page("hybrid", "hybrid", "https://facebook.com/hybrid", "profile", "Profile", account)["action"] == "linked_hybrid"
+    monkeypatch.setattr(meta_client, "verify_page_connection", lambda *args: {
+        "success": False, "failure_status": "EXPIRED", "error": "Expired", "token_info": {}})
+    for pid in ("hybrid", "graph"):
+        assert client.post(f"/api/pages/{pid}/reactivate").status_code == 409
+        assert not db.get_page(pid)["is_active"]
+    monkeypatch.setattr(meta_client, "verify_page_connection", lambda *args: {"success": True, "token_info": {"status": "OK"}})
+    for _ in range(2):
+        assert client.post("/api/pages/manual/reactivate").status_code == 200
+        assert db.get_page("manual")["is_active"]
+    assert client.post("/api/pages/missing/reactivate").status_code == 404
 
 
 def test_manual_resolve_updates_page_counters():
@@ -409,124 +386,45 @@ def test_scheduler_post_belongs_verification_and_pfbid_url():
         assert "không thuộc về Page này" in str(exc_info.value)
 
 
-def test_timeout_self_reconciliation():
-    # When post_comment times out, it checks if the comment actually landed on Facebook
-    with patch("httpx.Client.post", side_effect=httpx.ReadTimeout("Timed out")):
-        with patch("meta_client.check_comment_exists", return_value="reconciled_comment_123"):
-            res = meta_client.post_comment("111_222", "111", "token", "Nội dung test")
-            assert res["success"] is True
-            assert res["comment_id"] == "reconciled_comment_123"
-
-        with patch("meta_client.check_comment_exists", return_value=None):
-            res2 = meta_client.post_comment("111_222", "111", "token", "Nội dung test")
-            assert res2["success"] is False
-            assert res2["category"] == "NEED_CHECK"
+def test_timeout_requires_operator_reconciliation():
+    with patch("httpx.Client.post", side_effect=httpx.ReadTimeout("Timed out")), patch("meta_client.check_comment_exists") as check:
+        result = meta_client.post_comment("111_222", "111", "mock", "Content")
+    assert not result["success"] and result["category"] == "NEED_CHECK"
+    check.assert_not_called()
 
 
-def test_antidetect_hybrid_linking_and_cdp_execution():
-    import antidetect_client
-    acc_id = db.upsert_account("Nick Graph API", "u_graph_1", "tok_u")
-    # 1. Existing Graph API page
-    db.upsert_page("993921657144854", "Chị Đẹp Thích Vẽ", "valid_page_token", acc_id, token_status="OK")
-
-    # 2. Syncing matching page from Antidetect upgrades it to HYBRID without losing its token
-    res_hybrid = db.upsert_antidetect_page(
-        fb_page_id="61575475678031",
-        page_name="Chị Đẹp Thích Vẽ",
-        page_url="https://www.facebook.com/61575475678031",
-        antidetect_profile_id="prof-uuid-2",
-        antidetect_profile_name="Profile 2 - Bóng Ma Đề Cương",
-        account_id=acc_id,
-    )
-    assert res_hybrid["action"] == "linked_hybrid"
-    assert res_hybrid["page_id"] == "993921657144854"
-
-    p_hybrid = db.get_page_with_decrypted_token("993921657144854")
-    assert p_hybrid["connection_mode"] == "HYBRID"
-    assert p_hybrid["page_access_token"] == "valid_page_token"
-    assert p_hybrid["fb_profile_id"] == "61575475678031"
-
-    # 3. Syncing a new Antidetect-only page (no Graph API token)
-    res_ad = db.upsert_antidetect_page(
-        fb_page_id="61594671061927",
-        page_name="Tiện Ích Ngôi Nhà",
-        page_url="https://www.facebook.com/61594671061927",
-        antidetect_profile_id="prof-uuid-7",
-        antidetect_profile_name="Profile 7 - Meo Meo",
-        account_id=acc_id,
-    )
-    assert res_ad["action"] == "inserted"
-    p_ad = db.get_page("61594671061927")
-    assert p_ad["connection_mode"] == "ANTIDETECT"
-    assert p_ad["token_status"] == "ANTIDETECT_READY"
-
-    # 4. Manual task creation on Antidetect-only page works without Graph API token
-    with TestClient(fastapi_app.app) as client:
-        resp = client.post("/api/tasks/manual", json={
-            "page_id": "61594671061927",
-            "post_id_or_url": "https://www.facebook.com/61594671061927/posts/pfbid02xyzAntidetectPost",
-            "content": "{Chào|Xin chào} bạn nhé!",
-            "post_now": True,
-            "batch_id": "batch_ad_1"
-        })
-        assert resp.status_code == 200
-        assert resp.json()["success"] is True
-
-    # 5. Executing due task for Antidetect-only page routes to antidetect_client.post_comment_cdp
-    with patch("antidetect_client.post_comment_cdp") as mock_cdp:
-        mock_cdp.return_value = {
-            "success": True,
-            "comment_id": "cdp_61594671061927_999",
-            "mode": "ANTIDETECT_CDP",
-            "usage_pct": None,
-        }
-        scheduler.execute_due_tasks()
-        assert mock_cdp.call_count == 1
-        tasks = db.get_all_tasks(page_id="61594671061927")
-        assert tasks[0]["status"] == "SUCCESS"
-        assert tasks[0]["comment_id"] == "cdp_61594671061927_999"
-
-
-def test_hybrid_scanner_falls_back_to_cdp_after_token_expiry(monkeypatch):
-    acc_id = db.upsert_account("Nick Hybrid Scan", "u_hscan", "user_tok")
-    db.upsert_page("page_hscan", "Page Hybrid Scan", "page_tok_hscan", acc_id, token_status="OK")
-    linked = db.upsert_antidetect_page(
-        fb_page_id="fb_hscan",
-        page_name="Page Hybrid Scan",
-        page_url="https://www.facebook.com/fb_hscan",
-        antidetect_profile_id="prof-hscan",
-        antidetect_profile_name="Profile Hybrid Scan",
-        account_id=acc_id,
-    )
+def test_antidetect_links_only_verified_ids_and_cannot_bypass_graph(client):
+    account = db.upsert_account("Graph")
+    db.upsert_page("993921657144854", "Same Name", "mock", account)
+    separate = db.upsert_antidetect_page("61575475678031", "Same Name", "https://facebook.com/61575475678031", "profile", "Profile", account)
+    assert separate["action"] == "inserted"
+    linked = db.upsert_antidetect_page("993921657144854", "Same Name", "https://facebook.com/993921657144854", "profile", "Profile", account)
     assert linked["action"] == "linked_hybrid"
-    monkeypatch.setattr(config, "ANTIDETECT_AUTO_SCAN_POSTS", True)
-    fresh_time = datetime.now(timezone.utc).isoformat()
+    assert db.get_page_with_decrypted_token("993921657144854")["page_access_token"] == "mock"
+    response = client.post("/api/tasks/manual", json={"page_id":"61575475678031", "post_id_or_url":"123", "content":"Content"})
+    assert response.status_code == 409
+    with patch("antidetect_client.post_comment_cdp") as cdp:
+        scheduler.execute_due_tasks()
+        cdp.assert_not_called()
 
-    with patch("antidetect_client._read_runtime_readonly", return_value={}), \
-         patch("antidetect_client._probe_cdp_port", return_value=False), \
-         patch(
-             "meta_client.get_recent_posts",
-             side_effect=meta_client.MetaAPIError(190, 463, "expired", "TOKEN_EXPIRED"),
-         ) as mock_graph, \
-         patch("antidetect_client.get_recent_posts_cdp", return_value=[{
-             "id": "post_hscan_1",
-             "created_time": fresh_time,
-             "permalink_url": "https://www.facebook.com/fb_hscan/posts/1",
-         }]) as mock_cdp:
+
+def test_hybrid_scanner_pauses_expired_graph_without_cdp_fallback(worker):
+    account = db.upsert_account("Hybrid Scan")
+    db.upsert_page("page_hscan", "Hybrid", "mock", account)
+    worker("page_hscan")
+    assert db.upsert_antidetect_page("page_hscan", "Hybrid", "https://facebook.com/page_hscan", "profile", "Profile", account)["action"] == "linked_hybrid"
+    with patch("meta_client.get_recent_posts", side_effect=meta_client.MetaAPIError(190,463,"Expired","TOKEN_EXPIRED")) as graph, patch("antidetect_client.get_recent_posts_cdp") as cdp:
         scheduler.detect_new_posts_and_schedule()
-
-    mock_graph.assert_called_once()
-    mock_cdp.assert_called_once()
-    page = db.get_page("page_hscan")
-    assert page["is_active"] == 1
-    assert page["token_status"] == "ANTIDETECT_READY"
-    tasks = db.get_all_tasks(page_id="page_hscan")
-    assert any(t["post_id"] == "post_hscan_1" for t in tasks)
+    graph.assert_called_once()
+    cdp.assert_not_called()
+    assert db.get_page("page_hscan")["token_status"] == "EXPIRED"
+    assert db.get_all_tasks() == []
 
 
-def test_single_flight_executor_skips_overlapping_run():
+def test_single_flight_executor_skips_overlapping_run(worker):
     acc_id = db.upsert_account("Nick Single Flight")
     db.upsert_page("page_sf", "Page Single Flight", "token_sf", acc_id)
+    worker("page_sf")
     past_iso = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
     db.create_task("page_sf", "post_sf", "Msg", past_iso)
 
@@ -544,6 +442,7 @@ def test_single_flight_executor_skips_overlapping_run():
         mock_post.return_value = {"success": True, "comment_id": "c_sf"}
         scheduler.execute_due_tasks()
         mock_post.assert_called_once()
+
 
 
 def test_google_sheet_unified_single_tab_mode():
@@ -583,41 +482,29 @@ def test_google_sheet_unified_single_tab_mode():
     assert json.loads(p["templates"]) == ["{Chào|Xin chào} bạn, mẫu 1!", "Mẫu 2 {nhé|nha}!"]
 
 
-def test_maintenance_skips_auto_sheet_sync_while_paused(monkeypatch):
-    monkeypatch.setitem(
-        scheduler.SCHEDULER_METRICS["sheet_sync"],
-        "sheet_url",
-        "https://docs.google.com/spreadsheets/d/mock123/edit",
-    )
-    with patch("sheets_sync.sync_from_google_sheet") as mock_sync:
-        monkeypatch.setitem(scheduler.SCHEDULER_METRICS, "paused_all", True)
-        scheduler.run_maintenance_cycle()
-        mock_sync.assert_not_called()
-
-        monkeypatch.setitem(scheduler.SCHEDULER_METRICS, "paused_all", False)
-        mock_sync.return_value = {"success": True}
-        scheduler.run_maintenance_cycle()
-        mock_sync.assert_called_once()
-
-
-def test_manual_sync_endpoint_schedules_background_cycle(monkeypatch):
-    monkeypatch.setitem(scheduler.SCHEDULER_METRICS, "paused_all", False)
-    with TestClient(fastapi_app.app) as client:
-        with patch("scheduler.run_manual_sync_cycle") as mock_cycle:
-            resp = client.post("/api/sync")
-            assert resp.status_code == 200
-            assert "bắt đầu" in resp.json()["message"]
-            mock_cycle.assert_called_once()
-
-
-def test_manual_sync_blocked_while_paused(monkeypatch):
+def test_maintenance_refreshes_source_while_paused(monkeypatch):
+    monkeypatch.setattr(scheduler, "comment_sheet_url", lambda: "mock-sheet")
     monkeypatch.setitem(scheduler.SCHEDULER_METRICS, "paused_all", True)
-    with TestClient(fastapi_app.app) as client:
-        with patch("scheduler.run_manual_sync_cycle") as mock_cycle:
-            resp = client.post("/api/sync")
-            assert resp.status_code == 409
-            assert "tạm dừng" in resp.json()["detail"].lower()
-            mock_cycle.assert_not_called()
+    with patch("scheduler.refresh_comment_sheet", return_value={"success": True}) as refresh, patch("meta_client.post_comment") as send:
+        scheduler.run_maintenance_cycle()
+    refresh.assert_called_once()
+    send.assert_not_called()
+
+
+def test_manual_sync_endpoint_schedules_background_cycle(client, monkeypatch):
+    monkeypatch.setitem(scheduler.SCHEDULER_METRICS, "paused_all", False)
+    with patch("scheduler.run_manual_sync_cycle") as cycle:
+        response = client.post("/api/sync")
+    assert response.status_code == 200
+    cycle.assert_called_once()
+
+
+def test_manual_sync_blocked_while_paused(client, monkeypatch):
+    monkeypatch.setitem(scheduler.SCHEDULER_METRICS, "paused_all", True)
+    with patch("scheduler.run_manual_sync_cycle") as cycle:
+        response = client.post("/api/sync")
+    assert response.status_code == 409
+    cycle.assert_not_called()
 
 
 def test_manual_sync_cycle_honors_pause(monkeypatch):
@@ -635,10 +522,12 @@ def test_manual_sync_cycle_honors_pause(monkeypatch):
     assert db.get_all_tasks(page_id="page_mp")[0]["status"] == "PENDING"
 
 
-def test_pause_stops_batch_before_next_task(monkeypatch):
+def test_pause_stops_batch_before_next_task(monkeypatch, worker):
     acc_id = db.upsert_account("Nick Pause Batch")
     db.upsert_page("page_pa", "Page Pause A", "token_pa", acc_id)
+    worker("page_pa")
     db.upsert_page("page_pb", "Page Pause B", "token_pb", acc_id)
+    worker("page_pb")
     past_iso = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
     db.create_task("page_pa", "post_pa", "Msg A", past_iso)
     db.create_task("page_pb", "post_pb", "Msg B", past_iso)
@@ -658,20 +547,22 @@ def test_pause_stops_batch_before_next_task(monkeypatch):
     assert statuses == ["PENDING", "SUCCESS"]
 
 
-def test_pause_after_lock_releases_task(monkeypatch):
+
+def test_pause_after_lock_releases_task(monkeypatch, worker):
     acc_id = db.upsert_account("Nick Pause Lock")
     db.upsert_page("page_pl", "Page Pause Lock", "token_pl", acc_id)
+    worker("page_pl")
     past_iso = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
     db.create_task("page_pl", "post_pl", "Msg", past_iso)
 
-    real_lock = db.lock_task_for_sending
+    real_lock = db.claim_due_task
 
-    def lock_then_pause(task_id):
-        locked = real_lock(task_id)
+    def lock_then_pause(task_id, now_iso):
+        locked = real_lock(task_id, now_iso)
         monkeypatch.setitem(scheduler.SCHEDULER_METRICS, "paused_all", True)
         return locked
 
-    monkeypatch.setattr(db, "lock_task_for_sending", lock_then_pause)
+    monkeypatch.setattr(db, "claim_due_task", lock_then_pause)
     with patch("meta_client.post_comment") as mock_post:
         scheduler.execute_due_tasks()
         mock_post.assert_not_called()
@@ -679,6 +570,7 @@ def test_pause_after_lock_releases_task(monkeypatch):
     task = db.get_all_tasks(page_id="page_pl")[0]
     assert task["status"] == "PENDING"
     assert task["locked_at"] is None
+
 
 
 def test_manual_sync_skips_execution_if_paused_during_scan():
@@ -691,36 +583,22 @@ def test_manual_sync_skips_execution_if_paused_during_scan():
             mock_exec.assert_not_called()
 
 
-def test_maintenance_keeps_hybrid_page_active_on_cdp(monkeypatch):
-    monkeypatch.setitem(scheduler.SCHEDULER_METRICS["sheet_sync"], "sheet_url", "")
-    acc_id = db.upsert_account("Nick Maint Hybrid", "u_mh", "tok")
-    db.upsert_page("page_mh", "Page Maint Hybrid", "token_mh", acc_id, token_status="OK")
-    db.upsert_antidetect_page(
-        fb_page_id="fb_mh",
-        page_name="Page Maint Hybrid",
-        page_url="https://www.facebook.com/fb_mh",
-        antidetect_profile_id="prof_mh",
-        antidetect_profile_name="Profile Maint Hybrid",
-        account_id=acc_id,
-    )
-    now_iso = datetime.now(timezone.utc).isoformat()
-    db.create_task("page_mh", "post_mh", "Msg", now_iso)
-
-    with patch(
-        "meta_client.debug_token",
-        return_value={"checked": True, "is_valid": False, "status": "EXPIRED", "missing_scopes": []},
-    ):
+def test_maintenance_pauses_pending_tasks_after_confirmed_expiry(worker):
+    account = db.upsert_account("Maintenance Hybrid")
+    db.upsert_page("page_mh", "Hybrid", "mock", account)
+    worker("page_mh")
+    db.upsert_antidetect_page("page_mh", "Hybrid", "https://facebook.com/page_mh", "profile", "Profile", account)
+    db.create_task("page_mh", "post", "Content", datetime.now(timezone.utc).isoformat())
+    with patch("meta_client.debug_token", return_value={"checked":True,"is_valid":False,"missing_scopes":[]}):
         scheduler.run_maintenance_cycle()
-
-    page = db.get_page("page_mh")
-    assert page["is_active"] == 1
-    assert page["token_status"] == "ANTIDETECT_READY"
-    assert db.get_all_tasks(page_id="page_mh")[0]["status"] == "PENDING"
+    assert db.get_page("page_mh")["token_status"] == "EXPIRED"
+    assert db.get_all_tasks()[0]["status"] == "PAUSED"
 
 
-def test_disabling_auto_rule_cancels_pending_auto_only():
+def test_disabling_auto_rule_cancels_pending_auto_only(worker):
     acc_id = db.upsert_account("Nick Kill Switch")
     db.upsert_page("page_ks", "Page Kill Switch", "token_ks", acc_id)
+    worker("page_ks")
     past_iso = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
     db.create_task("page_ks", "post_auto_ks", "Auto message", past_iso, source="AUTO")
     db.create_task("page_ks", "post_manual_ks", "Manual message", past_iso, source="MANUAL", batch_id="b_ks")
@@ -739,6 +617,7 @@ def test_disabling_auto_rule_cancels_pending_auto_only():
     tasks = {t["source"]: t for t in db.get_all_tasks(page_id="page_ks")}
     assert tasks["AUTO"]["status"] == "CANCELLED"
     assert tasks["MANUAL"]["status"] == "SUCCESS"
+
 
 
 def _mock_cdp_environment(monkeypatch):
@@ -941,28 +820,22 @@ def test_cdp_comment_blocks_ambiguous_actor_menu(monkeypatch):
     assert typed == []
 
 
-def test_google_sheet_unified_disables_pages_missing_from_sheet():
+def test_comment_sheet_blocks_missing_pages_without_changing_opt_in():
     acc_id = db.upsert_account("Nick Unified Drop", "u_drop", "tok")
     db.upsert_page("100000000000001", "Page Keep Unified", "tok_keep", acc_id)
     db.upsert_page("100000000000002", "Page Drop Unified", "tok_drop", acc_id)
+    db.set_page_automation("100000000000002", True)
 
-    unified_rows = [{
-        "page id": "'100000000000001",
-        "tên fanpage": "Page Keep Unified",
-        "sau bao lâu comment (phút)": "10",
-        "mỗi ngày mấy comment": "20",
-        "mẫu bình luận": "Mẫu giữ lại",
-        "bật tự động": "TRUE",
-    }]
-
-    with patch("sheets_sync.fetch_sheet_csv", return_value=(unified_rows, None)):
-        res = sheets_sync.sync_from_google_sheet("https://docs.google.com/spreadsheets/d/mock123/edit")
+    res = sheets_sync.sync_comment_sheet_rows([
+        ["ID trang", "Tên Fanpage", "Comment", "Số phút chờ sau khi đăng"],
+        ["100000000000001", "Page Keep Unified", "Mẫu giữ lại", "10"],
+    ])
 
     assert res["success"] is True
     assert res["pages_synced"] == 1
-    assert res["pages_disabled"] == 1
-    assert db.get_page("100000000000001")["rule_enabled"] == 1
-    assert db.get_page("100000000000002")["rule_enabled"] == 0
+    assert db.get_page("100000000000001")["rule_enabled"] == 0
+    assert db.get_page("100000000000002")["rule_enabled"] == 1
+    assert db.get_page("100000000000002")["source_error"]
 
 
 def test_google_sheet_rejects_ambiguous_page_name():
@@ -1032,6 +905,7 @@ def test_sheet_sync_preserves_disabled_rule_when_enabled_cell_blank():
 def test_sheet_sync_explicit_false_disables_rule():
     acc_id = db.upsert_account("Nick Explicit False", "u_ef", "tok")
     db.upsert_page("100000000000007", "Page Tắt Chủ Động", "tok_ef", acc_id)
+    db.set_page_automation("100000000000007", True)
     assert db.get_page("100000000000007")["rule_enabled"] == 1
 
     unified_rows = [{

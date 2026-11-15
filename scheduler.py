@@ -1,17 +1,17 @@
 import json
-import random
 import asyncio
 import threading
+import time
 from datetime import datetime, timezone, timedelta
 from dateutil import parser as date_parser
 from typing import Dict, Any, Optional
 
 import config
+import comment_dispatch
+import comment_content
 import database as db
 import meta_client
-import antidetect_client
 import sheets_sync
-import spintax
 
 
 # In-memory status for UI monitoring
@@ -19,8 +19,11 @@ SCHEDULER_METRICS: Dict[str, Any] = {
     "post_scan": {"last_run": None, "last_error": None, "status": "RUNNING"},
     "task_exec": {"last_run": None, "last_error": None, "status": "RUNNING"},
     "maintenance": {"last_run": None, "last_error": None, "status": "RUNNING"},
-    "sheet_sync": {"last_run": None, "last_error": None, "sheet_url": config.DEFAULT_SHEET_URL},
-    "paused_all": config.PAUSED_BY_DEFAULT
+    "sheet_sync": {"last_run": None, "last_error": None, "sheet_url": config.PILOT_SHEET_URL or config.DEFAULT_SHEET_URL,
+                   "source": "LEGACY_PILOT" if config.PILOT_SHEET_URL else "DASHBOARD"},
+    "paused_all": True,
+    "scan_errors": {},
+    "send_errors": {},
 
 
 }
@@ -28,6 +31,90 @@ SCHEDULER_METRICS: Dict[str, Any] = {
 
 _SCAN_LOCK = threading.Lock()
 _EXEC_LOCK = threading.Lock()
+_RUN_STATE_LOCK = threading.Lock()
+_COMMENT_SHEET_LOCK = threading.Lock()
+_last_comment_sheet_read = float("-inf")
+_comment_sheet_result = {"success": False, "error": "Chưa đọc tab bình luận."}
+
+
+def set_system_paused(paused: bool) -> None:
+    with _RUN_STATE_LOCK:
+        if paused:
+            SCHEDULER_METRICS["paused_all"] = True
+        db.set_setting("automation_run_state", "paused" if paused else "running")
+        SCHEDULER_METRICS["paused_all"] = paused
+
+
+def comment_sheet_url() -> str:
+    """A dashboard-selected tab takes precedence; the legacy pilot URL is a safe fallback."""
+    try:
+        saved = db.get_setting("comment_sheet_url", "").strip()
+    except Exception:
+        saved = ""
+    return saved or config.MULTI_PAGE_SHEET_URL or config.PILOT_SHEET_URL or config.DEFAULT_SHEET_URL
+
+
+def refresh_comment_sheet(force=False, candidate_url=None):
+    global _last_comment_sheet_read, _comment_sheet_result
+    with _COMMENT_SHEET_LOCK:
+        url = candidate_url if candidate_url is not None else comment_sheet_url()
+        if not url:
+            return {"success": False, "error": "Chưa cấu hình tab bình luận multi-Page."}
+        status = SCHEDULER_METRICS["sheet_sync"]
+        if force or url != status["sheet_url"] or time.monotonic() - _last_comment_sheet_read >= 30:
+            try:
+                result = sheets_sync.sync_comment_sheet(
+                    url, legacy_page_id=config.PILOT_PAGE_ID, save_url=candidate_url is not None,
+                )
+            except Exception:
+                result = {"success": False, "error": "Không thể cập nhật mẫu bình luận trong DB."}
+            if candidate_url is not None and not result["success"] and url != comment_sheet_url():
+                return result
+            _comment_sheet_result = result
+            _last_comment_sheet_read = time.monotonic()
+            status["sheet_url"] = url
+            status["last_run"] = datetime.now(timezone.utc).isoformat()
+            status["last_error"] = _comment_sheet_result.get("error") or (
+                f"{len(_comment_sheet_result.get('errors') or [])} cảnh báo cấu hình theo Page."
+                if _comment_sheet_result.get("errors") else None
+            )
+            if _comment_sheet_result.get("success"):
+                status["templates_count"] = _comment_sheet_result.get("templates_count", 0)
+                status["pages_synced"] = _comment_sheet_result.get("pages_synced", 0)
+                status["page_errors"] = _comment_sheet_result.get("errors", [])
+                status["sheet_mode"] = _comment_sheet_result.get("sheet_mode")
+        return _comment_sheet_result
+
+
+_SCAN_BACKOFF_UNTIL = {}
+
+
+def graph_ready(page: Dict[str, Any]) -> bool:
+    return comment_dispatch.graph_ready(page)
+
+
+def build_post_schedule(page: Dict[str, Any], post_id: str, post_url: Optional[str],
+                        created_at: datetime, now: datetime) -> Dict[str, Any]:
+    delay_minutes = page["delay_minutes"]
+    first_due = max(now, created_at + timedelta(minutes=delay_minutes))
+    sequence = json.loads(page["comment_sequence"] or "[]")
+    steps = []
+    previous_delay = delay_minutes
+    for number, step in enumerate(sequence, start=1):
+        delay = step["delay_minutes"]
+        steps.append({
+            "number": number, "gap": delay - previous_delay,
+            **comment_content.materialize(page, post_id, template=step["template"], step=number),
+            "scheduled_at": (first_due + timedelta(minutes=delay - delay_minutes)).isoformat(),
+        })
+        previous_delay = delay
+    if not sequence:
+        steps.append({
+            "number": None, "gap": None,
+            **comment_content.materialize(page, post_id),
+            "scheduled_at": first_due.isoformat(),
+        })
+    return {"id": post_id, "url": post_url, "created_time": created_at.isoformat(), "steps": steps}
 
 
 def detect_new_posts_and_schedule():
@@ -47,85 +134,56 @@ def _detect_new_posts_and_schedule():
     """
     if SCHEDULER_METRICS["paused_all"]:
         return
+    if not refresh_comment_sheet()["success"]:
+        return
     pages = db.get_all_pages()
     now_utc = datetime.now(timezone.utc)
 
     for p in pages:
         if SCHEDULER_METRICS["paused_all"]:
             break
-        if not p.get("is_active") or not p.get("rule_enabled"):
-            continue
-
-        # Skip scanning if page API usage is critically high (>= 90%)
-        if (p.get("api_usage_percent") or 0.0) >= 90.0:
-            continue
-
         page_id = p["page_id"]
-        page_full = db.get_page_with_decrypted_token(page_id)
-        if not page_full:
+        if not p.get("is_active") or not p.get("rule_enabled") or p.get("source_error"):
             continue
-        token = page_full.get("page_access_token", "")
-        profile_id = p.get("antidetect_profile_id") or page_full.get("antidetect_profile_id")
-        if not token and not profile_id:
+        if _SCAN_BACKOFF_UNTIL.get(page_id, now_utc) > now_utc:
             continue
-
-        delay_minutes = p.get("delay_minutes", 10)
-        since_ts = p.get("last_seen_post_time")
-
         try:
-            templates = json.loads(p.get("templates", "[]"))
+            page_full = db.get_page_for_dispatch(page_id)
+            if not page_full or not graph_ready(page_full):
+                continue
+            templates = json.loads(p.get("templates") or "[]")
+            if not templates:
+                continue
+            since = p.get("last_seen_post_time") or now_utc.isoformat()
+            checkpoint = date_parser.isoparse(since)
+            if checkpoint.tzinfo is None:
+                checkpoint = checkpoint.replace(tzinfo=timezone.utc)
+            if not p.get("last_seen_post_time"):
+                with db.get_connection() as conn:
+                    conn.execute("UPDATE pages SET last_seen_post_time = ? WHERE page_id = ? AND last_seen_post_time IS NULL",
+                                 (since, page_id))
+                continue
+            posts = meta_client.get_recent_posts(page_id, page_full["page_access_token"], since_timestamp=since)
+        except meta_client.MetaAPIError as exc:
+            SCHEDULER_METRICS["scan_errors"][page_id] = exc.message
+            if exc.category == "RATE_LIMIT":
+                _SCAN_BACKOFF_UNTIL[page_id] = now_utc + timedelta(minutes=15)
+            elif exc.category in ("TOKEN_EXPIRED", "MISSING_PERMISSIONS"):
+                status = "EXPIRED" if exc.category == "TOKEN_EXPIRED" else exc.category
+                db.update_page_status(page_id, bool(p["is_active"]), status, exc.message)
+            continue
         except Exception:
-            templates = []
-        if not templates:
+            SCHEDULER_METRICS["scan_errors"][page_id] = "Không thể đọc bài hoặc cấu hình Page."
             continue
 
-        posts = []
-        token_status = p.get("token_status") or "OK"
-        use_graph = bool(token) and token_status not in ("EXPIRED", "MISSING_PERMISSIONS", "ANTIDETECT_READY")
-
-        if use_graph:
-            try:
-                posts = meta_client.get_recent_posts(page_id, token, since_timestamp=since_ts, limit=5)
-            except meta_client.MetaAPIError as e:
-                if e.category == "TOKEN_EXPIRED":
-                    if profile_id:
-                        # Token chết nhưng còn Profile: chuyển sang CDP và quét ngay trong vòng này
-                        db.update_page_status(page_id, is_active=True, token_status="ANTIDETECT_READY", status_note="Token API hết hạn, đã chuyển sang chế độ Antidetect CDP")
-                        use_graph = False
-                    else:
-                        db.update_page_status(page_id, is_active=False, token_status="EXPIRED", status_note=e.message)
-                        continue
-                else:
-                    continue
-            except Exception:
-                continue
-
-        if not use_graph:
-            if not profile_id:
-                continue
-            # Antidetect-only pages, or HYBRID with a dead Graph token: scan when the profile
-            # is already open or when auto-scan of closed profiles is explicitly enabled.
-            rt = antidetect_client._read_runtime_readonly().get(profile_id) or {}
-            is_open = antidetect_client._probe_cdp_port(rt.get("port"))
-            if not is_open and not config.ANTIDETECT_AUTO_SCAN_POSTS:
-                continue
-            try:
-                posts = antidetect_client.get_recent_posts_cdp(
-                    page_id=page_id,
-                    page_url=p.get("page_url"),
-                    profile_id=profile_id,
-                    since_timestamp=since_ts,
-                    limit=5,
-                )
-            except meta_client.MetaAPIError as e:
-                if e.category == "TOKEN_EXPIRED":
-                    db.update_page_status(page_id, is_active=False, token_status="EXPIRED", status_note=e.message)
-                continue
-            except Exception:
-                continue
-
+        SCHEDULER_METRICS["scan_errors"].pop(page_id, None)
+        if SCHEDULER_METRICS["paused_all"]:
+            break
         latest_post_time = None
+        new_posts = []
         for post in posts:
+            if SCHEDULER_METRICS["paused_all"]:
+                return
             post_id = post.get("id")
             created_str = post.get("created_time")
             post_url = post.get("permalink_url")
@@ -133,10 +191,15 @@ def _detect_new_posts_and_schedule():
                 continue
 
             try:
-                created_dt = date_parser.parse(created_str).astimezone(timezone.utc)
+                created_dt = date_parser.isoparse(created_str)
+                if created_dt.tzinfo is None:
+                    continue
+                created_dt = created_dt.astimezone(timezone.utc)
             except Exception:
                 continue
 
+            if created_dt <= checkpoint or created_dt > now_utc:
+                continue
             if latest_post_time is None or created_dt > latest_post_time:
                 latest_post_time = created_dt
 
@@ -145,35 +208,18 @@ def _detect_new_posts_and_schedule():
             if age_minutes > config.MAX_POST_AGE_MIN:
                 continue
 
-            # Calculate target schedule time
-            target_run_time = created_dt + timedelta(minutes=delay_minutes)
-            if target_run_time < now_utc:
-                target_run_time = now_utc
-
-            # Pick template and spin content
-            selected_template = random.choice(templates)
-            final_content = spintax.spin(selected_template)
-
-            # Insert task (dedupe_key auto:{page_id}:{post_id} guarantees no duplicates)
-            db.create_task(
-                page_id=page_id,
-                post_id=post_id,
-                comment_content=final_content,
-                scheduled_at=target_run_time.isoformat(),
-                source="AUTO",
-                post_created_time=created_dt.isoformat(),
-                post_url=post_url
-            )
-
+            try:
+                new_posts.append(build_post_schedule(p, post_id, post_url, created_dt, now_utc))
+            except ValueError as exc:
+                with db.get_connection() as conn:
+                    conn.execute("UPDATE page_rules SET source_error=? WHERE page_id=?", (str(exc), page_id))
+                SCHEDULER_METRICS["scan_errors"][page_id] = str(exc)
+                break
 
         if latest_post_time:
-            conn = db.get_connection()
-            with conn:
-                conn.execute(
-                    "UPDATE pages SET last_seen_post_time = ? WHERE page_id = ?",
-                    (latest_post_time.isoformat(), page_id)
-                )
-            conn.close()
+            if SCHEDULER_METRICS["paused_all"]:
+                return
+            db.queue_auto_scan(p, new_posts, latest_post_time.isoformat())
 
 
 def execute_due_tasks():
@@ -186,182 +232,104 @@ def execute_due_tasks():
         _EXEC_LOCK.release()
 
 
+def _due_task_candidates(include_auto):
+    seen = []
+    for _ in range(10):
+        batch = db.get_due_tasks(limit=10, include_auto=include_auto, exclude_ids=seen)
+        if not batch:
+            break
+        for task in batch:
+            seen.append(task["id"])
+            yield task
+
+
 def _execute_due_tasks():
-    """
-    Fetches tasks that are due, re-verifies live per-page rate limits & minimum gap
-    before each task so multiple due tasks for the same page never violate constraints,
-    then posts comments to Meta.
-    """
     if SCHEDULER_METRICS["paused_all"]:
         return
-    due_tasks = db.get_due_tasks(limit=10)
-    now_utc = datetime.now(timezone.utc)
-    today_str = db.local_day_key(now_utc)
-
-    for task in due_tasks:
-        # Emergency pause must stop the batch before the next task is touched.
-        if SCHEDULER_METRICS["paused_all"]:
+    sheet_ready = refresh_comment_sheet()["success"] if comment_sheet_url() else False
+    attempts = 0
+    paused = lambda: SCHEDULER_METRICS["paused_all"]
+    for task in _due_task_candidates(include_auto=bool(sheet_ready)):
+        if paused() or attempts >= 10:
             break
-        task_id = task["id"]
-        page_id = task["page_id"]
-        post_id = task["post_id"]
-        token = task["page_access_token"]
-        content = (task["comment_content"] or "").strip()
-
-        # Re-fetch live page state from DB so earlier tasks in the same batch are accounted for!
-        fresh_page = db.get_page(page_id)
-        if not fresh_page or not fresh_page.get("is_active"):
-            continue
-
-        # 1. Check Page daily limit using fresh DB count
-        max_per_day = fresh_page.get("max_comments_per_day") or config.MAX_COMMENTS_PER_PAGE_PER_DAY
-        today_comments = fresh_page.get("comments_today_count") or 0
-        if fresh_page.get("comments_today_date") == today_str and today_comments >= max_per_day:
-            tomorrow_utc = db.next_daily_reset_utc(now_utc)
-            conn = db.get_connection()
-            with conn:
-                conn.execute("UPDATE tasks SET scheduled_at = ? WHERE id = ?", (tomorrow_utc, task_id))
-            conn.close()
-            continue
-
-        # 2. Check Minimum Gap between comments on the same Page using fresh last_comment_at
-        last_comment_str = fresh_page.get("last_comment_at")
-        if last_comment_str:
-            try:
-                last_dt = date_parser.parse(last_comment_str).astimezone(timezone.utc)
-                elapsed_sec = (now_utc - last_dt).total_seconds()
-                if elapsed_sec < config.MIN_GAP_PER_PAGE_SEC:
-                    next_slot = (last_dt + timedelta(seconds=config.MIN_GAP_PER_PAGE_SEC)).isoformat()
-                    conn = db.get_connection()
-                    with conn:
-                        conn.execute("UPDATE tasks SET scheduled_at = ? WHERE id = ? AND status = 'PENDING'", (next_slot, task_id))
-                    conn.close()
+        task_id, page_id = task["id"], task["page_id"]
+        automatic = task.get("source") == "AUTO"
+        with comment_dispatch.guard(page_id, paused, automatic=automatic, require_sheet=automatic) as decision:
+            if not decision.ready:
+                db.defer_task(task_id, decision.retry_at, decision.message)
+                continue
+            token = decision.page["page_access_token"]
+            with _COMMENT_SHEET_LOCK:
+                if automatic and not _comment_sheet_result.get("success"):
                     continue
+                claimed = db.claim_due_task(task_id, datetime.now(timezone.utc).isoformat())
+            if not claimed:
+                continue
+            task = claimed
+            content = task["comment_content"]
+            due = datetime.fromisoformat(task["scheduled_at"])
+            if (datetime.now(timezone.utc) - due).total_seconds() > 7200:
+                db.update_task_result(task_id, "NEED_CHECK", error_message="Tác vụ quá hạn hơn 2 giờ. Đối chiếu bài trước khi gửi lại.")
+                continue
+            if not content.strip():
+                db.update_task_result(task_id, "FAILED", error_message="Nội dung bình luận trống.")
+                continue
+            if paused():
+                db.release_task_lock(task_id)
+                break
+            attempts += 1
+            try:
+                verified = meta_client.verify_post_belongs_to_page(task["post_id"], page_id, token)
+            except meta_client.MetaAPIError as exc:
+                result = exc.as_result()
             except Exception:
-                pass
-
-        # 3. Check if task is overdue by > 2 hours (e.g. system was off overnight)
-        try:
-            sched_dt = date_parser.parse(task["scheduled_at"]).astimezone(timezone.utc)
-            if (now_utc - sched_dt).total_seconds() > 7200:
-                db.update_task_result(
-                    task_id=task_id,
-                    status="NEED_CHECK",
-                    error_message="Tác vụ quá hạn hơn 2 giờ do hệ thống tạm dừng. Vui lòng đối chiếu bài viết trước khi bấm gửi lại."
-                )
-                continue
-        except Exception:
-            pass
-
-        # 4. Final Spintax / brace safety check before sending to Facebook
-        if "{" in content or "}" in content:
-            if not sheets_sync.validate_spintax_braces(content):
-                db.update_task_result(
-                    task_id=task_id,
-                    status="FAILED",
-                    error_message="Nội dung bình luận chứa cú pháp ngoặc Spintax '{...}' bị lỗi nên đã chặn gửi."
-                )
-                continue
-            content = spintax.spin(content)
-
-        # 5. Lock task for sending
-        if SCHEDULER_METRICS["paused_all"]:
-            break
-        if not db.lock_task_for_sending(task_id):
-            continue
-        # A pause may land right after the lock: give the task back so it is not
-        # left in SENDING (which later becomes a false NEED_CHECK).
-        if SCHEDULER_METRICS["paused_all"]:
-            db.release_task_lock(task_id)
-            break
-
-        # 6. Post comment to Meta (via Graph API if token available, else via Antidetect CDP)
-        profile_id = fresh_page.get("antidetect_profile_id") or task.get("antidetect_profile_id")
-        if token and fresh_page.get("token_status") not in ("EXPIRED", "MISSING_PERMISSIONS", "ANTIDETECT_READY"):
-            result = meta_client.post_comment(
-                post_id=post_id,
-                page_id=page_id,
-                page_access_token=token,
-                message=content
-            )
-            # Hybrid fallback: if Graph API token expired/failed auth and page has Antidetect profile
-            if not result.get("success") and result.get("category") == "TOKEN_EXPIRED" and profile_id:
-                result = antidetect_client.post_comment_cdp(
-                    post_id=post_id,
-                    page_id=fresh_page.get("fb_profile_id") or page_id,
-                    page_name=fresh_page.get("page_name") or page_id,
-                    page_url=fresh_page.get("page_url"),
-                    profile_id=profile_id,
-                    message=content,
-                    post_url=task.get("post_url"),
-                )
-        elif profile_id:
-            result = antidetect_client.post_comment_cdp(
-                post_id=post_id,
-                page_id=fresh_page.get("fb_profile_id") or page_id,
-                page_name=fresh_page.get("page_name") or page_id,
-                page_url=fresh_page.get("page_url"),
-                profile_id=profile_id,
-                message=content,
-                post_url=task.get("post_url"),
-            )
-        else:
-            result = {
-                "success": False,
-                "category": "TOKEN_EXPIRED",
-                "error": "Page chưa có Token Graph API và cũng chưa gắn Profile Antidetect.",
-                "usage_pct": None,
-            }
-
-
-        if result.get("usage_pct") is not None:
-            db.update_page_api_usage(page_id, float(result["usage_pct"]))
-
-        if result.get("success"):
-            db.update_task_result(
-                task_id=task_id,
-                status="SUCCESS",
-                comment_id=result.get("comment_id")
-            )
-            now_utc = datetime.now(timezone.utc)
-        else:
-            category = result.get("category", "UNKNOWN")
-            err_msg = result.get("error", "Lỗi không xác định")
-
-            if category == "NEED_CHECK":
-                db.update_task_result(task_id=task_id, status="NEED_CHECK", error_message=err_msg)
-            elif category == "TOKEN_EXPIRED":
-                db.update_task_result(task_id=task_id, status="PAUSED", error_message=err_msg)
-                db.update_page_status(page_id, is_active=False, token_status="EXPIRED", status_note=err_msg)
-            elif category == "RATE_LIMIT":
-                retry_count = task.get("retry_count", 0)
-                if retry_count < 4:
-                    backoff_mins = 2 ** (retry_count + 1)
-                    new_time = (now_utc + timedelta(minutes=backoff_mins)).isoformat()
-                    conn = db.get_connection()
-                    with conn:
-                        conn.execute(
-                            "UPDATE tasks SET status = 'PENDING', locked_at = NULL, scheduled_at = ?, retry_count = retry_count + 1, error_message = ? WHERE id = ?",
-                            (new_time, err_msg, task_id)
-                        )
-                    conn.close()
-                else:
-                    db.update_task_result(task_id=task_id, status="FAILED", error_message=err_msg)
-            elif category == "NETWORK_RETRYABLE":
-                retry_count = task.get("retry_count", 0)
-                if retry_count < 3:
-                    new_time = (now_utc + timedelta(minutes=2)).isoformat()
-                    conn = db.get_connection()
-                    with conn:
-                        conn.execute(
-                            "UPDATE tasks SET status = 'PENDING', locked_at = NULL, scheduled_at = ?, retry_count = retry_count + 1, error_message = ? WHERE id = ?",
-                            (new_time, err_msg, task_id)
-                        )
-                    conn.close()
-                else:
-                    db.update_task_result(task_id=task_id, status="FAILED", error_message=err_msg)
+                result = {"success": False, "category": "NETWORK_RETRYABLE", "error": "Không xác minh được bài trước khi gửi."}
             else:
-                db.update_task_result(task_id=task_id, status="FAILED", error_message=err_msg)
+                latest = comment_dispatch.check(page_id, paused, automatic=automatic, require_sheet=automatic)
+                if not latest.ready or latest.page["page_access_token"] != token:
+                    db.release_task_lock(task_id)
+                    db.defer_task(task_id, latest.retry_at, latest.message)
+                    continue
+                try:
+                    result = meta_client.post_comment(verified["clean_post_id"], page_id, token, content)
+                except Exception:
+                    result = {"success": False, "category": "NEED_CHECK", "error": "Chưa xác nhận được kết quả gửi. Đối chiếu trên Facebook."}
+            _record_dispatch_result(task, result, decision.page)
+
+
+def _record_dispatch_result(task, result, page):
+    task_id, page_id = task["id"], task["page_id"]
+    if result.get("usage_pct") is not None:
+        db.update_page_api_usage(page_id, float(result["usage_pct"]))
+    if result.get("success"):
+        SCHEDULER_METRICS["send_errors"].pop(page_id, None)
+        db.update_task_result(task_id, "SUCCESS", comment_id=result.get("comment_id"))
+        return
+    category = result.get("category", "UNKNOWN")
+    error = result.get("error", "Lỗi không xác định")
+    SCHEDULER_METRICS["send_errors"][page_id] = error
+    if category == "NEED_CHECK":
+        db.update_task_result(task_id, "NEED_CHECK", error_message=error)
+    elif category in ("TOKEN_EXPIRED", "MISSING_PERMISSIONS"):
+        db.update_task_result(task_id, "PAUSED", error_message=error)
+        status = "EXPIRED" if category == "TOKEN_EXPIRED" else category
+        db.update_page_status(page_id, bool(page["is_active"]), status, error)
+    elif category in ("RATE_LIMIT", "NETWORK_RETRYABLE"):
+        if category == "RATE_LIMIT":
+            retry_at = db.record_rate_limit(page_id, result)
+            max_retries = 4
+        else:
+            retry_at = (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat()
+            max_retries = 3
+        if task["retry_count"] < max_retries:
+            with db.get_connection() as conn:
+                conn.execute("""UPDATE tasks SET status='PENDING',locked_at=NULL,scheduled_at=?,
+                    retry_count=retry_count+1,error_message=?,updated_at=? WHERE id=? AND status='SENDING'""",
+                    (retry_at, error, datetime.now(timezone.utc).isoformat(), task_id))
+        else:
+            db.update_task_result(task_id, "FAILED", error_message=error)
+    else:
+        db.update_task_result(task_id, "FAILED", error_message=error)
 
 
 def run_manual_sync_cycle():
@@ -377,67 +345,90 @@ def run_manual_sync_cycle():
         _execute_due_tasks()
 
 
+def resume_tasks(page_id=None, task_id=None, confirmed_not_posted=False):
+    """Single preparation path for individual retries and Page-wide resumes."""
+    from contextlib import closing
+
+    with closing(db.get_connection()) as conn:
+        if task_id is not None:
+            rows = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM tasks WHERE page_id=? AND status='PAUSED'", (page_id,)).fetchall()
+    if not rows:
+        return 0
+    page_id = rows[0]["page_id"]
+    allowed = {"FAILED", "PAUSED"} | ({"NEED_CHECK"} if confirmed_not_posted else set())
+    if task_id is not None and rows[0]["status"] not in allowed:
+        raise ValueError("Tác vụ Cần kiểm tra phải được đối chiếu và xác nhận chưa đăng trước khi gửi lại.")
+    with comment_dispatch.page_lock(page_id):
+        if not graph_ready(db.get_page_for_dispatch(page_id) or {}):
+            raise ValueError("Page chưa có kết nối Meta khả dụng.")
+        automatic = any(row["source"] == "AUTO" for row in rows)
+        if any(row["source"] == "AUTO" and row["sequence_step"] is None for row in rows):
+            result = refresh_comment_sheet(force=True)
+            if not result.get("success"):
+                raise ValueError(result.get("error") or "Chưa đọc được Sheet để khôi phục tác vụ.")
+        with _COMMENT_SHEET_LOCK:
+            page = db.get_page(page_id)
+            if automatic and (not page["rule_enabled"] or page.get("source_error")):
+                raise ValueError(page.get("source_error") or "Hãy bật tự động của Page trước khi khôi phục.")
+            if task_id is not None:
+                return int(db.retry_task(task_id, confirmed_not_posted=confirmed_not_posted))
+            return db.resume_paused_tasks_for_page(page_id)
+
+
 def run_maintenance_cycle():
     """
     Runs periodic maintenance:
     1. Recovers only tasks stuck in SENDING for > 5 minutes (startup=False).
     2. Checks token health ONLY when debug_token actually succeeded (`checked=True`).
-    3. Auto-syncs Google Sheet if a Sheet URL is saved (paused system skips config drift).
+    3. Refreshes Google Sheet configuration even while sending is paused.
     """
     db.recover_stale_tasks(startup=False, stale_after_seconds=300)
 
-    pages = db.get_all_pages()
-    for p in pages:
+    for p in db.get_all_pages():
         pid = p["page_id"]
-        full_p = db.get_page_with_decrypted_token(pid)
-        if full_p and full_p.get("page_access_token"):
-            info = meta_client.debug_token(full_p["page_access_token"])
-            # CRITICAL: Only act if Meta explicitly returned a token inspection result (`checked=True`)
-            if info.get("checked") is True:
-                invalid_token = not info.get("is_valid")
-                missing_scopes = info.get("missing_scopes") or []
+        if not p.get("rule_enabled"):
+            continue
+        full_p = db.get_page_for_dispatch(pid)
+        if not full_p or not full_p.get("page_access_token"):
+            continue
+        info = meta_client.debug_token(full_p["page_access_token"])
+        if info.get("checked") is not True:
+            continue
+        missing = info.get("missing_scopes") or []
+        if not info.get("is_valid"):
+            status, note = "EXPIRED", "Token không còn hợp lệ hoặc đã hết hạn."
+        elif missing:
+            status, note = "MISSING_PERMISSIONS", "Thiếu quyền: " + ", ".join(missing)
+        else:
+            # Token checks must never undo an operator pause or reconnect requirement.
+            continue
+        db.update_page_status(pid, bool(p["is_active"]), status, note)
 
-                if invalid_token or missing_scopes:
-                    # HYBRID pages can keep running through Antidetect CDP even when Graph is dead.
-                    if p.get("antidetect_profile_id"):
-                        keep_active = bool(p.get("is_active"))
-                        already_cdp = (
-                            keep_active and p.get("token_status") == "ANTIDETECT_READY"
-                        )
-                        if not already_cdp:
-                            db.update_page_status(
-                                pid,
-                                keep_active,
-                                "ANTIDETECT_READY",
-                                "Token Graph không hợp lệ hoặc thiếu quyền; Page tiếp tục chạy qua Antidetect CDP."
-                            )
-                    elif invalid_token:
-                        db.update_page_status(pid, False, "EXPIRED", "Token không còn hợp lệ hoặc đã hết hạn")
-                    else:
-                        db.update_page_status(
-                            pid,
-                            False,
-                            "MISSING_PERMISSIONS",
-                            f"Thiếu quyền: {', '.join(missing_scopes)}"
-                        )
-                else:
-                    db.update_page_status(pid, True, info.get("status", "OK"), None)
-
-    sheet_url = SCHEDULER_METRICS["sheet_sync"].get("sheet_url")
-    if sheet_url and not SCHEDULER_METRICS["paused_all"]:
-        res = sheets_sync.sync_from_google_sheet(sheet_url)
-        SCHEDULER_METRICS["sheet_sync"]["last_run"] = datetime.now(timezone.utc).isoformat()
-        SCHEDULER_METRICS["sheet_sync"]["last_error"] = None if res.get("success") else res.get("error")
+    if comment_sheet_url():
+        refresh_comment_sheet()
 
 
 # --- 3 INDEPENDENT ASYNC LOOPS (NON-BLOCKING) ---
+
+async def run_worker(worker):
+    """Keep the service owner alive until a cancelled loop's actual thread exits."""
+    pending = asyncio.create_task(asyncio.to_thread(worker))
+    try:
+        return await asyncio.shield(pending)
+    except asyncio.CancelledError:
+        # Cancelling to_thread's awaiter does not stop an already running thread.
+        await asyncio.gather(pending, return_exceptions=True)
+        raise
+
 
 async def loop_post_scanner():
     """Loop 1: Incremental post scanner (Interval: config.POST_SCAN_INTERVAL_SEC)."""
     while True:
         if not SCHEDULER_METRICS["paused_all"]:
             try:
-                await asyncio.to_thread(detect_new_posts_and_schedule)
+                await run_worker(detect_new_posts_and_schedule)
                 SCHEDULER_METRICS["post_scan"]["last_run"] = datetime.now(timezone.utc).isoformat()
                 SCHEDULER_METRICS["post_scan"]["last_error"] = None
             except Exception as e:
@@ -446,11 +437,12 @@ async def loop_post_scanner():
 
 
 async def loop_task_executor():
-    """Loop 2: Task execution tick (Interval: config.TASK_TICK_SEC)."""
+    """Loop 2: Refresh Page templates while paused and dispatch enabled tasks."""
     while True:
+        await run_worker(refresh_comment_sheet)
         if not SCHEDULER_METRICS["paused_all"]:
             try:
-                await asyncio.to_thread(execute_due_tasks)
+                await run_worker(execute_due_tasks)
                 SCHEDULER_METRICS["task_exec"]["last_run"] = datetime.now(timezone.utc).isoformat()
                 SCHEDULER_METRICS["task_exec"]["last_error"] = None
             except Exception as e:
@@ -462,7 +454,7 @@ async def loop_maintenance():
     """Loop 3: Token health debug, stale task recovery & auto sheet sync."""
     while True:
         try:
-            await asyncio.to_thread(run_maintenance_cycle)
+            await run_worker(run_maintenance_cycle)
             SCHEDULER_METRICS["maintenance"]["last_run"] = datetime.now(timezone.utc).isoformat()
             SCHEDULER_METRICS["maintenance"]["last_error"] = None
         except Exception as e:
