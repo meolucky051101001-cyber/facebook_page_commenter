@@ -75,7 +75,15 @@ Khi Meta báo rate limit, tool lưu mốc chờ theo Page, tài khoản hoặc �
 
 Mẫu của bình luận đơn được cập nhật khi tác vụ đang PENDING hoặc PAUSED. Bấm chạy tiếp sẽ kiểm tra nguồn Sheet trước khi khôi phục. Sheet lỗi thì tác vụ tự động chưa được khôi phục. Nội dung được chốt khi nhận lượt gửi; tác vụ SENDING và NEED_CHECK giữ nội dung để đối chiếu. Chuỗi đã tạo giữ snapshot; đổi chế độ trên Sheet áp dụng cho bài mới. Tác vụ PAUSED quá hạn hơn hai giờ vẫn cần đối chiếu, không tự đặt lại lịch thành hiện tại.
 
-Token lỗi giải mã sẽ được đánh dấu INVALID_SECRET và tác vụ chờ của Page đó chuyển PAUSED. Kết nối lại và kiểm tra đúng danh tính Page trước khi khôi phục. Scheduler dùng Graph API; dữ liệu Antidetect giúp ghép profile và quản lý danh mục, không tự thay thế token hết hạn bằng đường gửi CDP.
+Token lỗi giải mã sẽ được đánh dấu INVALID_SECRET và tác vụ Graph đang chờ của Page đó chuyển PAUSED. Kết nối lại và kiểm tra đúng danh tính Page trước khi khôi phục. Scheduler chọn rõ `GRAPH_API` hoặc `BROWSER` cho từng Page; lỗi Graph không tự chuyển sang trình duyệt. Inbox và xuất bản vẫn cần Graph API.
+
+### Bình luận bằng trình duyệt Antidetect
+
+Đồng bộ danh mục Antidetect, chọn **Trình duyệt Antidetect** ở Page, bấm **Kiểm tra trình duyệt**, đồng bộ Sheet rồi **Bật tự động**. Nếu profile hết phiên, đăng nhập Facebook lại trong đúng profile rồi kiểm tra lại. Chế độ này dùng phiên trình duyệt, không yêu cầu Page Access Token.
+
+Tool xác minh numeric ID Page, bài viết, người bình luận và nội dung ngay trước Enter. Tên Page giống nhau không đủ để xác minh. Mỗi profile chỉ xử lý một thao tác cùng lúc. Tool chỉ đóng phiên browser có `launch_id` do nó sở hữu. Đổi cách gửi tạm dừng tác vụ đang chờ; cần **Khôi phục tác vụ** riêng sau khi kiểm tra, quota và lịch sử vẫn giữ.
+
+Chỉ ghi SUCCESS khi thấy ID bình luận mới đúng Page/nội dung. Kết quả không rõ sau Enter chuyển NEED_CHECK và không tự gửi lại. Layout thiếu ID hoặc timestamp tuyệt đối sẽ bị chặn; hiện chưa hỗ trợ link `pfbid`/rút gọn qua trình duyệt. Cần nghiệm thu layout trên phiên Facebook đã đăng nhập trước khi bật nhiều Page. Xem `docs/KE-HOACH-BINH-LUAN-TRINH-DUYET.md`.
 
 Ứng dụng khóa theo đường dẫn DB trước khi recovery, kể cả chạy qua `run.py`, `run_background.pyw` hoặc Uvicorn trực tiếp. Chỉ một tiến trình được dùng DB. Trạng thái chạy được lưu trong DB: chưa có trạng thái thì tạm dừng, đã có thì khôi phục trạng thái đã lưu. Để cập nhật dịch vụ, tạm dừng trước, sao lưu bằng SQLite Backup API và kiểm tra bản sao. Nếu đã gửi sau nâng cấp, phải giữ lịch sử gửi mới khi rollback để tránh mất khóa chống trùng.
 

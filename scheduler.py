@@ -2,6 +2,7 @@ import json
 import asyncio
 import threading
 import time
+from contextlib import closing
 from datetime import datetime, timezone, timedelta
 from dateutil import parser as date_parser
 from typing import Dict, Any, Optional
@@ -12,6 +13,7 @@ import comment_content
 import database as db
 import meta_client
 import sheets_sync
+import antidetect_client
 
 
 # In-memory status for UI monitoring
@@ -93,6 +95,38 @@ def graph_ready(page: Dict[str, Any]) -> bool:
     return comment_dispatch.graph_ready(page)
 
 
+def send_ready(page: Dict[str, Any]) -> bool:
+    return comment_dispatch.send_ready(page)
+
+
+def _send_mode(page):
+    return (page or {}).get("send_mode") or "GRAPH_API"
+
+
+def _same_send_connection(before, after):
+    """Never reuse a verification after the operator changes its connection."""
+    if not after or _send_mode(before) != _send_mode(after):
+        return False
+    keys = ("antidetect_profile_id", "fb_profile_id", "browser_identity_id", "browser_profile_id") \
+        if _send_mode(before) == "BROWSER" else ("page_access_token",)
+    return all(before.get(key) == after.get(key) for key in keys)
+
+
+def _record_browser_connection_failure(page, result):
+    """Invalidate only the browser binding used by this operation, never its token."""
+    category = result.get("category")
+    status = result.get("browser_status")
+    if status not in ("LOGIN_REQUIRED", "CHECKPOINT", "ERROR"):
+        return
+    if category in ("BROWSER_BUSY", "CANCELLED_BEFORE_SEND", "NETWORK_RETRYABLE", "RATE_LIMIT", "POST_ERROR"):
+        return
+    db.invalidate_page_browser(
+        page["page_id"], status, result.get("error"),
+        profile_id=page.get("antidetect_profile_id"),
+        identity_id=page.get("browser_identity_id"),
+    )
+
+
 def build_post_schedule(page: Dict[str, Any], post_id: str, post_url: Optional[str],
                         created_at: datetime, now: datetime) -> Dict[str, Any]:
     delay_minutes = page["delay_minutes"]
@@ -149,7 +183,7 @@ def _detect_new_posts_and_schedule():
             continue
         try:
             page_full = db.get_page_for_dispatch(page_id)
-            if not page_full or not graph_ready(page_full):
+            if not page_full or not send_ready(page_full):
                 continue
             templates = json.loads(p.get("templates") or "[]")
             if not templates:
@@ -163,7 +197,16 @@ def _detect_new_posts_and_schedule():
                     conn.execute("UPDATE pages SET last_seen_post_time = ? WHERE page_id = ? AND last_seen_post_time IS NULL",
                                  (since, page_id))
                 continue
-            posts = meta_client.get_recent_posts(page_id, page_full["page_access_token"], since_timestamp=since)
+            if _send_mode(page_full) == "BROWSER":
+                posts = antidetect_client.get_recent_posts_for_page_cdp(page_full, since_timestamp=since)
+            else:
+                posts = meta_client.get_recent_posts(page_id, page_full["page_access_token"], since_timestamp=since)
+        except antidetect_client.BrowserAutomationError as exc:
+            SCHEDULER_METRICS["scan_errors"][page_id] = exc.message
+            _record_browser_connection_failure(page_full, exc.as_result())
+            if exc.category in ("BROWSER_BUSY", "NETWORK_RETRYABLE"):
+                _SCAN_BACKOFF_UNTIL[page_id] = now_utc + timedelta(seconds=config.TASK_TICK_SEC)
+            continue
         except meta_client.MetaAPIError as exc:
             SCHEDULER_METRICS["scan_errors"][page_id] = exc.message
             if exc.category == "RATE_LIMIT":
@@ -179,6 +222,9 @@ def _detect_new_posts_and_schedule():
         SCHEDULER_METRICS["scan_errors"].pop(page_id, None)
         if SCHEDULER_METRICS["paused_all"]:
             break
+        latest_page = db.get_page_for_dispatch(page_id)
+        if not send_ready(latest_page) or not _same_send_connection(page_full, latest_page):
+            continue
         latest_post_time = None
         new_posts = []
         for post in posts:
@@ -243,6 +289,33 @@ def _due_task_candidates(include_auto):
             yield task
 
 
+def _prepare_before_submit(task, initial_page, paused, *, refresh_sheet=False):
+    """Recheck policy after slow browser navigation without acquiring the Page lock again."""
+    automatic = task.get("source") == "AUTO"
+    if automatic and refresh_sheet and not refresh_comment_sheet(force=True).get("success"):
+        return comment_dispatch.Decision("SOURCE_CHANGED", message="Chưa đọc được Sheet mới nhất trước khi gửi.")
+    with _COMMENT_SHEET_LOCK:
+        if automatic and not _comment_sheet_result.get("success"):
+            return comment_dispatch.Decision("SOURCE_CHANGED", message="Nguồn bình luận chưa sẵn sàng.")
+        latest = comment_dispatch.check(task["page_id"], paused, automatic=automatic,
+                                        require_sheet=automatic, transport="selected")
+        if not latest.ready:
+            return latest
+        if not _same_send_connection(initial_page, latest.page):
+            return comment_dispatch.Decision("PAGE_CHANGED", message="Kết nối Page đã thay đổi trước khi gửi.")
+        with closing(db.get_connection()) as conn:
+            current_task = conn.execute("SELECT status,comment_content FROM tasks WHERE id=?", (task["id"],)).fetchone()
+        if not current_task or current_task["status"] != "SENDING" or current_task["comment_content"] != task["comment_content"]:
+            return comment_dispatch.Decision("TASK_CHANGED", message="Tác vụ đã thay đổi trước khi gửi.")
+        revision = task.get("content_revision") or ""
+        # Graph requests retain their claimed snapshot. Browser navigation can
+        # take much longer, so reprepare unsent single comments if its rules changed.
+        if _send_mode(initial_page) == "BROWSER" and automatic and task.get("sequence_step") is None and not revision.startswith("snapshot:"):
+            if revision != comment_content.rule_revision(latest.page):
+                return comment_dispatch.Decision("SOURCE_CHANGED", message="Mẫu hoặc lịch bình luận đã đổi; sẽ chuẩn bị lại tác vụ.")
+        return latest
+
+
 def _execute_due_tasks():
     if SCHEDULER_METRICS["paused_all"]:
         return
@@ -254,11 +327,14 @@ def _execute_due_tasks():
             break
         task_id, page_id = task["id"], task["page_id"]
         automatic = task.get("source") == "AUTO"
-        with comment_dispatch.guard(page_id, paused, automatic=automatic, require_sheet=automatic) as decision:
+        with comment_dispatch.guard(page_id, paused, automatic=automatic, require_sheet=automatic,
+                                    transport="selected") as decision:
             if not decision.ready:
                 db.defer_task(task_id, decision.retry_at, decision.message)
                 continue
-            token = decision.page["page_access_token"]
+            page = decision.page
+            browser = _send_mode(page) == "BROWSER"
+            token = page.get("page_access_token")
             with _COMMENT_SHEET_LOCK:
                 if automatic and not _comment_sheet_result.get("success"):
                     continue
@@ -279,21 +355,48 @@ def _execute_due_tasks():
                 break
             attempts += 1
             try:
-                verified = meta_client.verify_post_belongs_to_page(task["post_id"], page_id, token)
-            except meta_client.MetaAPIError as exc:
+                if browser:
+                    verified = antidetect_client.verify_post_for_page_cdp(page, task["post_id"], post_url=task.get("post_url"))
+                else:
+                    verified = meta_client.verify_post_belongs_to_page(task["post_id"], page_id, token)
+            except (meta_client.MetaAPIError, antidetect_client.BrowserAutomationError) as exc:
                 result = exc.as_result()
             except Exception:
                 result = {"success": False, "category": "NETWORK_RETRYABLE", "error": "Không xác minh được bài trước khi gửi."}
             else:
-                latest = comment_dispatch.check(page_id, paused, automatic=automatic, require_sheet=automatic)
-                if not latest.ready or latest.page["page_access_token"] != token:
+                latest = _prepare_before_submit(task, page, paused)
+                if not latest.ready:
                     db.release_task_lock(task_id)
                     db.defer_task(task_id, latest.retry_at, latest.message)
                     continue
                 try:
-                    result = meta_client.post_comment(verified["clean_post_id"], page_id, token, content)
+                    if browser:
+                        cancellation = {}
+
+                        def before_submit():
+                            final = _prepare_before_submit(task, page, paused, refresh_sheet=True)
+                            if not final.ready:
+                                cancellation.update(error=final.message, retry_at=final.retry_at)
+                            return final.ready
+
+                        result = antidetect_client.send_page_comment_cdp(
+                            page, verified["clean_post_id"], content,
+                            post_url=verified.get("permalink_url") or task.get("post_url"),
+                            before_submit=before_submit,
+                        )
+                        if result.get("category") == "CANCELLED_BEFORE_SEND":
+                            result.update(cancellation)
+                        if result.get("success") and not result.get("comment_id"):
+                            result = {"success": False, "category": "NEED_CHECK",
+                                      "error": "Chưa có mã bình luận xác thực từ trình duyệt. Đối chiếu trên Facebook."}
+                    else:
+                        result = meta_client.post_comment(verified["clean_post_id"], page_id, token, content)
+                except antidetect_client.BrowserAutomationError as exc:
+                    result = exc.as_result()
                 except Exception:
                     result = {"success": False, "category": "NEED_CHECK", "error": "Chưa xác nhận được kết quả gửi. Đối chiếu trên Facebook."}
+            if browser and result.get("category") == "BROWSER_BUSY":
+                attempts -= 1  # Profile contention must not consume another Page's send budget.
             _record_dispatch_result(task, result, decision.page)
 
 
@@ -308,6 +411,18 @@ def _record_dispatch_result(task, result, page):
     category = result.get("category", "UNKNOWN")
     error = result.get("error", "Lỗi không xác định")
     SCHEDULER_METRICS["send_errors"][page_id] = error
+    if _send_mode(page) == "BROWSER":
+        _record_browser_connection_failure(page, result)
+        if category in ("BROWSER_BUSY", "CANCELLED_BEFORE_SEND"):
+            db.release_task_lock(task_id)
+            retry_at = result.get("retry_at") or (
+                datetime.now(timezone.utc) + timedelta(seconds=config.TASK_TICK_SEC)).isoformat()
+            db.defer_task(task_id, retry_at, error)
+            return
+        if result.get("browser_status") in ("LOGIN_REQUIRED", "CHECKPOINT", "ERROR") and category not in (
+                "NEED_CHECK", "NETWORK_RETRYABLE", "RATE_LIMIT", "POST_ERROR"):
+            db.update_task_result(task_id, "PAUSED", error_message=error)
+            return
     if category == "NEED_CHECK":
         db.update_task_result(task_id, "NEED_CHECK", error_message=error)
     elif category in ("TOKEN_EXPIRED", "MISSING_PERMISSIONS"):
@@ -347,8 +462,6 @@ def run_manual_sync_cycle():
 
 def resume_tasks(page_id=None, task_id=None, confirmed_not_posted=False):
     """Single preparation path for individual retries and Page-wide resumes."""
-    from contextlib import closing
-
     with closing(db.get_connection()) as conn:
         if task_id is not None:
             rows = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchall()
@@ -361,8 +474,8 @@ def resume_tasks(page_id=None, task_id=None, confirmed_not_posted=False):
     if task_id is not None and rows[0]["status"] not in allowed:
         raise ValueError("Tác vụ Cần kiểm tra phải được đối chiếu và xác nhận chưa đăng trước khi gửi lại.")
     with comment_dispatch.page_lock(page_id):
-        if not graph_ready(db.get_page_for_dispatch(page_id) or {}):
-            raise ValueError("Page chưa có kết nối Meta khả dụng.")
+        if not send_ready(db.get_page_for_dispatch(page_id) or {}):
+            raise ValueError("Page chưa có kết nối khả dụng cho chế độ gửi đã chọn.")
         automatic = any(row["source"] == "AUTO" for row in rows)
         if any(row["source"] == "AUTO" and row["sequence_step"] is None for row in rows):
             result = refresh_comment_sheet(force=True)
@@ -388,7 +501,7 @@ def run_maintenance_cycle():
 
     for p in db.get_all_pages():
         pid = p["page_id"]
-        if not p.get("rule_enabled"):
+        if not p.get("rule_enabled") or _send_mode(p) == "BROWSER":
             continue
         full_p = db.get_page_for_dispatch(pid)
         if not full_p or not full_p.get("page_access_token"):

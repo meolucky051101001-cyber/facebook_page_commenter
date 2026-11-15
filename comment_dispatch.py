@@ -35,6 +35,21 @@ def graph_ready(page):
                      or (page.get("connection_checked_at") and not page.get("connection_error"))))
 
 
+def browser_ready(page):
+    return bool(page and page.get("is_active") and page.get("send_mode") == "BROWSER"
+                and page.get("browser_status") == "READY" and page.get("browser_checked_at")
+                and not page.get("browser_error") and page.get("antidetect_profile_id")
+                and page.get("browser_profile_id") == page.get("antidetect_profile_id")
+                and page.get("browser_identity_id")
+                and page.get("browser_identity_id") == db.browser_identity_id(page))
+
+
+def send_ready(page):
+    if page and page.get("send_mode", "GRAPH_API") == "BROWSER":
+        return browser_ready(page)
+    return bool(page and page.get("send_mode", "GRAPH_API") == "GRAPH_API" and graph_ready(page))
+
+
 @dataclass
 class Decision:
     reason: str
@@ -51,19 +66,21 @@ class Decision:
                 "retry_at": self.retry_at, "message": self.message}
 
 
-def check(page_id, paused, *, automatic=False, require_sheet=False):
+def check(page_id, paused, *, automatic=False, require_sheet=False, transport="GRAPH_API"):
     if paused():
         return Decision("SYSTEM_PAUSED", message="Hệ thống đang tạm dừng gửi bình luận.")
-    page = db.get_page_for_dispatch(page_id)
-    if not graph_ready(page):
-        return Decision("PAGE_BLOCKED", page, message="Page cần kết nối Meta hợp lệ.")
+    page = db.get_page_for_dispatch(page_id, transport=transport)
+    if not (send_ready(page) if transport == "selected" else graph_ready(page)):
+        browser = transport == "selected" and page and page.get("send_mode") == "BROWSER"
+        message = (page.get("browser_error") or "Page cần kiểm tra kết nối trình duyệt.") if browser else "Page cần kết nối Meta hợp lệ."
+        return Decision("PAGE_BLOCKED", page, message=message)
     if automatic and (not page.get("rule_enabled") or (require_sheet and page.get("source_error"))):
         return Decision("AUTOMATION_PAUSED", page, message="Tự động của Page đang tạm dừng hoặc cấu hình chưa hợp lệ.")
     now = datetime.now(timezone.utc)
     waits = []
     cooldown = db.get_send_cooldown(page, now)
     if cooldown:
-        waits.append((cooldown, "WAIT_RATE_LIMIT", "Page đang chờ giới hạn Meta."))
+        waits.append((cooldown, "WAIT_RATE_LIMIT", "Page đang chờ giới hạn gửi."))
     limit = page.get("max_comments_per_day") or config.MAX_COMMENTS_PER_PAGE_PER_DAY
     if page.get("comments_today_date") == db.local_day_key(now) and (page.get("comments_today_count") or 0) >= limit:
         waits.append((db.next_daily_reset_utc(now), "WAIT_DAILY", "Đã hết hạn mức bình luận hôm nay."))
@@ -88,7 +105,7 @@ def page_status(page, paused=False):
     deadlines = []
     cooldown = db.get_send_cooldown(page, now)
     if cooldown:
-        deadlines.append((cooldown, "Đang chờ giới hạn Meta"))
+        deadlines.append((cooldown, "Đang chờ giới hạn gửi"))
     if used >= limit:
         deadlines.append((db.next_daily_reset_utc(now), "Đã hết hạn mức hôm nay"))
     if page.get("last_comment_at"):
@@ -101,20 +118,22 @@ def page_status(page, paused=False):
     until, reason = max(deadlines, key=lambda item: datetime.fromisoformat(item[0])) if deadlines else (None, None)
     if paused:
         reason = "Hệ thống đang tạm dừng"
-    elif not page.get("is_active") or page.get("token_status") not in ("OK", "EXPIRING_SOON"):
+    elif page.get("send_mode") == "BROWSER" and not browser_ready(page):
+        reason = page.get("browser_error") or "Page cần kiểm tra kết nối trình duyệt"
+    elif page.get("send_mode", "GRAPH_API") == "GRAPH_API" and (not page.get("is_active") or page.get("token_status") not in ("OK", "EXPIRING_SOON")):
         reason = page.get("status_note") or "Page cần kết nối Meta hợp lệ"
     return {"comments_used_today": used, "comments_remaining_today": max(0, limit - used),
             "send_wait_reason": reason, "next_send_at": until}
 
 
 @contextmanager
-def guard(page_id, paused, *, automatic=False, require_sheet=False):
+def guard(page_id, paused, *, automatic=False, require_sheet=False, transport="GRAPH_API"):
     lock = page_lock(page_id)
     if not lock.acquire(blocking=False):
         yield Decision("WAIT_BUSY", retry_at=(datetime.now(timezone.utc) + timedelta(seconds=config.TASK_TICK_SEC)).isoformat(),
                        message="Page đang xử lý một bình luận khác.")
         return
     try:
-        yield check(page_id, paused, automatic=automatic, require_sheet=require_sheet)
+        yield check(page_id, paused, automatic=automatic, require_sheet=require_sheet, transport=transport)
     finally:
         lock.release()

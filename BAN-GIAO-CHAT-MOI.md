@@ -5,50 +5,81 @@ Cập nhật: 15/11/2026, Asia/Bangkok. Thư mục làm việc và chạy dịch
 
 Đọc kế hoạch trong `docs/KE-HOACH-SUA-LOI-COMMENT-TU-DONG.md` và kết quả từng chặng trong `docs/NHAT-KY-TRIEN-KHAI-COMMENT-TU-DONG.md`. Tài liệu `docs/legacy` chỉ để tham khảo lịch sử.
 
-## Trạng thái đã kiểm chứng
+## Hiện trạng mới nhất sau triển khai Browser
 
-- Dịch vụ chạy nền qua `pythonw run_background.pyw` tại `127.0.0.1:8080`. PID ở `backups/auto-comment-20261115-834cb6ce/service.pid`; phải kiểm tra lại tiến trình và API khi bắt đầu phiên mới.
-- DB schema 6, 8 tài khoản, 65 Page, 65 rule; 4 tác vụ lịch sử gồm 3 SUCCESS và 1 CANCELLED. Không có tác vụ PENDING, SENDING hoặc NEED_CHECK, không có publication hay inbox tại thời điểm bàn giao. Chín token Page còn giải mã được; điều này không thay thế kiểm tra quyền Meta trực tiếp.
-- Toàn hệ thống đang `paused`; tất cả 65 Page tắt tự động. Đợt sửa lỗi này không gửi bình luận hoặc trả lời thật trên Facebook.
-- Sheet đang dùng được chọn trong DB, ưu tiên hơn URL PILOT trong .env. Lần đọc thực tế thành công ở chế độ MULTI_PAGE: 3 Page hợp lệ, 5 mẫu. Có 57 Page chưa có dòng mẫu và 5 Page ở dòng 7–11 thiếu nội dung Comment; tổng 62 Page có lỗi nguồn. Không tự tạo nội dung để lấp những dòng này.
-- Các API `/api/metrics`, `/api/pages`, `/api/tasks`, `/api/inbox` và hai trang `/`, `/operations` trả 200 với khóa hợp lệ; API trả 401 khi khóa sai. Chưa nghiệm thu giao diện bằng trình duyệt tương tác.
+Thông tin dưới đây thay thế các ghi nhận vận hành trước đó.
 
-## Hành vi mới cần giữ
+- Dịch vụ `pythonw run_background.pyw` tại `http://127.0.0.1:8080`, schema 7,
+  PID mới 12412 trong `backups/browser-transport-20261115/service.pid`. Kiểm tra lại khi tiếp tục.
+- Hệ thống đang chạy; 65 Page, 65 rule, 8 tài khoản, tất cả send_mode=GRAPH_API.
+  Chỉ Chị Đẹp Thích Vẽ bật AUTO. Doll gửi theo đợt thủ công đã được người dùng yêu cầu.
+- 18 tasks: 17 SUCCESS, 1 CANCELLED; không còn PENDING/SENDING/NEED_CHECK sau khi hoàn tất chuỗi Vẽ mới.
+- Nguồn: spreadsheet1Qq1lkhVzlDe0FJ5k3HDDkBiGYDqTItO2ycQMDQHATD0,
+  tab Comments - Multi-Page, gid1974210351. URL trong DB ưu tiên cấu hình PILOT.
+- Người dùng đã chọn chuỗi 3 câu của Chị Đẹp Thích Vẽ sau 30/35/40 phút.
+  Đã sửa Sheet D5:E5=30/1, D12:E12=35/2, D13:E13=40/3, lưu Drive,
+  tool đã sync, source_error=null. Áp dụng bài mới, không gửi bù lịch sử.
 
-1. Page lỗi giải mã được lưu `INVALID_SECRET`; task PENDING của Page chuyển PAUSED. Lỗi token cũ không được ghi đè token mới. Page khỏe tiếp tục được xử lý.
-2. Bình luận bài và reply dùng chung quota ngày UTC+7, khoảng cách gửi và khóa theo Page; thao tác thủ công qua tool cũng tuân theo. Ẩn/hiện bình luận không tính quota bình luận. Không tính bình luận tạo bên ngoài tool.
-3. Nội dung Spintax được tạo ổn định theo bài, bước và phiên bản cấu hình. Tên Page là dữ liệu, không phải cú pháp. Tác vụ đơn PENDING/PAUSED cập nhật theo Sheet; nội dung được chốt khi claim, SENDING/NEED_CHECK giữ nguyên để đối chiếu.
-4. Rate limit lưu cooldown theo Page, account hoặc app; restart, sync và retry không xóa mốc này. Giữ Retry-After dài hơn nếu Meta trả về.
-5. Resume một task hoặc cả Page dùng cùng bước chuẩn bị; task đơn tự động buộc đọc lại Sheet. Chuỗi đã tạo giữ snapshot; đổi chế độ chỉ áp dụng bài mới. NEED_CHECK phải đối chiếu trước khi cho phép gửi lại.
-6. Khóa DB được lấy trước init/recovery ở lifespan cho mọi entry point. Khi shutdown, ứng dụng chờ worker thread thực sự kết thúc mới nhả khóa. Trạng thái running/paused được lưu trong DB và khôi phục khi khởi động; không mặc định rằng restart luôn paused.
+## Những bình luận thật đã hoàn thành
 
-Scheduler gửi qua Graph API. Antidetect cung cấp danh mục/profile, không tự fallback sang CDP khi Graph bị chặn. Bản `integration/antidetect` đã cập nhật thông tin quota/lý do chờ; chưa chép sang thư mục Antidetect cài đặt bên ngoài project.
+- Chị Đẹp Thích Vẽ canonical993921657144854, alias61575475678031:
+  tasks5-9 gồm 5 bình luận đã xác minh. Bằng chứng trong
+  backups/two-comments-thich-ve-2026-11-15/verified-result.json.
+- Chuỗi Vẽ mới đã chạy tự động: tasks 16–18 trên post
+  `993921657144854_122155270202849189`, Reel `1454772333471446`.
+  Đã đối chiếu cả ba câu qua Graph; thời gian gửi 20:31, 20:36 và 20:41 UTC+7.
+  Bằng chứng trong `backups/browser-transport-20261115/ve-auto-sequence-verified.json`.
+  Bộ đếm Vẽ hiện 8 bình luận hôm nay, Doll 6. Backup mới nhất `post-send-final.sqlite3`.
+- Chị Đẹp Thích Doll canonical1134157636440779, alias61564553242967:
+  user xác nhận chỉ 2 bài hôm nay 15/11, mỗi bài 3 câu Sheet dòng2-4.
+  Tasks10-12 post1134157636440779_122118128666485108, Reel1842815036864659 (13:00).
+  Tasks13-15 post1134157636440779_122118140852485108, Reel1756655442063696 (18:00).
+  GET xác minh 6/6 comment đúng nội dung và author. Không gửi bài hôm qua.
+  Bằng chứng backups/doll-comments-20261115/verified-result.json;
+  backup sau gửi post-send-verified.sqlite3 (quick_check=ok).
 
-## Kiểm thử và bằng chứng
+## Browser mới và việc còn lại
 
-Kết quả kiểm thử mã gửi/migration: 91 passed, không bỏ qua test, một cảnh báo deprecation Starlette/AnyIO. Đã kiểm tra cú pháp 24 tệp Python và 2 khối JavaScript giao diện. Mọi lời gọi Meta trong test đều được giả lập; fixture chặn HTTP thật và dùng DB/khóa thử nghiệm.
+Đọc docs/KE-HOACH-BINH-LUAN-TRINH-DUYET.md. Đã triển khai schema 7, chọn send_mode,
+trạng thái xác minh browser riêng token, khóa theo profile, scan/verify/send theo
+mode và UI kiểm tra/khôi phục. Graph không fallback sang browser. Inbox/xuất bản Graph-only.
 
-```powershell
-python -m pytest -q --tb=short -p no:cacheprovider --basetemp .pytest_cache/test-run
-```
+Đổi mode/profile xóa xác minh và pause task chờ; SENDING chặn đổi mode. Giữ quota,
+cooldown,lịch sử,opt-in. Graph giữ nội dung đã claim; browser kiểm tra lại Sheet,
+actor,post,focus,nội dung trước Enter. Không rõ sau Enter => NEED_CHECK, không auto retry.
 
-Thư mục `backups/auto-comment-20261115-834cb6ce` chứa:
+Antidetect cài C:\Projects\Tools\Antidetect Python; không sửa mã/metadata ngoài repo.
+Đã mở app bằng entrypoint có sẵn; PID 36052 trong backup/antidetect-service.pid.
+Probe chỉ đọc Profile 2 c25eebac-3cec-43ec-8d73-51f914b5437b trả LOGIN_REQUIRED.
+Cần người dùng đăng nhập Facebook lại trong profile này trước khi nghiệm thu layout/gửi Browser.
+Chưa bật browser cho Page nào. Không hỏi lại user tên tool: user chưa có tool,
+đang nhờ xây auto comment trong project này.
 
-- `source.zip`, `database.sqlite3`, `config.env`, `manifest.json`: điểm khôi phục đầu đợt, gồm thay đổi có sẵn trước khi sửa.
-- `pre-deploy.sqlite3`: bản sao schema 5 ngay trước triển khai; `rehearsal.sqlite3`: bản nâng cấp thử.
-- `migration-rehearsal.json`, `migration-deployment.json`: so sánh mọi cột cũ, schema mới, token giải mã và quick_check.
-- `service-health.json`, `post-start-data-check.json`: API/khóa DB và bảo toàn lịch sử, mốc quét, quyền bật/tắt sau startup. Page rule được refresh từ Sheet như thiết kế.
-- `deployed-source.zip`, `deployed-manifest.json`, `implementation.patch`: mã triển khai, băm tệp và diff so với điểm bắt đầu, chuẩn hóa CRLF/LF.
-- `log-redaction.json`: ghi nhận che token trong log cũ. Entry point nền đặt httpx/httpcore ở WARNING để không ghi URL chứa token.
+Giới hạn: numeric post URLs, chưa pfbid/shortlinks; cần DOM cung cấp numeric actor ID,
+Page/post identity và timestamp tuyệt đối cho scan. TênPage hoặc accessState=ok chưa chứng minh đủ.
 
-.env, DB, backup và log là dữ liệu cục bộ, không commit hoặc in ra chat. Đọc log qua bộ che bí mật trước khi đưa vào báo cáo.
+Danh mục user spreadsheet1VUwW1xxgM4c8hj6CnGjdJyyHnOHFTKIOYMzLXpduWj8 gid880102023:
+65 dòng, 7 profile, 25 dòng thiếu ID. Không tự ghép tên. Nhật Kí Sân Trường/Profile4 trùng,
+Chị Đẹp Handmade chưa khớp, Tạp Hóa My Bò/Profile7 chưa có local.
+Báo cáo trong backups/profile-catalog-review-20261115.
 
-## Chạy tiếp và khôi phục
+## Kiểm thử và bảo toàn
 
-Trước khi mở tự động, cần người dùng chỉ định Page, bài và nội dung nghiệm thu gửi thật theo mục 14 của kế hoạch. Kiểm tra cấu hình Sheet và quyền Meta của Page đó, sau đó mới bật Page và tiếp tục hệ thống. Phần sửa lỗi kỹ thuật và triển khai cục bộ đã hoàn tất; nghiệm thu gửi Facebook thật còn chờ phạm vi này.
+192 tests passed, 1 Starlette/AnyIO deprecation. Python/JS syntax OK. Browser tests mô phỏng,
+không chứng minh layout thật. Migration 6→7 diễn tập giữ mọi cột cũ/history/rule/quota/settings.
+Dịch vụ mới API200,schema 7,65Page,không tự đổi mode.
 
-Để khởi động nếu dịch vụ đã dừng, kiểm tra API/cổng/PID trước rồi dùng `pythonw run_background.pyw` hoặc `python run.py` trong project. Dashboard ở [http://127.0.0.1:8080](http://127.0.0.1:8080); API cần `X-Dashboard-Key` đọc cục bộ từ .env. Không khởi động thêm tiến trình vào DB đang được dùng.
+Backups/browser-transport-20261115 có schema 7-source.zip,before-schema 7.sqlite3,
+before-deploy.sqlite3,migration-report.json,deployed-health.json,thich-ve-sequence.json,
+browser-live-probe.json. Backup cũ ở backups/auto-comment-20261115-834cb6ce.
 
-Trước khi thay phiên bản, pause qua API, chờ lượt gửi hiện tại kết thúc, rồi dừng đúng tiến trình. Không xóa file khóa khi tiến trình còn chạy. Nếu chưa có lần gửi mới và cần rollback, phục hồi cặp mã trong source.zip và DB pre-deploy.sqlite3, giữ cấu hình mã hóa phù hợp. Nếu đã có lần gửi mới, giữ/đối chiếu toàn bộ lịch sử sau backup trước khi dùng DB cũ để tránh gửi trùng.
+Test: python -m pytest -q --tb=short -p no:cacheprovider --basetemp .pytest_cache/unique-run
 
-Nếu Git báo ownership, dùng `git -c safe.directory='C:/Projects/Tools/facebook comment/facebook_page_commenter' ...`. Workspace đã có nhiều thay đổi trước đợt này; không reset về HEAD để khôi phục riêng phần sửa lỗi.
+Trước thay phiên bản: pause API, chờ SENDING kết thúc,SQLite backup,dừng đúng process,restart.
+Không xóa khóa khi process còn chạy. Không rollbackDB cũ làm mất 11 bình luận thật mới.
+Không in/commit .env,token,cookie,proxy secret,DB hoặc rawlogs.
+
+Git dùng git -c safe.directory='C:/Projects/Tools/facebook comment/facebook_page_commenter'.
+HEAD push trước Browser:c12c2c16f3652ea67dcaba70e7ec81c871dab47a.
+Đợt Browser được commit cùng cập nhật vận hành này; xem Git log để lấy mã commit.
+Giữ nguyên legacy untracked. Không rollback về backup trước đợt gửi mới.

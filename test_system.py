@@ -620,111 +620,20 @@ def test_disabling_auto_rule_cancels_pending_auto_only(worker):
 
 
 
-def _mock_cdp_environment(monkeypatch):
-    import antidetect_client
+@pytest.mark.parametrize("page_name", ["Page Mẫu", "Page Mẫu Outlet", "Nick Cá Nhân"])
+def test_legacy_cdp_requires_numeric_page_mapping(monkeypatch, page_name):
+    import antidetect_client as ad
 
-    class FakeWebSocket:
-        pass
+    def must_not_launch(*args):
+        raise AssertionError("Invalid page identity must not launch a browser")
 
-    class FakeConnect:
-        async def __aenter__(self):
-            return FakeWebSocket()
-
-        async def __aexit__(self, *exc):
-            return False
-
-    async def fake_cdp_call(ws, msg_id, method, params=None, timeout=10.0):
-        return {"id": msg_id, "result": {}}
-
-    async def fake_sleep(*args, **kwargs):
-        return None
-
-    monkeypatch.setattr(antidetect_client, "acquire_profile_cdp_port", lambda pid: (9222, False, None))
-    monkeypatch.setattr(antidetect_client, "_open_transient_tab", lambda port: ("t1", "ws://fake"))
-    monkeypatch.setattr(antidetect_client, "_ensure_antidetect_sys_path", lambda: False)
-    monkeypatch.setattr(antidetect_client, "_close_transient_tab", lambda *args: None)
-    monkeypatch.setattr(antidetect_client, "release_profile_cdp_port", lambda *args: None)
-    monkeypatch.setattr(antidetect_client, "_cdp_call", fake_cdp_call)
-    monkeypatch.setattr(antidetect_client.asyncio, "sleep", fake_sleep)
-    monkeypatch.setattr("websockets.connect", lambda *args, **kwargs: FakeConnect())
-    return antidetect_client
-
-
-def _cdp_page_state(actor_names, actor_button=None, switch_button=None, comment_box=True):
-    return {
-        "url": "https://www.facebook.com/example/posts/1",
-        "accessState": "ok",
-        "actorNames": list(actor_names),
-        "actorButtonRect": actor_button,
-        "switchProfileButtonRect": switch_button,
-        "commentBoxRect": {"x": 10, "y": 20, "w": 200, "h": 30} if comment_box else None,
-        "commentBoxPlaceholder": "Bình luận dưới tên Page Mẫu",
-    }
-
-
-def test_cdp_comment_blocked_when_actor_not_confirmed(monkeypatch):
-    ad = _mock_cdp_environment(monkeypatch)
-    state = _cdp_page_state(["Nick Cá Nhân"])
-
-    async def fake_eval(ws, msg_id, expression, timeout=10.0):
-        return dict(state)
-
-    typed = []
-
-    async def fake_type(ws, msg_id, text, human_helper=None):
-        typed.append(text)
-        return msg_id + 1
-
-    monkeypatch.setattr(ad, "_cdp_eval", fake_eval)
-    monkeypatch.setattr(ad, "_human_type_and_submit_on_ws", fake_type)
-
-    res = ad.post_comment_cdp(
-        post_id="post_actor",
-        page_id="page_actor",
-        page_name="Page Mẫu",
-        page_url=None,
-        profile_id="prof_actor",
-        message="Xin chào",
+    monkeypatch.setattr(ad, "acquire_profile_cdp_port", must_not_launch)
+    result = ad.post_comment_cdp(
+        post_id="post_actor", page_id="page_actor", page_name=page_name,
+        page_url=None, profile_id="prof_actor", message="Xin chào",
     )
-
-    assert res["success"] is False
-    assert res["category"] == "INVALID_TARGET"
-    assert "tài khoản cá nhân" in res["error"]
-    assert typed == []
-
-
-def test_cdp_comment_sends_when_actor_confirmed(monkeypatch):
-    ad = _mock_cdp_environment(monkeypatch)
-    state = _cdp_page_state(["Page Mẫu"])
-    calls = {"evaluations": 0}
-    typed = []
-
-    async def fake_eval(ws, msg_id, expression, timeout=10.0):
-        calls["evaluations"] += 1
-        return dict(state) if calls["evaluations"] == 1 else {"found": True}
-
-    async def fake_click(ws, msg_id, x, y, human_helper=None):
-        return msg_id + 1
-
-    async def fake_type(ws, msg_id, text, human_helper=None):
-        typed.append(text)
-        return msg_id + 1
-
-    monkeypatch.setattr(ad, "_cdp_eval", fake_eval)
-    monkeypatch.setattr(ad, "_human_click_on_ws", fake_click)
-    monkeypatch.setattr(ad, "_human_type_and_submit_on_ws", fake_type)
-
-    res = ad.post_comment_cdp(
-        post_id="post_actor",
-        page_id="page_actor",
-        page_name="Page Mẫu",
-        page_url=None,
-        profile_id="prof_actor",
-        message="Xin chào",
-    )
-
-    assert res["success"] is True
-    assert typed == ["Xin chào"]
+    assert result["success"] is False
+    assert result["category"] == "INVALID_TARGET"
 
 
 def test_cdp_actor_name_matching_is_exact():
@@ -747,77 +656,6 @@ def test_cdp_actor_name_matching_is_exact():
 
     duplicate_options = options + [{"text": "page   mẫu", "x": 100, "y": 300}]
     assert len(ad._select_exact_actor_option(duplicate_options, "Page Mẫu")) == 2
-
-
-def test_cdp_comment_blocks_prefix_actor_name(monkeypatch):
-    ad = _mock_cdp_environment(monkeypatch)
-    state = _cdp_page_state(["Page Mẫu Outlet"])
-
-    async def fake_eval(ws, msg_id, expression, timeout=10.0):
-        return dict(state)
-
-    async def fake_type(ws, msg_id, text, human_helper=None):
-        raise AssertionError("must never type when actor name only matches as a prefix")
-
-    monkeypatch.setattr(ad, "_cdp_eval", fake_eval)
-    monkeypatch.setattr(ad, "_human_type_and_submit_on_ws", fake_type)
-
-    res = ad.post_comment_cdp(
-        post_id="post_prefix",
-        page_id="page_actor",
-        page_name="Page Mẫu",
-        page_url=None,
-        profile_id="prof_actor",
-        message="Xin chào",
-    )
-
-    assert res["success"] is False
-    assert res["category"] == "INVALID_TARGET"
-    assert "Page khác" in res["error"]
-
-
-def test_cdp_comment_blocks_ambiguous_actor_menu(monkeypatch):
-    ad = _mock_cdp_environment(monkeypatch)
-    state = _cdp_page_state(["Nick Cá Nhân"], actor_button={"x": 5, "y": 6})
-    menu_options = [
-        {"text": "Page Mẫu", "x": 100, "y": 200},
-        {"text": "Page Mẫu", "x": 100, "y": 320},
-    ]
-    calls = {"evaluations": 0}
-    typed = []
-
-    async def fake_eval(ws, msg_id, expression, timeout=10.0):
-        calls["evaluations"] += 1
-        if calls["evaluations"] == 1:
-            return dict(state)
-        if calls["evaluations"] == 2:
-            return list(menu_options)
-        return dict(state)
-
-    async def fake_click(ws, msg_id, x, y, human_helper=None):
-        return msg_id + 1
-
-    async def fake_type(ws, msg_id, text, human_helper=None):
-        typed.append(text)
-        return msg_id + 1
-
-    monkeypatch.setattr(ad, "_cdp_eval", fake_eval)
-    monkeypatch.setattr(ad, "_human_click_on_ws", fake_click)
-    monkeypatch.setattr(ad, "_human_type_and_submit_on_ws", fake_type)
-
-    res = ad.post_comment_cdp(
-        post_id="post_ambiguous",
-        page_id="page_actor",
-        page_name="Page Mẫu",
-        page_url=None,
-        profile_id="prof_actor",
-        message="Xin chào",
-    )
-
-    assert res["success"] is False
-    assert res["category"] == "INVALID_TARGET"
-    assert "trùng" in res["error"]
-    assert typed == []
 
 
 def test_comment_sheet_blocks_missing_pages_without_changing_opt_in():

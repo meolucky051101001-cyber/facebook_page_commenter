@@ -7,9 +7,8 @@ Safety & Integrity Guarantees (per Antidetect Python HANDOFF.md):
 2. Respects browser ownership: if a profile is already open in Antidetect Python,
    this module only opens a transient CDP tab (`/json/new?about%3Ablank`), performs
    the scan/comment, and closes the transient tab — NEVER closing the user's browser.
-3. Uses CDP Input domain (`Input.dispatchMouseEvent`, `Input.dispatchKeyEvent`,
-   `Input.insertText`) with Bezier mouse trajectories and lognormal keystroke delays
-   from `antidetect.human.HumanInput` — zero JS injection on the page.
+3. Uses DOM evidence to verify numeric Page and post identity before CDP input.
+   Unknown layouts fail closed; uncertain submissions are never retried automatically.
 """
 import asyncio
 import csv
@@ -21,9 +20,10 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from contextlib import contextmanager
 
 import config
 import database as db
@@ -32,6 +32,24 @@ import meta_client
 _BRIDGE_LOCK = threading.RLock()
 _INPROC_MANAGER = None
 _INPROC_LAUNCHER = None
+_PROFILE_OPERATION_LOCKS = {}
+_OWNED_PROFILE_LEASES = {}
+
+
+class BrowserAutomationError(RuntimeError):
+    """A browser failure with an explicit dispatch category and connection status."""
+
+    def __init__(self, message, category="INVALID_TARGET", browser_status="ERROR"):
+        super().__init__(message)
+        self.category = category
+        self.browser_status = browser_status
+        self.status = browser_status
+        self.message = message
+
+    def as_result(self):
+        return {"success": False, "comment_id": None, "category": self.category,
+                "error": self.message, "browser_status": self.browser_status,
+                "mode": "ANTIDETECT_CDP", "usage_pct": None}
 
 
 def get_antidetect_dir() -> Path:
@@ -309,7 +327,8 @@ def export_all_pages_to_csv_templates() -> None:
 def _get_running_antidetect_server() -> Optional[Tuple[int, str]]:
     """
     Checks if Antidetect Python's FastAPI server (`run.py`) is currently running.
-    Returns `(server_port, access_key)` if available and healthy, else `None`.
+    Returns `(server_port, access_key)` when healthy. A recorded but unhealthy
+    server is an error: launching another owner would risk the user's profile.
     """
     ad_dir = get_antidetect_dir()
     pid_file = ad_dir / "data" / "server.pid"
@@ -327,20 +346,42 @@ def _get_running_antidetect_server() -> Optional[Tuple[int, str]]:
         )
         with urllib.request.urlopen(req, timeout=1.0) as resp:
             if resp.status != 200:
-                return None
+                raise BrowserAutomationError("Máy chủ Antidetect có bản ghi nhưng chưa sẵn sàng.", "NETWORK_RETRYABLE")
             health = json.loads(resp.read().decode("utf-8"))
             if health.get("application") != "antidetect-python":
-                return None
+                raise BrowserAutomationError("Cổng máy chủ Antidetect đang do ứng dụng khác sử dụng.", "NETWORK_RETRYABLE")
 
-        if _ensure_antidetect_sys_path():
-            from antidetect.runtime_auth import read_runtime
-            rec = read_runtime() or {}
-            access_key = rec.get("access_key")
-            if access_key:
-                return port, str(access_key)
-    except Exception:
-        return None
-    return None
+        try:
+            if _ensure_antidetect_sys_path():
+                from antidetect.runtime_auth import read_runtime
+                rec = read_runtime() or {}
+                access_key = rec.get("access_key")
+                if access_key:
+                    return port, str(access_key)
+        except Exception as exc:
+            raise BrowserAutomationError("Máy chủ Antidetect đang chạy nhưng không đọc được quyền truy cập.", "NETWORK_RETRYABLE") from exc
+        raise BrowserAutomationError("Máy chủ Antidetect đang chạy nhưng thiếu quyền truy cập.", "NETWORK_RETRYABLE")
+    except BrowserAutomationError:
+        raise
+    except Exception as exc:
+        raise BrowserAutomationError("Có bản ghi máy chủ Antidetect nhưng chưa xác minh được trạng thái. Hãy mở lại Antidetect rồi thử lại.", "NETWORK_RETRYABLE") from exc
+
+
+def _remember_owned_launch(profile_id, port, result):
+    """Only a positive launch acknowledgement establishes ownership."""
+    if result.get("launched_now") is not True:
+        return False
+    health = result.get("cdp_health") or {}
+    launch_id = result.get("launch_id") or health.get("launch_id")
+    owner = result.get("owner_instance") or health.get("owner_instance")
+    if launch_id:
+        _OWNED_PROFILE_LEASES[profile_id] = {
+            "port": int(port), "launch_id": str(launch_id),
+            "owner_instance": str(owner) if owner else None,
+        }
+    # Without an immutable launch id the tab is usable, but the browser must
+    # remain open because cleanup cannot prove ownership of its current session.
+    return bool(launch_id)
 
 
 def _get_inproc_launcher():
@@ -384,7 +425,7 @@ def acquire_profile_cdp_port(profile_id: str) -> Tuple[int, bool, Optional[int]]
             srv_port, access_key = srv
             try:
                 req = urllib.request.Request(
-                    f"http://127.0.0.1:{srv_port}/api/profiles/{profile_id}/start",
+                    f"http://127.0.0.1:{srv_port}/api/profiles/{urllib.parse.quote(profile_id, safe='')}/start",
                     data=b"{}",
                     headers={
                         "Content-Type": "application/json",
@@ -395,11 +436,13 @@ def acquire_profile_cdp_port(profile_id: str) -> Tuple[int, bool, Optional[int]]
                 with urllib.request.urlopen(req, timeout=25.0) as resp:
                     res = json.loads(resp.read().decode("utf-8"))
                     port = res.get("port")
-                    already = bool(res.get("already_running"))
-                    if _probe_cdp_port(port):
-                        return int(port), (not already), srv_port
-            except Exception:
-                pass
+                    if res.get("success") is True and _probe_cdp_port(port):
+                        return int(port), _remember_owned_launch(profile_id, port, res), srv_port
+                    raise BrowserAutomationError("Antidetect đã nhận yêu cầu nhưng cổng CDP không sẵn sàng.", "NETWORK_RETRYABLE")
+            except BrowserAutomationError:
+                raise
+            except Exception as exc:
+                raise BrowserAutomationError("Máy chủ Antidetect từ chối hoặc không hoàn tất mở profile.", "NETWORK_RETRYABLE") from exc
 
         # 4. Launch in-process via BrowserLauncher
         _, launcher = _get_inproc_launcher()
@@ -415,7 +458,7 @@ def acquire_profile_cdp_port(profile_id: str) -> Tuple[int, bool, Optional[int]]
         port = res.get("port") or launcher.active_ports.get(profile_id)
         if not _probe_cdp_port(port):
             raise RuntimeError(f"Profile {profile_id} đã mở nhưng cổng CDP ({port}) không phản hồi.")
-        return int(port), True, None
+        return int(port), _remember_owned_launch(profile_id, port, res), None
 
 
 def release_profile_cdp_port(profile_id: str, opened_by_us: bool, srv_port: Optional[int] = None) -> None:
@@ -423,16 +466,28 @@ def release_profile_cdp_port(profile_id: str, opened_by_us: bool, srv_port: Opti
     Stops the profile ONLY if `opened_by_us` is True and `config.ANTIDETECT_AUTO_CLOSE_BROWSER` is True.
     Never closes a profile that the user had opened manually!
     """
-    if not opened_by_us or not config.ANTIDETECT_AUTO_CLOSE_BROWSER:
+    if not opened_by_us:
         return
     with _BRIDGE_LOCK:
+        lease = _OWNED_PROFILE_LEASES.pop(profile_id, None)
+        if not lease or not config.ANTIDETECT_AUTO_CLOSE_BROWSER:
+            return
+        current = _read_runtime_readonly().get(profile_id) or {}
+        if current.get("launch_id") != lease["launch_id"] or current.get("port") != lease["port"]:
+            return
+        if lease["owner_instance"] and current.get("owner_instance") != lease["owner_instance"]:
+            return
         if srv_port is not None:
-            srv = _get_running_antidetect_server()
-            if srv is not None:
+            try:
+                srv = _get_running_antidetect_server()
+            except Exception:
+                srv = None
+            if srv is not None and srv[0] == srv_port:
                 _, access_key = srv
                 try:
                     req = urllib.request.Request(
-                        f"http://127.0.0.1:{srv_port}/api/profiles/{profile_id}/stop",
+                        f"http://127.0.0.1:{srv_port}/api/profiles/{urllib.parse.quote(profile_id, safe='')}/stop/owned?" +
+                        urllib.parse.urlencode({"expected_launch_id": lease["launch_id"]}),
                         data=b"{}",
                         headers={
                             "Content-Type": "application/json",
@@ -444,9 +499,12 @@ def release_profile_cdp_port(profile_id: str, opened_by_us: bool, srv_port: Opti
                         return
                 except Exception:
                     pass
+            # This browser belongs to the server, never stop an unrelated launcher.
+            return
         if _INPROC_LAUNCHER is not None:
             try:
-                _INPROC_LAUNCHER.stop(profile_id)
+                _INPROC_LAUNCHER.stop(profile_id, expected_launch_id=lease["launch_id"],
+                                      expected_owner_instance=lease["owner_instance"])
             except Exception:
                 pass
 
@@ -526,6 +584,8 @@ async def _cdp_call(ws, msg_id: int, method: str, params: Optional[Dict[str, Any
         raw = await asyncio.wait_for(ws.recv(), timeout=rem)
         msg = json.loads(raw)
         if msg.get("id") == msg_id:
+            if msg.get("error"):
+                raise RuntimeError(f"CDP {method} failed: {msg['error'].get('message', 'protocol error')}")
             return msg
     raise TimeoutError(f"CDP call {method} timed out after {timeout}s")
 
@@ -543,722 +603,579 @@ async def _cdp_eval(ws, msg_id: int, expression: str, timeout: float = 10.0) -> 
     return ((res.get("result") or {}).get("result") or {}).get("value")
 
 
-# ============================================================================
-# 1. SCAN RECENT POSTS OF A FANPAGE VIA CDP
-# ============================================================================
-
-_SCAN_POSTS_JS = r"""
-(() => {
-    const out = {
-        url: location.href,
-        accessState: 'ok',
-        posts: []
-    };
-    const pathLower = String(location.pathname || '').toLowerCase();
-    if (pathLower.startsWith('/checkpoint')) {
-        out.accessState = 'checkpoint';
-        return out;
+# DOM evidence is restricted to rendered controls and the selected post. No
+# cookies, credentials, private endpoints, or application internals are read.
+_BROWSER_EVIDENCE_JS = r"""
+((expectedPost, message) => {
+  const out = {url: location.href, accessState: 'ok', actorIds: [],
+    actorOptions: [], actorButtonRect: null, posts: [], comments: [],
+    commentIds: [], commentBoxRect: null, commentBoxText: '', focused: false};
+  if (/^\/(checkpoint|two_step_verification|recover)(\/|$)/i.test(location.pathname)) {
+    out.accessState = 'checkpoint'; return out;
+  }
+  if (/^\/(login|login.php)(\/|$)/i.test(location.pathname) ||
+      (document.querySelector('input[name="email"]') && document.querySelector('input[name="pass"]'))) {
+    out.accessState = 'login_required'; return out;
+  }
+  const num = x => /^\d+$/.test(String(x || '')) ? String(x) : '';
+  const norm = s => String(s || '').replace(/\r\n/g, '\n').replace(/\s+/g, ' ').trim();
+  const visible = el => { const r = el.getBoundingClientRect();
+    return r.width > 2 && r.height > 2 && getComputedStyle(el).visibility !== 'hidden'; };
+  const rect = el => { if (!el || !visible(el)) return null;
+    const r = el.getBoundingClientRect(); return {x:r.left+r.width/2,y:r.top+r.height/2}; };
+  const url = s => { try { const u = new URL(s, location.href);
+    if (u.protocol !== 'https:' || !['facebook.com','www.facebook.com','m.facebook.com'].includes(u.hostname)
+        || u.username || u.password || (u.port && u.port !== '443')) return null;
+    return u;
+  } catch (_) { return null; } };
+  const profile = s => { const u = url(s); if (!u) return '';
+    return /^\/(?:profile.php)?\/?$/.test(u.pathname) ? num(u.searchParams.get('id'))
+      : (/^\/(\d+)\/?$/.exec(u.pathname) || [])[1] || ''; };
+  const post = s => { const u = url(s); if (!u) return null;
+    if (u.searchParams.has('comment_id') || u.searchParams.has('reply_comment_id')) return null;
+    const m = /^\/(\d+|[^/]+)\/posts\/(\d+)\/?$/.exec(u.pathname);
+    const story = num(u.searchParams.get('story_fbid'));
+    const v = /^\/(?:[^/]+\/)?(?:videos|reel)\/(\d+)\/?$/.exec(u.pathname);
+    const id = story || (m && m[2]) || (v && v[1]);
+    return id ? {id, owner: story ? num(u.searchParams.get('id')) : (m ? num(m[1]) : ''), url:u.href} : null;
+  };
+  const identity = el => { const ids = new Set();
+    for (const n of [el, ...el.querySelectorAll('[data-actor-id],[data-profile-id],a[href]')]) {
+      const id = num(n.getAttribute('data-actor-id')) || num(n.getAttribute('data-profile-id')) ||
+        (n.matches('a[href]') && profile(n.href));
+      if (id) ids.add(id);
     }
-    if (pathLower.startsWith('/login') || (document.querySelector('input[name="email"]') && document.querySelector('input[name="pass"]'))) {
-        out.accessState = 'login_required';
-        return out;
+    return [...ids];
+  };
+  const ownLinks = art => [...art.querySelectorAll('a[href]')].filter(a => a.closest('[role="article"]') === art);
+  const targets = new Set();
+  for (const art of document.querySelectorAll('[role="article"]')) {
+    if (art.parentElement.closest('[role="article"]')) continue;
+    const links = ownLinks(art);
+    for (const a of links) {
+      const p = post(a.href); if (!p) continue;
+      const owners = new Set(p.owner ? [p.owner] : []);
+      const pageAttr = num(art.getAttribute('data-page-id')); if (pageAttr) owners.add(pageAttr);
+      for (const head of art.querySelectorAll('h2 a[href],h3 a[href]')) {
+        if (head.closest('[role="article"]') !== art) continue;
+        const id = profile(head.href); if (id) owners.add(id);
+      }
+      const timeEl = a.matches('time[datetime],abbr[data-utime]') ? a :
+        a.querySelector('time[datetime],abbr[data-utime]');
+      const absoluteTime = a.getAttribute('data-utime') || (timeEl &&
+        (timeEl.getAttribute('data-utime') || timeEl.getAttribute('datetime')));
+      out.posts.push({id:p.id, ownerIds:[...owners], url:p.url, created_time:absoluteTime || null});
+      if (p.id === expectedPost) targets.add(art);
     }
-
-    const PINNED = /(?:^|\n)\s*(?:bài viết đã ghim|đã ghim|pinned post|pinned)\b/i;
-    const PROMOTED = /(?:^|\n)\s*(?:được tài trợ|sponsored)\b/i;
-    const RXS = [
-        [/^(?:vừa xong|just now|now)$/i, 'now'],
-        [/^(\d+)\s*(?:phút|phut|p|m|min|mins|minute|minutes)(?:\s*trước|\s*ago)?$/i, 'm'],
-        [/^(\d+)\s*(?:giờ|gio|g|h|hr|hrs|hour|hours)(?:\s*trước|\s*ago)?$/i, 'h'],
-        [/^(\d+)\s*(?:ngày|ngay|d|day|days)(?:\s*trước|\s*ago)?$/i, 'd']
-    ];
-
-    const articles = Array.from(document.querySelectorAll('div[role="article"]'));
-    const seenUrls = new Set();
-
-    for (const art of articles) {
-        if (out.posts.length >= 10) break;
-        if (art.parentElement && art.parentElement.closest('div[role="article"]')) continue;
-        const headText = (art.innerText || '').trim().slice(0, 260);
-        if (PINNED.test(headText) || PROMOTED.test(headText)) continue;
-
-        const links = Array.from(art.querySelectorAll('a[href]'));
-        let bestLink = null;
-        let ageUnit = null;
-        let ageVal = null;
-        let rawLabel = null;
-
-        for (const a of links) {
-            const href = a.href || '';
-            if (!href || href.includes('comment_id=') || href.includes('reply_comment_id=')) continue;
-            const label = (a.getAttribute('aria-label') || a.textContent || '').trim().replace(/\s+/g, ' ');
-            const isPostUrl = /\/posts\/|\/permalink\.php|\/videos\/|\/reel\/|\/photos\/|story_fbid=|fbid=/.test(href);
-
-            if (label && label.length <= 45) {
-                for (const [rx, u] of RXS) {
-                    const m = label.match(rx);
-                    if (m) {
-                        ageVal = (u === 'now') ? 0 : parseInt(m[1], 10);
-                        ageUnit = u;
-                        rawLabel = label;
-                        if (isPostUrl) bestLink = href.split('#')[0];
-                        break;
-                    }
-                }
-            }
-            if (!bestLink && isPostUrl) {
-                bestLink = href.split('#')[0];
-            }
-        }
-
-        if (bestLink && ageUnit !== null && !seenUrls.has(bestLink)) {
-            seenUrls.add(bestLink);
-            out.posts.push({
-                url: bestLink,
-                ageVal: ageVal,
-                ageUnit: ageUnit,
-                rawLabel: rawLabel
-            });
-        }
+  }
+  // A composer must belong to exactly this post, not a suggested post or reply.
+  const target = targets.size === 1 ? [...targets][0] : null;
+  let box = null;
+  if (target) {
+    const boxes = [...target.querySelectorAll('[contenteditable="true"][role="textbox"]')].filter(b => {
+      const label = b.getAttribute('aria-label') || b.getAttribute('aria-placeholder') || '';
+      return visible(b) && b.closest('[role="article"]') === target && /bình luận|comment/i.test(label) &&
+        !/trả lời|reply/i.test(label);
+    });
+    if (boxes.length === 1) box = boxes[0];
+  }
+  const scope = target || document.querySelector('[role="main"]') || document;
+  // Only explicitly labelled actor controls contribute identities.
+  // Author links and generic selected menu entries never identify the sender.
+  const marker = /đang tương tác dưới tên|bình luận (dưới tên|với tư cách)|commenting as|comment as|interacting as/i;
+  const actorIds = new Set();
+  for (const control of scope.querySelectorAll('[role="button"],button,[role="status"]')) {
+    if (!visible(control)) continue;
+    const label = control.getAttribute('aria-label') || control.textContent || '';
+    if (!marker.test(label)) continue;
+    for (const id of identity(control)) actorIds.add(id);
+    if (!out.actorButtonRect) out.actorButtonRect = rect(control);
+  }
+  if (box) {
+    for (const attr of ['data-actor-id','data-profile-id']) {
+      const id = num(box.getAttribute(attr)); if (id) actorIds.add(id);
     }
-    return out;
-})()
-"""
-
-
-def _extract_post_id_from_permalink(url: str, page_id: str) -> Optional[str]:
-    clean = (url or "").strip()
-    if not clean:
-        return None
-    sub_id = meta_client.extract_post_id_from_input(clean, page_id)
-    if sub_id:
-        return sub_id
-    return None
-
-
-def get_recent_posts_cdp(
-    page_id: str,
-    page_url: Optional[str],
-    profile_id: str,
-    since_timestamp: Optional[str] = None,
-    limit: int = 5,
-) -> List[Dict[str, Any]]:
-    """
-    Opens a transient CDP tab on `profile_id`, navigates to the Fanpage URL,
-    and extracts recent posts published on the Page.
-    """
-    target_url = (page_url or "").strip() or f"https://www.facebook.com/{page_id}"
-
-    async def _run() -> List[Dict[str, Any]]:
-        import websockets
-        port, opened_by_us, srv_port = acquire_profile_cdp_port(profile_id)
-        target_id = ""
-        try:
-            target_id, ws_url = _open_transient_tab(port)
-            async with websockets.connect(ws_url, open_timeout=5, max_size=10 * 1024 * 1024) as ws:
-                msg_id = 100
-                msg_id += 1
-                await _cdp_call(ws, msg_id, "Page.navigate", {"url": target_url})
-                await asyncio.sleep(3.5)
-
-                # Scroll slightly to trigger feed rendering
-                msg_id += 1
-                await _cdp_eval(ws, msg_id, "window.scrollBy(0, 500); true;")
-                await asyncio.sleep(1.5)
-
-                msg_id += 1
-                data = await _cdp_eval(ws, msg_id, _SCAN_POSTS_JS)
-                if not isinstance(data, dict):
-                    return []
-
-                access = data.get("accessState")
-                if access in ("login_required", "checkpoint"):
-                    raise meta_client.MetaAPIError(
-                        f"Profile Antidetect bị mất đăng nhập hoặc checkpoint ({access}).",
-                        code=190,
-                        category="TOKEN_EXPIRED",
-                    )
-
-                now_utc = datetime.now(timezone.utc)
-                results = []
-                for item in (data.get("posts") or [])[:limit]:
-                    p_url = item.get("url")
-                    u = item.get("ageUnit")
-                    val = int(item.get("ageVal") or 0)
-                    if u == "now":
-                        created_dt = now_utc
-                    elif u == "m":
-                        created_dt = now_utc - timedelta(minutes=val)
-                    elif u == "h":
-                        created_dt = now_utc - timedelta(hours=val)
-                    elif u == "d":
-                        created_dt = now_utc - timedelta(days=val)
-                    else:
-                        continue
-
-                    post_id = _extract_post_id_from_permalink(p_url, page_id)
-                    if not post_id:
-                        continue
-                    results.append({
-                        "id": post_id,
-                        "created_time": created_dt.isoformat(),
-                        "permalink_url": p_url,
-                    })
-                return results
-        finally:
-            if target_id:
-                _close_transient_tab(port, target_id)
-            release_profile_cdp_port(profile_id, opened_by_us, srv_port)
-
-    return asyncio.run(_run())
-
-
-# ============================================================================
-# 2. POST COMMENT AS FANPAGE VIA CDP + HUMAN INPUT
-# ============================================================================
-
-def build_facebook_post_url(page_id: str, post_id: str, page_url: Optional[str] = None, post_url: Optional[str] = None) -> str:
-    """Constructs a navigable Facebook URL for a post_id."""
-    if post_url and post_url.startswith("http"):
-        return post_url
-    raw = (post_id or "").strip()
-    if raw.startswith("http://") or raw.startswith("https://"):
-        return raw
-    sub_id = raw
-    if "_" in raw:
-        parts = raw.split("_", 1)
-        if parts[0].isdigit():
-            page_id = parts[0]
-            sub_id = parts[1]
-    if sub_id.startswith("pfbid"):
-        return f"https://www.facebook.com/{page_id}/posts/{sub_id}"
-    return f"https://www.facebook.com/permalink.php?story_fbid={sub_id}&id={page_id}"
-
-
-_INSPECT_POST_AND_ACTOR_JS = r"""
-((expectedPageName) => {
-    const out = {
-        url: location.href,
-        accessState: 'ok',
-        actorNames: [],
-        actorButtonRect: null,
-        switchProfileButtonRect: null,
-        commentBoxRect: null,
-        commentBoxPlaceholder: ''
-    };
-    const pathLower = String(location.pathname || '').toLowerCase();
-    if (pathLower.startsWith('/checkpoint')) {
-        out.accessState = 'checkpoint';
-        return out;
+    out.commentBoxRect = rect(box); out.commentBoxText = box.innerText || '';
+    out.focused = document.activeElement === box || box.contains(document.activeElement);
+  }
+  for (const option of document.querySelectorAll('[role="menuitem"],[role="menuitemradio"],[role="option"]')) {
+    if (!visible(option)) continue;
+    const ids = identity(option);
+    if (ids.length !== 1) continue;
+    out.actorOptions.push({id:ids[0], ...rect(option)});
+  }
+  out.actorIds = [...actorIds];
+  if (target) for (const link of target.querySelectorAll('a[href]')) {
+    const u = url(link.href); if (!u) continue;
+    const cid = num(u.searchParams.get('comment_id'));
+    if (!cid || u.searchParams.has('reply_comment_id')) continue;
+    const parentURL = new URL(u.href);
+    parentURL.searchParams.delete('comment_id');
+    const parentPost = post(parentURL.href);
+    if (!parentPost || parentPost.id !== expectedPost) continue;
+    const container = link.closest('[role="article"]');
+    if (!container || container === target || !visible(container)) continue;
+    if (container.parentElement.closest('[role="article"]') !== target) continue;
+    out.commentIds.push(cid);
+    const texts = [...container.querySelectorAll('[dir="auto"]')].filter(el =>
+      el.closest('[role="article"]') === container && !el.closest('[contenteditable="true"]'));
+    const body = texts.find(el => norm(el.innerText || el.textContent) === norm(message));
+    const authors = new Set();
+    for (const author of ownLinks(container)) {
+      // The author link precedes the comment body; arbitrary links in its text
+      // cannot establish the identity of the author.
+      const beforeBody = body && (author.compareDocumentPosition(body) & Node.DOCUMENT_POSITION_FOLLOWING) && !author.contains(body);
+      if (!author.closest('h3,h4,[role="heading"]') && !beforeBody) continue;
+      const id = profile(author.href); if (id) authors.add(id);
     }
-    if (pathLower.startsWith('/login') || (document.querySelector('input[name="email"]') && document.querySelector('input[name="pass"]'))) {
-        out.accessState = 'login_required';
-        return out;
+    if (body) {
+      out.comments.push({id:cid, authorIds:[...authors], text:message});
     }
-
-    const norm = (s) => String(s || '')
-        .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
-        .toLowerCase()
-        .replace(/\s+/g, ' ')
-        .trim();
-
-    const targetName = norm(expectedPageName);
-
-    const markers = [
-        'đang tương tác dưới tên ',
-        'bình luận dưới tên ',
-        'bình luận với tư cách ',
-        'viết bình luận dưới tên ',
-        'bình luận bằng tài khoản ',
-        'interacting as ',
-        'commenting as ',
-        'comment as ',
-        'posting as ',
-        'writing as ',
-    ];
-
-    // Extracts the actor name that follows a known "acting as ..." phrase.
-    // Returns '' when no phrase is present so callers cannot guess an identity.
-    const extractActor = (raw) => {
-        const text = norm(raw);
-        if (!text) return '';
-        let bestIndex = -1;
-        let bestMarker = '';
-        for (const marker of markers) {
-            const idx = text.indexOf(marker);
-            if (idx >= 0 && (bestIndex === -1 || idx < bestIndex)) {
-                bestIndex = idx;
-                bestMarker = marker;
-            }
-        }
-        if (bestIndex === -1) return '';
-        let rest = text.slice(bestIndex + bestMarker.length);
-        rest = rest.split(/[.!?·|\n]/)[0];
-        rest = rest.replace(/(nhấn|bấm|click|tap)\s+(để\s+)?(thay đổi|chuyển|đổi).*$/, '');
-        rest = rest.replace(/^(là|as)\s+/, '');
-        rest = rest.replace(/^["'“”‘’]+|["'“”‘’]+$/g, '').trim();
-        return rest;
-    };
-
-    const addActor = (raw) => {
-        const actor = extractActor(raw);
-        if (actor && !out.actorNames.includes(actor)) {
-            out.actorNames.push(actor);
-        }
-    };
-
-    const rectOf = (el, allowScroll) => {
-        if (!el) return null;
-        if (allowScroll !== false) el.scrollIntoView({block: 'center', inline: 'center'});
-        const r = el.getBoundingClientRect();
-        if (r.width <= 2 || r.height <= 2) return null;
-        return {
-            x: Math.round(r.left + r.width / 2),
-            y: Math.round(r.top + r.height / 2),
-            w: Math.round(r.width),
-            h: Math.round(r.height)
-        };
-    };
-
-    // 1. Comment textbox: its aria-label is the most reliable actor hint.
-    const boxes = Array.from(document.querySelectorAll('div[contenteditable="true"][role="textbox"]'));
-    let targetBox = null;
-    for (const b of boxes) {
-        const label = norm(b.getAttribute('aria-label') || b.getAttribute('aria-placeholder') || b.getAttribute('data-placeholder') || '');
-        if (label.includes('bình luận') || label.includes('comment') || label.includes('trả lời') || label.includes('reply')) {
-            targetBox = b;
-            out.commentBoxPlaceholder = label;
-            addActor(label);
-            break;
-        }
-    }
-    if (!targetBox && boxes.length > 0) {
-        targetBox = boxes[0];
-        out.commentBoxPlaceholder = norm(targetBox.getAttribute('aria-label') || '');
-        addActor(out.commentBoxPlaceholder);
-    }
-    if (targetBox) {
-        out.commentBoxRect = rectOf(targetBox);
-    }
-
-    // 2. Inline actor switcher controls. Only control elements and live regions are
-    // inspected; user-written comment text never contributes an actor name.
-    for (const btn of Array.from(document.querySelectorAll('[role="button"], button'))) {
-        const aria = norm(btn.getAttribute('aria-label') || '');
-        const text = norm(btn.innerText || btn.textContent || '');
-        const looksLikeActorControl = (
-            aria.includes('tư cách') ||
-            aria.includes('đang tương tác') ||
-            aria.includes('bình luận dưới tên') ||
-            aria.includes('bình luận với tư cách') ||
-            aria.includes('comment as') ||
-            aria.includes('commenting as') ||
-            aria.includes('interacting as') ||
-            aria.includes('chọn người bình luận') ||
-            text.includes('đang tương tác dưới tên') ||
-            text.includes('bình luận dưới tên')
-        );
-        if (!looksLikeActorControl) continue;
-        addActor(aria);
-        addActor(text);
-        if (!out.actorButtonRect) {
-            out.actorButtonRect = rectOf(btn, false);
-        }
-    }
-    for (const region of Array.from(document.querySelectorAll('[role="status"], [aria-live]'))) {
-        addActor(region.innerText || region.textContent || '');
-    }
-
-    // 3. Page-level "Chuyển ngay" / "Switch Now" button, only when the exact target
-    // Page name is not confirmed yet and it follows "chuyển sang" / "switch to".
-    const confirmedTarget = targetName && out.actorNames.some((name) => name === targetName);
-    if (!confirmedTarget) {
-        for (const btn of Array.from(document.querySelectorAll('[role="button"], button'))) {
-            const txt = norm(btn.getAttribute('aria-label') || btn.textContent || '');
-            const isGenericSwitch = txt === 'chuyển ngay' || txt === 'switch now' || txt === 'chuyển sang trang';
-            const isTargetSwitch = targetName && (
-                txt === 'chuyển sang ' + targetName ||
-                txt === 'switch to ' + targetName
-            );
-            if (isGenericSwitch || isTargetSwitch) {
-                const rc = rectOf(btn);
-                if (rc) {
-                    out.switchProfileButtonRect = rc;
-                    break;
-                }
-            }
-        }
-    }
-
-    return out;
-})
-"""
-
-_FIND_ACTOR_MENU_OPTION_JS = r"""
-(() => {
-    const norm = (s) => String(s || '')
-        .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
-        .toLowerCase()
-        .replace(/\s+/g, ' ')
-        .trim();
-
-    const markers = [
-        'đang tương tác dưới tên ',
-        'bình luận dưới tên ',
-        'bình luận với tư cách ',
-        'viết bình luận dưới tên ',
-        'bình luận bằng tài khoản ',
-        'interacting as ',
-        'commenting as ',
-        'comment as ',
-        'posting as ',
-        'writing as ',
-    ];
-
-    const labelOf = (el) => {
-        const raw = String(el.innerText || el.textContent || el.getAttribute('aria-label') || '');
-        const text = norm(raw);
-        let bestIndex = -1;
-        let bestMarker = '';
-        for (const marker of markers) {
-            const idx = text.indexOf(marker);
-            if (idx >= 0 && (bestIndex === -1 || idx < bestIndex)) {
-                bestIndex = idx;
-                bestMarker = marker;
-            }
-        }
-        let label = '';
-        if (bestIndex >= 0) {
-            label = text.slice(bestIndex + bestMarker.length).split(/[.!?·|\n]/)[0];
-            label = label.replace(/(nhấn|bấm|click|tap)\s+(để\s+)?(thay đổi|chuyển|đổi).*$/, '');
-        } else {
-            label = norm(raw.split('\n').find((line) => norm(line)) || '');
-        }
-        return label.replace(/^["'“”‘’]+|["'“”‘’]+$/g, '').trim();
-    };
-
-    const options = [];
-    const seenRects = new Set();
-    for (const el of Array.from(document.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="option"]'))) {
-        const r = el.getBoundingClientRect();
-        if (r.width <= 4 || r.height <= 4) continue;
-        const key = Math.round(r.left / 10) + ':' + Math.round(r.top / 10);
-        if (seenRects.has(key)) continue;
-        seenRects.add(key);
-        options.push({
-            text: labelOf(el),
-            x: Math.round(r.left + r.width / 2),
-            y: Math.round(r.top + r.height / 2)
-        });
-    }
-    return options;
-})
-"""
-
-_VERIFY_COMMENT_APPEARED_JS = r"""
-((commentSnippet) => {
-    const norm = (s) => String(s || '').toLowerCase().trim().replace(/\s+/g, ' ');
-    const needle = norm(commentSnippet).slice(0, 40);
-    if (!needle) return {found: false};
-
-    // Check outside of contenteditable input boxes
-    const articles = Array.from(document.querySelectorAll('div[role="article"], ul li, div[dir="auto"]'));
-    for (const el of articles) {
-        if (el.isContentEditable || el.closest('[contenteditable="true"]')) continue;
-        const txt = norm(el.innerText || el.textContent || '');
-        if (txt.includes(needle)) {
-            return {found: true};
-        }
-    }
-    return {found: false};
+  }
+  out.commentIds = [...new Set(out.commentIds)];
+  return out;
 })
 """
 
 
-async def _human_click_on_ws(ws, msg_id: int, x: float, y: float, human_helper=None) -> int:
-    """Dispatches human-like Bezier mouse movement and press/release click on the given CDP WebSocket."""
-    if human_helper is not None:
-        fx, fy = human_helper.rng.uniform(40, 180), human_helper.rng.uniform(40, 180)
-        path = human_helper.mouse_path(fx, fy, x, y)
+def _numeric(value):
+    value = str(value or "").strip()
+    return value if re.fullmatch(r"[0-9]+", value) else None
+
+
+def _facebook_url(value):
+    value = str(value or "").strip()
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        valid = (parsed.scheme == "https" and parsed.hostname in
+                 {"facebook.com", "www.facebook.com", "m.facebook.com"} and
+                 not parsed.username and not parsed.password and parsed.port in (None, 443))
+    except ValueError:
+        valid = False
+    if not valid or any(ord(ch) < 32 or ch == "\\" for ch in value):
+        raise BrowserAutomationError("Chỉ hỗ trợ URL HTTPS của Facebook, không kèm tài khoản hoặc cổng lạ.")
+    return value
+
+
+def _post_identity(raw):
+    raw = str(raw or "").strip()
+    owner = None
+    if "://" in raw:
+        parsed = urllib.parse.urlsplit(_facebook_url(raw))
+        query = urllib.parse.parse_qs(parsed.query)
+        if query.get("comment_id") or query.get("reply_comment_id"):
+            raise BrowserAutomationError("Cần đường dẫn bài viết, không phải đường dẫn bình luận.")
+        candidates = query.get("story_fbid") or []
+        owner = _numeric((query.get("id") or [None])[0])
+        match = re.fullmatch(r"/([^/]+)/posts/([0-9]+)/?", parsed.path)
+        if match:
+            candidates.append(match.group(2))
+            owner = _numeric(match.group(1)) or owner
+        video = re.fullmatch(r"/(?:[^/]+/)?(?:videos|reel)/([0-9]+)/?", parsed.path)
+        if video:
+            candidates.append(video.group(1))
+        if len(set(candidates)) != 1 or not _numeric(candidates[0]):
+            raise BrowserAutomationError("Cần ID bài viết dạng số được Facebook xác nhận; liên kết rút gọn/pfbid chưa hỗ trợ.")
+        return owner, candidates[0]
+    if re.fullmatch(r"[0-9]+_[0-9]+", raw):
+        return tuple(raw.split("_", 1))
+    if _numeric(raw):
+        return None, raw
+    raise BrowserAutomationError("ID bài viết không hợp lệ hoặc chưa có ID dạng số.")
+
+
+def _page_context(page):
+    profile_id = str(page.get("antidetect_profile_id") or "").strip()
+    page_id = _numeric(page.get("page_id"))
+    identity_id = _numeric(page.get("fb_profile_id")) or page_id
+    if not profile_id or not page_id or not identity_id:
+        raise BrowserAutomationError("Page cần ID dạng số và liên kết profile Antidetect hợp lệ.")
+    try:
+        profiles = [p for p in _read_profiles_readonly() if str(p.get("id") or "") == profile_id]
+    except (OSError, ValueError, TypeError) as exc:
+        raise BrowserAutomationError("Không đọc được danh mục profile Antidetect.", "NETWORK_RETRYABLE") from exc
+    if len(profiles) != 1:
+        raise BrowserAutomationError("Không tìm thấy đúng một profile trong danh mục Antidetect.")
+    mapped = []
+    for item in profiles[0].get("facebook_pages") or []:
+        item_id = _numeric(item.get("id"))
+        if not item_id and item.get("url"):
+            parsed = urllib.parse.urlsplit(_facebook_url(item["url"]))
+            item_id = _numeric(parsed.path.strip("/")) or _numeric(
+                (urllib.parse.parse_qs(parsed.query).get("id") or [None])[0])
+        if item_id == identity_id:
+            mapped.append(item)
+    if len(mapped) != 1:
+        raise BrowserAutomationError("ID Page chưa được ánh xạ duy nhất vào profile Antidetect đã chọn.")
+    if page.get("page_url"):
+        _facebook_url(page["page_url"])
+    return {"profile_id": profile_id, "page_id": page_id, "identity_id": identity_id,
+            "allowed_ids": {page_id, identity_id}}
+
+
+def _check_mapping(page, expected):
+    current = _page_context(page)
+    if current != expected:
+        raise BrowserAutomationError("Ánh xạ Page/profile đã thay đổi; cần kiểm tra kết nối lại.")
+
+
+@contextmanager
+def _profile_operation(page):
+    context = _page_context(page)
+    with _BRIDGE_LOCK:
+        lock = _PROFILE_OPERATION_LOCKS.setdefault(context["profile_id"], threading.Lock())
+    if not lock.acquire(blocking=False):
+        raise BrowserAutomationError("Profile đang xử lý một thao tác khác.", "BROWSER_BUSY", "READY")
+    try:
+        _check_mapping(page, context)
+        yield context
+    finally:
+        lock.release()
+
+
+def build_facebook_post_url(page_id, post_id, page_url=None, post_url=None):
+    canonical = _numeric(page_id)
+    if not canonical:
+        raise BrowserAutomationError("Page ID phải là dạng số.")
+    owner, numeric_post = _post_identity(post_id)
+    if owner and owner != canonical:
+        raise BrowserAutomationError("ID bài viết thuộc Page khác.")
+    if page_url:
+        _facebook_url(page_url)
+    if post_url:
+        supplied_owner, supplied_post = _post_identity(post_url)
+        if supplied_post != numeric_post or (supplied_owner and supplied_owner != canonical):
+            raise BrowserAutomationError("Đường dẫn không khớp ID bài viết/Page.")
+        return _facebook_url(post_url)
+    if "://" in str(post_id):
+        return _facebook_url(post_id)
+    return f"https://www.facebook.com/permalink.php?story_fbid={numeric_post}&id={canonical}"
+
+
+def _target_post(context, post_id, post_url):
+    owner, numeric_post = _post_identity(post_id)
+    if owner and owner not in context["allowed_ids"]:
+        raise BrowserAutomationError("Bài viết không thuộc Page được cấu hình.")
+    url = post_url or (str(post_id) if "://" in str(post_id) else None)
+    if url:
+        supplied_owner, supplied_post = _post_identity(url)
+        if supplied_post != numeric_post or (supplied_owner and supplied_owner not in context["allowed_ids"]):
+            raise BrowserAutomationError("Đường dẫn bài viết không khớp Page/ID đã chọn.")
+        url = _facebook_url(url)
     else:
-        path = [(x, y)]
-
-    for px, py in path:
-        msg_id += 1
-        await _cdp_call(ws, msg_id, "Input.dispatchMouseEvent", {
-            "type": "mouseMoved",
-            "x": float(px),
-            "y": float(py),
-            "button": "none",
-            "pointerType": "mouse",
-        })
-        await asyncio.sleep(0.01)
-
-    msg_id += 1
-    await _cdp_call(ws, msg_id, "Input.dispatchMouseEvent", {
-        "type": "mousePressed",
-        "x": float(x),
-        "y": float(y),
-        "button": "left",
-        "buttons": 1,
-        "clickCount": 1,
-        "pointerType": "mouse",
-    })
-    await asyncio.sleep(0.08)
-    msg_id += 1
-    await _cdp_call(ws, msg_id, "Input.dispatchMouseEvent", {
-        "type": "mouseReleased",
-        "x": float(x),
-        "y": float(y),
-        "button": "left",
-        "buttons": 0,
-        "clickCount": 1,
-        "pointerType": "mouse",
-    })
-    return msg_id
+        url = f"https://www.facebook.com/permalink.php?story_fbid={numeric_post}&id={context['identity_id']}"
+    return numeric_post, url
 
 
-async def _human_type_and_submit_on_ws(ws, msg_id: int, text: str, human_helper=None) -> int:
-    """
-    Types Vietnamese/Unicode text with human flight delays via CDP Input domain
-    and presses Enter to submit the comment.
-    """
-    await asyncio.sleep(0.25)
-    # Type in natural small chunks/characters so React/Lexical editor state updates properly
-    for ch in text:
-        msg_id += 1
-        await _cdp_call(ws, msg_id, "Input.insertText", {"text": ch})
-        delay_s = (human_helper.key_delay_ms(ch) / 1000.0) if human_helper else 0.045
-        await asyncio.sleep(min(0.18, max(0.025, delay_s * 0.5)))
-
-    await asyncio.sleep(0.35)
-    # Press Enter to submit comment
-    msg_id += 1
-    await _cdp_call(ws, msg_id, "Input.dispatchKeyEvent", {
-        "type": "keyDown",
-        "key": "Enter",
-        "code": "Enter",
-        "text": "\r",
-        "unmodifiedText": "\r",
-        "windowsVirtualKeyCode": 13,
-        "nativeVirtualKeyCode": 13,
-    })
-    await asyncio.sleep(0.07)
-    msg_id += 1
-    await _cdp_call(ws, msg_id, "Input.dispatchKeyEvent", {
-        "type": "keyUp",
-        "key": "Enter",
-        "code": "Enter",
-        "windowsVirtualKeyCode": 13,
-        "nativeVirtualKeyCode": 13,
-    })
-    return msg_id
+def _timestamp(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, (int, float)) or re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", str(value)):
+            stamp = float(value)
+            if stamp > 10**11:
+                stamp /= 1000
+            result = datetime.fromtimestamp(stamp, timezone.utc)
+        else:
+            result = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if result.tzinfo is None or result.year < 2004:
+            return None
+        return result.astimezone(timezone.utc)
+    except (ValueError, TypeError, OSError, OverflowError):
+        return None
 
 
-def _normalize_actor_name(name: str) -> str:
-    text = (name or "").replace("\u200b", "").replace("\u200c", "").replace("\u200d", "").replace("\ufeff", "")
+def _validate_state(state):
+    if not isinstance(state, dict):
+        raise BrowserAutomationError("Không đọc được trang Facebook qua CDP.", "NETWORK_RETRYABLE")
+    access = state.get("accessState")
+    if access == "login_required":
+        raise BrowserAutomationError("Profile cần đăng nhập Facebook lại.", "TOKEN_EXPIRED", "LOGIN_REQUIRED")
+    if access == "checkpoint":
+        raise BrowserAutomationError("Profile đang ở bước xác minh Facebook.", "TOKEN_EXPIRED", "CHECKPOINT")
+    _facebook_url(state.get("url"))
+    if access != "ok":
+        raise BrowserAutomationError("Không xác định được trạng thái đăng nhập Facebook.")
+
+
+def _identity_matches(state, context):
+    ids = set(state.get("actorIds") or [])
+    return bool(ids) and ids <= context["allowed_ids"] and all(_numeric(i) for i in ids)
+
+
+def _verified_post(state, context, post_id, require_timestamp=False):
+    _validate_state(state)
+    route_owner, route_post = _post_identity(state["url"])
+    if route_post != post_id or (route_owner and route_owner not in context["allowed_ids"]):
+        raise BrowserAutomationError("Facebook đã chuyển sang bài viết khác.")
+    matches = [p for p in state.get("posts") or [] if str(p.get("id")) == post_id]
+    if not matches:
+        raise BrowserAutomationError("Không xác minh được bài viết đang hiển thị.")
+    valid = []
+    for item in matches:
+        owners = set(item.get("ownerIds") or [])
+        if not owners or not owners <= context["allowed_ids"]:
+            raise BrowserAutomationError("Không xác minh được ID chủ sở hữu bài viết đúng Page.")
+        owner, observed_post = _post_identity(item.get("url"))
+        if observed_post != post_id or (owner and owner not in context["allowed_ids"]):
+            raise BrowserAutomationError("Liên kết trong bài viết không khớp Page/ID.")
+        valid.append(item)
+    times = {_timestamp(p.get("created_time")) for p in valid} - {None}
+    if len(times) > 1:
+        raise BrowserAutomationError("Facebook trả về thời điểm bài viết không nhất quán.")
+    created = next(iter(times), None)
+    if require_timestamp and created is None:
+        raise BrowserAutomationError("Chưa đọc được thời điểm đăng chính xác của bài viết.")
+    return {"clean_post_id": f"{context['page_id']}_{post_id}",
+            "permalink_url": _facebook_url(valid[0]["url"]),
+            "created_time": created.isoformat() if created else None}
+
+
+class _BrowserSession:
+    def __init__(self, ws):
+        self.ws = ws
+        self.msg_id = 0
+
+    async def call(self, method, params=None):
+        self.msg_id += 1
+        response = await _cdp_call(self.ws, self.msg_id, method, params)
+        if response.get("error"):
+            raise RuntimeError("CDP không hoàn tất thao tác.")
+        return response
+
+    async def inspect(self, post_id="", message=""):
+        self.msg_id += 1
+        expression = f"{_BROWSER_EVIDENCE_JS}({json.dumps(post_id)}, {json.dumps(message, ensure_ascii=False)})"
+        state = await _cdp_eval(self.ws, self.msg_id, expression)
+        _validate_state(state)
+        return state
+
+    async def click(self, point):
+        for kind in ("mousePressed", "mouseReleased"):
+            await self.call("Input.dispatchMouseEvent", {"type": kind, "x": float(point["x"]),
+                            "y": float(point["y"]), "button": "left", "clickCount": 1})
+
+
+async def _with_browser_tab(context, url, operation):
+    import websockets
+    port, opened_by_us, server_port = acquire_profile_cdp_port(context["profile_id"])
+    target_id = ""
+    try:
+        target_id, ws_url = _open_transient_tab(port)
+        async with websockets.connect(ws_url, open_timeout=5, max_size=10 * 1024 * 1024) as ws:
+            session = _BrowserSession(ws)
+            response = await session.call("Page.navigate", {"url": _facebook_url(url)})
+            if (response.get("result") or {}).get("errorText"):
+                raise BrowserAutomationError("Không mở được trang Facebook.", "NETWORK_RETRYABLE")
+            await asyncio.sleep(3)
+            return await operation(session)
+    finally:
+        if target_id:
+            _close_transient_tab(port, target_id)
+        release_profile_cdp_port(context["profile_id"], opened_by_us, server_port)
+
+
+async def _confirm_actor(session, context, post_id="", message=""):
+    state = await session.inspect(post_id, message)
+    if _identity_matches(state, context):
+        return state
+    if state.get("actorButtonRect"):
+        await session.click(state["actorButtonRect"])
+        await asyncio.sleep(1)
+        state = await session.inspect(post_id, message)
+    options = [o for o in state.get("actorOptions") or [] if str(o.get("id")) in context["allowed_ids"]]
+    if len(options) == 1:
+        await session.click(options[0])
+        await asyncio.sleep(2)
+        state = await session.inspect(post_id, message)
+    if not _identity_matches(state, context):
+        raise BrowserAutomationError("Không xác nhận được ID Page đang bình luận. Tên Page giống nhau chưa đủ; cần mở đúng Page trong profile rồi kiểm tra lại.")
+    return state
+
+
+def _run_read(page, context, url, operation):
+    try:
+        result = asyncio.run(_with_browser_tab(context, url, operation))
+        _check_mapping(page, context)
+        return result
+    except BrowserAutomationError:
+        raise
+    except Exception as exc:
+        raise BrowserAutomationError(f"Không hoàn tất đọc Facebook qua CDP ({type(exc).__name__}).", "NETWORK_RETRYABLE") from exc
+
+
+def verify_page_connection_cdp(page):
+    try:
+        with _profile_operation(page) as context:
+            async def operation(session):
+                state = await _confirm_actor(session, context)
+                return {"success": True, "error": None, "browser_status": "READY",
+                        "identity_id": context["identity_id"], "profile_id": context["profile_id"],
+                        "observed_identity_ids": sorted(set(state["actorIds"]))}
+            return _run_read(page, context, f"https://www.facebook.com/{context['identity_id']}", operation)
+    except BrowserAutomationError as exc:
+        return {**exc.as_result(), "identity_id": None, "profile_id": page.get("antidetect_profile_id")}
+
+
+def get_recent_posts_for_page_cdp(page, since_timestamp=None):
+    with _profile_operation(page) as context:
+        since = _timestamp(since_timestamp) if since_timestamp is not None else None
+        if since_timestamp is not None and since is None:
+            raise BrowserAutomationError("Mốc thời gian quét bài viết không hợp lệ.")
+        async def operation(session):
+            state = await _confirm_actor(session, context)
+            results = {}
+            timestamps = {}
+            for item in state.get("posts") or []:
+                post_id = _numeric(item.get("id"))
+                created = _timestamp(item.get("created_time"))
+                owners = set(item.get("ownerIds") or [])
+                if not post_id or not created or not owners or not owners <= context["allowed_ids"]:
+                    continue
+                owner, url_post = _post_identity(item.get("url"))
+                if url_post != post_id or (owner and owner not in context["allowed_ids"]):
+                    continue
+                if post_id in timestamps and timestamps[post_id] != created:
+                    raise BrowserAutomationError("Facebook trả về thời điểm bài viết không nhất quán.")
+                timestamps[post_id] = created
+                if since and created <= since:
+                    continue
+                results[post_id] = {"id": f"{context['page_id']}_{post_id}", "created_time": created.isoformat(),
+                                    "permalink_url": _facebook_url(item["url"])}
+            return sorted(results.values(), key=lambda item: item["created_time"], reverse=True)
+        return _run_read(page, context, f"https://www.facebook.com/{context['identity_id']}", operation)
+
+
+def verify_post_for_page_cdp(page, post_id, post_url=None):
+    with _profile_operation(page) as context:
+        numeric_post, url = _target_post(context, post_id, post_url)
+        async def operation(session):
+            state = await _confirm_actor(session, context, numeric_post)
+            return _verified_post(state, context, numeric_post, require_timestamp=True)
+        return _run_read(page, context, url, operation)
+
+
+def _normalize_comment(text):
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def _matching_comment_ids(state, context, message):
+    matches = set()
+    for item in state.get("comments") or []:
+        authors = set(item.get("authorIds") or [])
+        comment_id = _numeric(item.get("id"))
+        if comment_id and authors and authors <= context["allowed_ids"] and \
+                _normalize_comment(item.get("text")) == _normalize_comment(message):
+            matches.add(comment_id)
+    return matches
+
+
+def send_page_comment_cdp(page, post_id, message, post_url=None, before_submit=None):
+    submitted = False
+    try:
+        if not isinstance(message, str) or not message.strip():
+            raise BrowserAutomationError("Nội dung bình luận không được để trống.")
+        with _profile_operation(page) as context:
+            numeric_post, url = _target_post(context, post_id, post_url)
+            async def operation(session):
+                nonlocal submitted
+                state = await _confirm_actor(session, context, numeric_post, message)
+                _verified_post(state, context, numeric_post)
+                _check_mapping(page, context)
+                if not state.get("commentBoxRect") or state.get("commentBoxText"):
+                    raise BrowserAutomationError("Không có ô bình luận trống được xác minh trong đúng bài viết.")
+                if _matching_comment_ids(state, context, message):
+                    raise BrowserAutomationError("Đã thấy bình luận trùng nội dung của Page; cần kiểm tra trước khi gửi lại.", "NEED_CHECK", "READY")
+                baseline = set(state.get("commentIds") or [])
+                await session.click(state["commentBoxRect"])
+                focused = await session.inspect(numeric_post, message)
+                _verified_post(focused, context, numeric_post)
+                if not focused.get("focused") or focused.get("commentBoxText") or not _identity_matches(focused, context):
+                    raise BrowserAutomationError("Ô nhập hoặc Page đang bình luận đã thay đổi.")
+                await session.call("Input.insertText", {"text": message})
+                final = await session.inspect(numeric_post, message)
+                _verified_post(final, context, numeric_post)
+                if not final.get("focused") or not _identity_matches(final, context) or \
+                        _normalize_comment(final.get("commentBoxText")) != _normalize_comment(message):
+                    raise BrowserAutomationError("Nội dung/ô nhập/Page thay đổi trước khi gửi; đã hủy thao tác.", "CANCELLED_BEFORE_SEND")
+                baseline.update(final.get("commentIds") or [])
+                _check_mapping(page, context)
+                if before_submit is not None and not before_submit():
+                    raise BrowserAutomationError("Tác vụ đã dừng hoặc cấu hình thay đổi trước khi gửi.", "CANCELLED_BEFORE_SEND", "READY")
+                # The callback may refresh Sheets over HTTP. DOM evidence from
+                # before that potentially slow call is no longer sufficient.
+                ready = await session.inspect(numeric_post, message)
+                _verified_post(ready, context, numeric_post)
+                if not ready.get("focused") or not _identity_matches(ready, context) or \
+                        _normalize_comment(ready.get("commentBoxText")) != _normalize_comment(message):
+                    raise BrowserAutomationError("Bài viết/Page/ô nhập thay đổi trong khi kiểm tra cấu hình; đã hủy gửi.", "CANCELLED_BEFORE_SEND")
+                if _matching_comment_ids(ready, context, message):
+                    raise BrowserAutomationError("Đã thấy bình luận trùng nội dung trước khi gửi; cần kiểm tra để tránh đăng lặp.", "NEED_CHECK", "READY")
+                baseline.update(ready.get("commentIds") or [])
+                _check_mapping(page, context)
+                # Set before dispatch: a lost response to keyDown is uncertain,
+                # even if the subsequent keyUp never completes.
+                submitted = True
+                await session.call("Input.dispatchKeyEvent", {"type": "keyDown", "key": "Enter", "code": "Enter",
+                    "text": "\r", "unmodifiedText": "\r", "windowsVirtualKeyCode": 13})
+                await session.call("Input.dispatchKeyEvent", {"type": "keyUp", "key": "Enter", "code": "Enter",
+                    "windowsVirtualKeyCode": 13})
+                for _ in range(8):
+                    await asyncio.sleep(1)
+                    after = await session.inspect(numeric_post, message)
+                    _verified_post(after, context, numeric_post)
+                    fresh = _matching_comment_ids(after, context, message) - baseline
+                    if len(fresh) == 1:
+                        return {"success": True, "category": "SUCCESS", "comment_id": fresh.pop(),
+                                "error": None, "browser_status": "READY", "mode": "ANTIDETECT_CDP", "usage_pct": None}
+                raise BrowserAutomationError("Đã gửi Enter nhưng chưa xác nhận được ID bình luận mới đúng Page/nội dung. Cần kiểm tra, không tự gửi lại.", "NEED_CHECK", "READY")
+            return asyncio.run(_with_browser_tab(context, url, operation))
+    except BrowserAutomationError as exc:
+        if submitted:
+            return BrowserAutomationError("Kết quả gửi chưa xác định. Cần kiểm tra bài viết trước khi gửi lại.",
+                                          "NEED_CHECK", exc.browser_status).as_result()
+        return exc.as_result()
+    except Exception as exc:
+        return BrowserAutomationError(
+            f"Lỗi CDP ({type(exc).__name__}); " + ("cần kiểm tra bài viết trước khi gửi lại." if submitted else "chưa gửi bình luận."),
+            "NEED_CHECK" if submitted else "NETWORK_RETRYABLE").as_result()
+
+
+# Compatibility entry points delegate to the same numeric-identity safety gates.
+def get_recent_posts_cdp(page_id, page_url, profile_id, since_timestamp=None, limit=5):
+    page = {"page_id": page_id, "page_url": page_url, "antidetect_profile_id": profile_id}
+    return get_recent_posts_for_page_cdp(page, since_timestamp)[:limit]
+
+
+def post_comment_cdp(post_id, page_id, page_name, page_url, profile_id, message, post_url=None):
+    page = {"page_id": page_id, "page_name": page_name, "page_url": page_url, "antidetect_profile_id": profile_id}
+    return send_page_comment_cdp(page, post_id, message, post_url=post_url)
+
+
+def _normalize_actor_name(name):
+    text = str(name or "").translate({ord(ch): None for ch in "\u200b\u200c\u200d\ufeff"})
     return re.sub(r"\s+", " ", text.strip().lower())
 
 
-def _actor_names_match(actor_names: List[str], page_name: str) -> bool:
-    """True only when every detected actor name is exactly the target Page name."""
+def _actor_names_match(actor_names, page_name):
+    """Display helper only; names never authorize sending."""
     target = _normalize_actor_name(page_name)
-    if not target:
-        return False
-    names = [_normalize_actor_name(n) for n in (actor_names or []) if isinstance(n, str)]
-    names = [n for n in names if n]
-    return bool(names) and all(n == target for n in names)
+    names = [_normalize_actor_name(n) for n in actor_names or [] if isinstance(n, str) and n.strip()]
+    return bool(target and names) and all(n == target for n in names)
 
 
-def _select_exact_actor_option(candidates: Any, page_name: str) -> List[Dict[str, Any]]:
-    """Keeps only actor-menu items whose label exactly equals the target Page name."""
+def _select_exact_actor_option(candidates, page_name):
+    """Legacy display helper only; production switching uses numeric IDs."""
     target = _normalize_actor_name(page_name)
-    if not target or not isinstance(candidates, list):
-        return []
-    picked: List[Dict[str, Any]] = []
-    seen = set()
-    for candidate in candidates:
-        if not isinstance(candidate, dict):
-            continue
-        if _normalize_actor_name(candidate.get("text") or "") != target:
+    picked, seen = [], set()
+    for candidate in candidates if isinstance(candidates, list) else []:
+        if not isinstance(candidate, dict) or not target or _normalize_actor_name(candidate.get("text")) != target:
             continue
         try:
             key = (int(float(candidate.get("x") or 0)) // 10, int(float(candidate.get("y") or 0)) // 10)
-        except (TypeError, ValueError):
+        except (ValueError, TypeError):
             continue
-        if key in seen:
-            continue
-        seen.add(key)
-        picked.append(candidate)
+        if key not in seen:
+            seen.add(key)
+            picked.append(candidate)
     return picked
-
-
-def post_comment_cdp(
-    post_id: str,
-    page_id: str,
-    page_name: str,
-    page_url: Optional[str],
-    profile_id: str,
-    message: str,
-    post_url: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Posts a comment under the Fanpage's identity using the owning Antidetect profile's CDP port.
-    Returns a result dictionary compatible with `meta_client.post_comment`:
-      `{"success": True/False, "comment_id": ..., "category": ..., "error": ...}`
-    """
-    target_post_url = build_facebook_post_url(page_id, post_id, page_url=page_url, post_url=post_url)
-
-    async def _run() -> Dict[str, Any]:
-        import websockets
-        try:
-            port, opened_by_us, srv_port = acquire_profile_cdp_port(profile_id)
-        except Exception as e:
-            return {
-                "success": False,
-                "category": "NETWORK_RETRYABLE",
-                "error": f"Không mở được profile Antidetect ({profile_id}): {e}",
-                "usage_pct": None,
-            }
-
-        human_helper = None
-        if _ensure_antidetect_sys_path():
-            try:
-                from antidetect.human import HumanInput
-                human_helper = HumanInput(port=port)
-            except Exception:
-                human_helper = None
-
-        target_id = ""
-        try:
-            target_id, ws_url = _open_transient_tab(port)
-            async with websockets.connect(ws_url, open_timeout=5, max_size=10 * 1024 * 1024) as ws:
-                msg_id = 1
-                msg_id += 1
-                await _cdp_call(ws, msg_id, "Page.bringToFront")
-                msg_id += 1
-                await _cdp_call(ws, msg_id, "Page.navigate", {"url": target_post_url})
-                await asyncio.sleep(4.0)
-
-                # Inspect post, login state, actor switcher, and comment box
-                escaped_name = json.dumps(page_name or "", ensure_ascii=False)
-                msg_id += 1
-                state = await _cdp_eval(ws, msg_id, f"{_INSPECT_POST_AND_ACTOR_JS}({escaped_name})")
-                if not isinstance(state, dict):
-                    return {
-                        "success": False,
-                        "category": "NETWORK_RETRYABLE",
-                        "error": "Không đọc được trạng thái trang bài viết qua CDP.",
-                        "usage_pct": None,
-                    }
-
-                access = state.get("accessState")
-                if access in ("login_required", "checkpoint"):
-                    return {
-                        "success": False,
-                        "category": "TOKEN_EXPIRED",
-                        "error": f"Profile Antidetect bị mất phiên đăng nhập hoặc dính checkpoint ({access}).",
-                        "usage_pct": None,
-                    }
-
-                # Try switching actor to Fanpage unless the exact Page identity is confirmed
-                if not _actor_names_match(state.get("actorNames"), page_name):
-                    if state.get("actorButtonRect"):
-                        rc = state["actorButtonRect"]
-                        msg_id = await _human_click_on_ws(ws, msg_id, rc["x"], rc["y"], human_helper)
-                        await asyncio.sleep(1.2)
-                        msg_id += 1
-                        options = await _cdp_eval(ws, msg_id, _FIND_ACTOR_MENU_OPTION_JS)
-                        matches = _select_exact_actor_option(options, page_name)
-                        if len(matches) > 1:
-                            return {
-                                "success": False,
-                                "category": "INVALID_TARGET",
-                                "error": (
-                                    f"Menu chọn Page có {len(matches)} mục trùng khớp chính xác với tên "
-                                    f"'{page_name}'. Đã chặn gửi để tránh bình luận sai Page."
-                                ),
-                                "usage_pct": None,
-                            }
-                        if len(matches) == 1:
-                            msg_id = await _human_click_on_ws(
-                                ws, msg_id, matches[0]["x"], matches[0]["y"], human_helper
-                            )
-                            await asyncio.sleep(1.8)
-                    elif state.get("switchProfileButtonRect"):
-                        rc = state["switchProfileButtonRect"]
-                        msg_id = await _human_click_on_ws(ws, msg_id, rc["x"], rc["y"], human_helper)
-                        await asyncio.sleep(3.5)
-
-                    # Re-inspect comment box after actor switch
-                    msg_id += 1
-                    state = await _cdp_eval(ws, msg_id, f"{_INSPECT_POST_AND_ACTOR_JS}({escaped_name})") or state
-
-                # Hard safety gate: never type a comment unless the exact page identity is confirmed.
-                if not _actor_names_match(state.get("actorNames"), page_name):
-                    return {
-                        "success": False,
-                        "category": "INVALID_TARGET",
-                        "error": (
-                            f"Không xác nhận được đang bình luận dưới tên Page '{page_name}'. "
-                            "Đã chặn gửi để tránh bình luận bằng tài khoản cá nhân hoặc Page khác."
-                        ),
-                        "usage_pct": None,
-                    }
-
-                box_rect = state.get("commentBoxRect")
-                if not box_rect:
-                    # Scroll down a bit and look for the comment box again
-                    msg_id += 1
-                    await _cdp_eval(ws, msg_id, "window.scrollBy(0, 350); true;")
-                    await asyncio.sleep(1.0)
-                    msg_id += 1
-                    state = await _cdp_eval(ws, msg_id, f"{_INSPECT_POST_AND_ACTOR_JS}({escaped_name})") or state
-                    box_rect = state.get("commentBoxRect")
-
-                if not box_rect:
-                    return {
-                        "success": False,
-                        "category": "INVALID_TARGET",
-                        "error": f"Không tìm thấy ô nhập bình luận trên bài viết ({target_post_url}).",
-                        "usage_pct": None,
-                    }
-
-                # Click the comment input box, type the message, and press Enter
-                msg_id = await _human_click_on_ws(ws, msg_id, box_rect["x"], box_rect["y"], human_helper)
-                msg_id = await _human_type_and_submit_on_ws(ws, msg_id, message, human_helper)
-
-                # Poll up to 6 seconds to verify the comment rendered in the post DOM
-                escaped_msg = json.dumps(message, ensure_ascii=False)
-                for _ in range(6):
-                    await asyncio.sleep(1.0)
-                    msg_id += 1
-                    ver = await _cdp_eval(ws, msg_id, f"{_VERIFY_COMMENT_APPEARED_JS}({escaped_msg})")
-                    if isinstance(ver, dict) and ver.get("found"):
-                        return {
-                            "success": True,
-                            "comment_id": f"cdp_{page_id}_{int(time.time())}",
-                            "mode": "ANTIDETECT_CDP",
-                            "usage_pct": None,
-                        }
-
-                # Uncertain outcome after sending Enter -> mark NEED_CHECK to prevent duplicate comments
-                return {
-                    "success": False,
-                    "category": "NEED_CHECK",
-                    "error": "Đã gõ và nhấn Enter gửi bình luận qua Antidetect CDP nhưng chưa xác nhận được bình luận hiển thị trên DOM. Vui lòng kiểm tra bài viết trước khi thử lại.",
-                    "usage_pct": None,
-                }
-        except Exception as e:
-            return {
-                "success": False,
-                "category": "NEED_CHECK",
-                "error": f"Lỗi kết nối CDP trong lúc gửi bình luận ({type(e).__name__}: {e}). Cần kiểm tra trên Facebook trước khi gửi lại.",
-                "usage_pct": None,
-            }
-        finally:
-            if target_id:
-                _close_transient_tab(port, target_id)
-            release_profile_cdp_port(profile_id, opened_by_us, srv_port)
-
-    return asyncio.run(_run())

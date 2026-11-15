@@ -6,7 +6,7 @@ import json
 import secrets
 import threading
 import time
-from contextlib import asynccontextmanager, closing
+from contextlib import asynccontextmanager, closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Literal
@@ -122,6 +122,10 @@ class PauseRequest(BaseModel):
 
 class PageAutomationRequest(BaseModel):
     enabled: bool
+
+
+class PageSendModeRequest(BaseModel):
+    send_mode: Literal["GRAPH_API", "BROWSER"]
 
 
 class RetryTaskRequest(BaseModel):
@@ -295,7 +299,7 @@ def get_metrics():
         "metrics": scheduler.SCHEDULER_METRICS,
         "task_counts": counts,
         "total_pages": len(pages),
-        "active_pages": sum(1 for p in pages if p.get("is_active") and p.get("rule_enabled") and not p.get("source_error")),
+        "active_pages": sum(1 for p in pages if _public_send_ready(p) and p.get("rule_enabled") and not p.get("source_error")),
         "has_app_credentials": config.has_app_credentials(),
         "has_facebook_login_config": bool(config.has_app_credentials() and config.META_OAUTH_REDIRECT_URI),
     }
@@ -345,43 +349,95 @@ def sync_from_antidetect():
     return res
 
 
+def _public_graph_ready(page):
+    return bool(page.get("is_active") and page.get("has_page_token")
+                and page.get("token_status") in ("OK", "EXPIRING_SOON")
+                and (page["page_id"] == config.PILOT_PAGE_ID
+                     or (page.get("connection_checked_at") and not page.get("connection_error"))))
+
+
+def _public_send_ready(page):
+    return (comment_dispatch.browser_ready(page) if page.get("send_mode") == "BROWSER"
+            else _public_graph_ready(page))
+
+
+@contextmanager
+def _page_configuration_guard(page_id):
+    page = db.get_page(page_id)
+    if not page or page["page_id"] != page_id:
+        raise HTTPException(404, "Chọn ID Page trong danh sách dashboard.")
+    lock = comment_dispatch.page_lock(page_id)
+    if not lock.acquire(blocking=False):
+        raise HTTPException(409, "Page đang xử lý bình luận. Hãy thử lại sau khi tác vụ kết thúc.")
+    try:
+        yield
+    finally:
+        lock.release()
+
+
 @app.get("/api/pages")
 def list_pages():
     pages = db.get_all_pages()
     for page in pages:
         page.update(comment_dispatch.page_status(page, scheduler.SCHEDULER_METRICS["paused_all"]))
-        page["graph_ready"] = bool(
-            page.get("is_active") and page.get("has_page_token")
-            and page.get("token_status") in ("OK", "EXPIRING_SOON")
-            and (page["page_id"] == config.PILOT_PAGE_ID
-                 or (page.get("connection_checked_at") and not page.get("connection_error")))
-        )
-        page["automation_eligible"] = page["graph_ready"] and not page.get("source_error")
+        page["graph_ready"] = _public_graph_ready(page)
+        page["browser_ready"] = comment_dispatch.browser_ready(page)
+        page["send_ready"] = _public_send_ready(page)
+        page["automation_eligible"] = page["send_ready"] and not page.get("source_error")
         page["scan_error"] = scheduler.SCHEDULER_METRICS["scan_errors"].get(page["page_id"])
         page["send_error"] = scheduler.SCHEDULER_METRICS["send_errors"].get(page["page_id"])
     return {"pages": pages}
 
 
+@app.post("/api/pages/{page_id}/send_mode")
+def set_page_send_mode(page_id: str, req: PageSendModeRequest):
+    with _page_configuration_guard(page_id):
+        try:
+            page = db.set_page_send_mode(page_id, req.send_mode)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+    return {"success": True, "send_mode": page["send_mode"],
+            "message": "Đã lưu cách gửi. Kiểm tra kết nối trước khi bật tự động hoặc khôi phục tác vụ đang tạm dừng."}
+
+
 @app.get("/api/pages/{page_id}/recent_posts")
 def get_page_posts(page_id: str):
-    page = db.get_page_with_decrypted_token(page_id)
-    if not page:
+    page = db.get_page_for_dispatch(page_id)
+    if not page or page["page_id"] != page_id:
         raise HTTPException(status_code=404, detail="Không tìm thấy Page")
-    if not scheduler.graph_ready(page):
-        raise HTTPException(status_code=409, detail="Page chưa có kết nối Graph API khả dụng.")
+    if not comment_dispatch.send_ready(page):
+        raise HTTPException(status_code=409, detail="Hãy kiểm tra kết nối theo cách gửi đã chọn cho Page.")
     try:
+        if page.get("send_mode") == "BROWSER":
+            return {"posts": antidetect_client.get_recent_posts_for_page_cdp(page), "source": "BROWSER"}
         posts = meta_client.get_recent_posts(page_id, page["page_access_token"], limit=15)
         return {"posts": posts, "source": "GRAPH_API"}
+    except antidetect_client.BrowserAutomationError as exc:
+        scheduler._record_browser_connection_failure(page, exc.as_result())
+        raise HTTPException(status_code=409, detail=str(exc)) from None
     except meta_client.MetaAPIError as exc:
         raise HTTPException(status_code=400, detail=exc.message) from None
     except Exception:
-        raise HTTPException(status_code=502, detail="Không tải được bài từ Meta.") from None
+        raise HTTPException(status_code=502, detail="Không tải được bài từ Facebook.") from None
 
 
 def verify_connected_page(page_id: str):
-    page = db.get_page_with_decrypted_token(page_id)
-    if not page:
+    page = db.get_page_for_dispatch(page_id)
+    if not page or page["page_id"] != page_id:
         raise HTTPException(status_code=404, detail="Không tìm thấy Page")
+    if page.get("send_mode") == "BROWSER":
+        result = antidetect_client.verify_page_connection_cdp(page)
+        if result.get("category") == "BROWSER_BUSY":
+            raise HTTPException(409, result.get("error") or "Profile đang bận.")
+        status = result.get("browser_status") or "ERROR"
+        saved = db.update_page_browser_check(
+            page_id, datetime.now(timezone.utc).isoformat(), status,
+            error=result.get("error"), identity_id=result.get("identity_id"),
+            profile_id=result.get("profile_id"),
+        )
+        if not result.get("success") or not saved:
+            raise HTTPException(409, result.get("error") or "Chưa xác minh được đúng Page trong profile đã chọn.")
+        return status
     if not page.get("page_access_token"):
         raise HTTPException(status_code=409, detail="Page chưa có token Graph API khả dụng.")
     result = meta_client.verify_page_connection(page_id, page["page_access_token"])
@@ -405,8 +461,12 @@ def verify_connected_page(page_id: str):
 
 @app.post("/api/pages/{page_id}/check")
 def check_page_connection(page_id: str):
-    return {"success": True, "token_status": verify_connected_page(page_id),
-            "message": "Đã xác minh đúng Page, quyền bình luận và quyền đọc bài."}
+    with _page_configuration_guard(page_id):
+        status = verify_connected_page(page_id)
+        page = db.get_page(page_id)
+    return {"success": True, "send_mode": page.get("send_mode", "GRAPH_API"),
+            "browser_status" if page.get("send_mode") == "BROWSER" else "token_status": status,
+            "message": "Đã xác minh kết nối đúng Page theo cách gửi đã chọn."}
 
 
 @app.get("/api/pages/{page_id}/preview")
@@ -425,11 +485,22 @@ def preview_page(page_id: str):
 
 @app.post("/api/pages/{page_id}/automation")
 def set_page_automation(page_id: str, req: PageAutomationRequest):
+    # Stop requests remain immediate; enabling cannot race a send or mode change.
+    if not req.enabled:
+        return _set_page_automation(page_id, req)
+    with _page_configuration_guard(page_id):
+        return _set_page_automation(page_id, req)
+
+
+def _set_page_automation(page_id: str, req: PageAutomationRequest):
+    page = db.get_page(page_id)
+    if not page or page["page_id"] != page_id:
+        raise HTTPException(404, "Không tìm thấy Page")
     if req.enabled:
         verify_connected_page(page_id)
         page = db.get_page(page_id)
         if not page["is_active"]:
-            raise HTTPException(status_code=409, detail="Hãy kích hoạt lại kết nối Meta của Page trước.")
+            raise HTTPException(status_code=409, detail="Hãy kích hoạt lại kết nối của Page trước.")
         result = scheduler.refresh_comment_sheet(force=True)
         if not result.get("success"):
             raise HTTPException(status_code=409, detail=result.get("error") or "Không đọc được tab bình luận.")
@@ -445,10 +516,10 @@ def set_page_automation(page_id: str, req: PageAutomationRequest):
 @app.post("/api/pages/{page_id}/resume_tasks")
 def resume_page_tasks(page_id: str):
     page = db.get_page(page_id)
-    if not page:
+    if not page or page["page_id"] != page_id:
         raise HTTPException(status_code=404, detail="Không tìm thấy Page")
-    if not scheduler.graph_ready(db.get_page_with_decrypted_token(page_id) or {}):
-        raise HTTPException(status_code=409, detail="Page chưa sẵn sàng qua Graph API.")
+    if not comment_dispatch.send_ready(db.get_page_for_dispatch(page_id) or {}):
+        raise HTTPException(status_code=409, detail="Page chưa sẵn sàng theo cách gửi đã chọn.")
     try:
         resumed = scheduler.resume_tasks(page_id=page["page_id"])
     except ValueError as exc:
@@ -458,8 +529,11 @@ def resume_page_tasks(page_id: str):
 
 @app.post("/api/pages/{page_id}/reactivate")
 def reactivate_page(page_id: str):
-    status = verify_connected_page(page_id)
-    db.update_page_status(page_id, is_active=True, token_status=status)
+    with _page_configuration_guard(page_id):
+        status = verify_connected_page(page_id)
+        page = db.get_page(page_id)
+        db.update_page_status(page_id, is_active=True,
+                              token_status=page.get("token_status") if page.get("send_mode") == "BROWSER" else status)
     return {"success": True, "message": "Đã kích hoạt lại Page.", "is_active": True}
 
 
@@ -683,12 +757,16 @@ def preview_spintax(req: SpintaxPreviewRequest):
 
 @app.post("/api/tasks/manual")
 def create_manual_task(req: ManualTaskRequest):
-    page = db.get_page_with_decrypted_token(req.page_id)
+    with _page_configuration_guard(req.page_id):
+        return _create_manual_task(req)
+
+
+def _create_manual_task(req: ManualTaskRequest):
+    page = db.get_page_for_dispatch(req.page_id)
     if not page:
         raise HTTPException(status_code=404, detail="Không tìm thấy Page")
-    if not scheduler.graph_ready(page):
-        raise HTTPException(status_code=409, detail="Page chưa có kết nối Graph API khả dụng.")
-    token = page["page_access_token"]
+    if not comment_dispatch.send_ready(page):
+        raise HTTPException(status_code=409, detail="Hãy kiểm tra kết nối theo cách gửi đã chọn cho Page.")
 
     raw_content = req.content.strip()
     if not raw_content:
@@ -697,12 +775,18 @@ def create_manual_task(req: ManualTaskRequest):
         raise HTTPException(status_code=400, detail="Nội dung bình luận bị lỗi đóng/mở ngoặc nhọn Spintax '{...}'")
 
     try:
-        post_data = meta_client.verify_post_belongs_to_page(req.post_id_or_url, req.page_id, token)
+        if page.get("send_mode") == "BROWSER":
+            post_data = antidetect_client.verify_post_for_page_cdp(page, req.post_id_or_url)
+        else:
+            post_data = meta_client.verify_post_belongs_to_page(req.post_id_or_url, req.page_id, page["page_access_token"])
         verified_post_id = post_data["clean_post_id"]
+    except antidetect_client.BrowserAutomationError as exc:
+        scheduler._record_browser_connection_failure(page, exc.as_result())
+        raise HTTPException(status_code=409, detail=str(exc)) from None
     except meta_client.MetaAPIError as exc:
         raise HTTPException(status_code=400, detail=f"Xác minh bài viết thất bại: {exc.message}") from None
     except Exception:
-        raise HTTPException(status_code=502, detail="Không xác minh được bài trên Meta.") from None
+        raise HTTPException(status_code=502, detail="Không xác minh được bài trên Facebook.") from None
 
     # Store exactly the text confirmed in the dashboard.
     final_content = raw_content
@@ -912,7 +996,8 @@ def index():
                         <div class="card p-4 border-start border-4 border-success mb-3">
                             <h5 class="fw-bold mb-2 text-success"><i class="fa-solid fa-shield-halved"></i> Đồng bộ từ Antidetect Python</h5>
                             <p class="text-muted small mb-2">
-                                Đồng bộ danh mục Page và profile. Bình luận dùng kết nối Meta Graph API của từng Page.
+                                Đồng bộ danh mục Page và profile. Chọn Graph API hoặc Trình duyệt Antidetect cho từng Page,
+                                kiểm tra kết nối, đồng bộ tab Comments - Multi-Page rồi bật tự động.
                             </p>
 
                             <div id="antidetectSummary" class="small text-secondary mb-3">Đang kiểm tra dữ liệu Antidetect...</div>
@@ -1001,7 +1086,8 @@ def index():
                         <div class="col-md-5">
                             <div class="mb-3">
                                 <label class="form-label fw-semibold">1. Chọn Fanpage:</label>
-                                <select id="manualPageSelect" class="form-select" onchange="loadRecentPostsForManual()"></select>
+                                <select id="manualPageSelect" class="form-select" onchange="resetManualBatchId(); document.getElementById('recentPostsContainer').textContent = ''"></select>
+                                <button type="button" class="btn btn-sm btn-outline-primary mt-2" onclick="loadRecentPostsForManual()">Tải bài viết của Page</button>
                             </div>
                             <div class="mb-3">
                                 <label class="form-label fw-semibold">2. Chọn bài viết từ danh sách:</label>
@@ -1210,22 +1296,22 @@ def index():
             filterPage.innerHTML = '<option value="">Tất cả Fanpage</option>';
 
             if (cachedPages.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted py-4">Chưa có Page nào. Hãy thêm User Access Token bên trái để nạp Page.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted py-4">Chưa có Page nào. Đồng bộ Antidetect hoặc kết nối Facebook để nạp Page.</td></tr>';
                 return;
             }
 
             cachedPages.forEach(p => {
                 const isPageActive = Number(p.is_active) === 1;
-                let badgeToken = '<span class="badge bg-success">Graph API (OK)</span>';
-                if (p.connection_mode === 'HYBRID') {
-                    badgeToken = '<span class="badge bg-primary">Hybrid (API + Antidetect)</span>';
-                } else if (p.connection_mode === 'ANTIDETECT' || p.token_status === 'ANTIDETECT_READY') {
-                    badgeToken = '<span class="badge bg-info text-dark">Sẵn sàng (Antidetect CDP)</span>';
-                }
-                if (p.token_status === 'INVALID_SECRET') badgeToken = '<span class="badge bg-danger">Lỗi khóa mã hóa / Cần kết nối lại</span>';
-                else if (p.token_status === 'EXPIRED') badgeToken = '<span class="badge bg-danger">Hết hạn / Cần đăng nhập lại</span>';
-                else if (p.token_status === 'MISSING_PERMISSIONS') badgeToken = '<span class="badge bg-warning text-dark">Thiếu quyền Page</span>';
-                else if (p.token_status === 'EXPIRING_SOON') badgeToken = '<span class="badge bg-warning text-dark">Sắp hết hạn</span>';
+                const browserMode = p.send_mode === 'BROWSER';
+                const browserLabels = {READY: 'Đã xác minh Page', UNCHECKED: 'Chưa kiểm tra',
+                    LOGIN_REQUIRED: 'Cần đăng nhập Facebook', CHECKPOINT: 'Cần xác minh Facebook', ERROR: 'Cần kiểm tra lại'};
+                const tokenLabels = {OK: 'Token hợp lệ', EXPIRING_SOON: 'Token sắp hết hạn',
+                    EXPIRED: 'Token hết hạn', INVALID_SECRET: 'Cần kết nối lại token',
+                    MISSING_PERMISSIONS: 'Thiếu quyền Page'};
+                const statusText = browserMode ? (browserLabels[p.browser_status] || 'Chưa kiểm tra')
+                    : (p.has_page_token ? (tokenLabels[p.token_status] || 'Cần kiểm tra Meta') : 'Chưa kết nối Meta');
+                const badgeToken = `<span class="badge ${p.send_ready ? 'bg-success' : 'bg-warning text-dark'}">${escapeHtml(statusText)}</span>`;
+                const canCheck = browserMode ? Boolean(p.antidetect_profile_id) : Boolean(p.has_page_token);
 
                 const srcLabel = p.antidetect_profile_name || p.account_name || 'N/A';
                 const activeBadge = isPageActive
@@ -1235,16 +1321,39 @@ def index():
                 tr.innerHTML = `
                     <td><strong>${escapeHtml(p.page_name)}</strong><br><small class="text-muted">ID: ${escapeHtml(p.page_id)}</small></td>
                     <td><span class="badge bg-light text-dark border text-wrap text-start">${escapeHtml(srcLabel)}</span></td>
-                    <td>${activeBadge}<br>${badgeToken}<br><small class="text-muted">${escapeHtml(p.connection_error || p.send_error || p.scan_error || p.status_note || '')}</small></td>
+                    <td><div class="send-mode-control mb-1"></div>${activeBadge}<br>${badgeToken}<br><small class="text-muted">${escapeHtml((browserMode ? p.browser_error : p.connection_error) || p.send_error || p.scan_error || '')}</small></td>
                     <td>${p.rule_enabled ? 'Đã bật' : 'Tạm dừng'}<br><small>${p.delay_minutes ?? '—'} phút · Đã dùng ${p.comments_used_today}/${p.max_comments_per_day ?? '—'}, còn ${p.comments_remaining_today}<br>${escapeHtml(p.source_error || p.send_wait_reason || '')}${p.next_send_at ? '<br>Thử tiếp: ' + escapeHtml(new Date(p.next_send_at).toLocaleString('vi-VN', {timeZone:'Asia/Bangkok'})) : ''}</small></td>
                     <td></td>
                 `;
+                const modeSelect = document.createElement('select');
+                modeSelect.className = 'form-select form-select-sm';
+                modeSelect.setAttribute('aria-label', 'Cách gửi của ' + p.page_name);
+                for (const [value, label] of [['GRAPH_API', 'Graph API'], ['BROWSER', 'Trình duyệt Antidetect']]) {
+                    const option = new Option(label, value);
+                    option.disabled = value === 'BROWSER' && !p.antidetect_profile_id;
+                    modeSelect.appendChild(option);
+                }
+                modeSelect.value = p.send_mode || 'GRAPH_API';
+                modeSelect.onchange = async () => {
+                    modeSelect.disabled = true;
+                    try {
+                        const res = await apiFetch(`/api/pages/${encodeURIComponent(p.page_id)}/send_mode`, {
+                            method: 'POST', headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({send_mode: modeSelect.value})});
+                        const result = await res.json();
+                        if (!res.ok) throw new Error(result.detail || 'Không đổi được cách gửi.');
+                        alert(result.message);
+                    } catch (error) { alert(error.message); }
+                    finally { await fetchPages(); fetchMetrics(); }
+                };
+                tr.querySelector('.send-mode-control').appendChild(modeSelect);
                 const actions = [
-                    ['Kiểm tra Meta', 'check', Boolean(p.has_page_token)],
+                    [browserMode ? 'Kiểm tra trình duyệt' : 'Kiểm tra Meta', 'check', canCheck],
                     ['Xem mẫu', 'preview', true],
-                    [p.rule_enabled ? 'Tạm dừng' : 'Bật tự động', 'automation', Boolean(p.rule_enabled || (isPageActive && p.has_page_token))],
+                    [p.rule_enabled ? 'Tạm dừng' : 'Bật tự động', 'automation', Boolean(p.rule_enabled || (isPageActive && canCheck))],
+                    ['Khôi phục tác vụ', 'resume_tasks', Boolean(p.send_ready)],
                 ];
-                if (!isPageActive && p.has_page_token) actions.push(['Kích hoạt kết nối', 'reactivate', true]);
+                if (!isPageActive && canCheck) actions.push(['Kích hoạt kết nối', 'reactivate', true]);
                 for (const [label, action, enabled] of actions) {
                     const button = document.createElement('button');
                     button.className = 'btn btn-sm btn-outline-primary me-1 mb-1';
@@ -1260,14 +1369,14 @@ def index():
                 }
                 tbody.appendChild(tr);
 
-                const modeTag = p.connection_mode === 'ANTIDETECT' ? '[CDP]' : (p.connection_mode === 'HYBRID' ? '[Hybrid]' : '[API]');
+                const modeTag = browserMode ? '[Trình duyệt]' : '[API]';
                 ruleSelect.innerHTML += `<option value="${escapeHtml(p.page_id)}">${escapeHtml(p.page_name)} ${modeTag} (${escapeHtml(p.page_id)})</option>`;
-                if (p.graph_ready) manualSelect.innerHTML += `<option value="${escapeHtml(p.page_id)}">${escapeHtml(p.page_name)} ${modeTag}</option>`;
+                if (p.send_ready) manualSelect.innerHTML += `<option value="${escapeHtml(p.page_id)}">${escapeHtml(p.page_name)} ${modeTag}</option>`;
                 filterPage.innerHTML += `<option value="${escapeHtml(p.page_id)}">${escapeHtml(p.page_name)}</option>`;
             });
 
             loadPageRule();
-            loadRecentPostsForManual();
+            document.getElementById('recentPostsContainer').innerHTML = '<small class="text-muted">Chọn Page rồi bấm Tải bài viết, hoặc dán link bài cần bình luận.</small>';
         }
 
         async function pageAction(page, action) {

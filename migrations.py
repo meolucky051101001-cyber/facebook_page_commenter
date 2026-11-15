@@ -92,6 +92,17 @@ def run_migrations(conn: sqlite3.Connection, preserve_auto_page_id: str = ""):
             conn.execute("ALTER TABLE tasks ADD COLUMN content_delay_minutes INTEGER")
             conn.execute("INSERT INTO schema_version (version) VALUES (6)")
 
+    if current_version < 7:
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("ALTER TABLE pages ADD COLUMN send_mode TEXT NOT NULL DEFAULT 'GRAPH_API' CHECK(send_mode IN ('GRAPH_API', 'BROWSER'))")
+            conn.execute("ALTER TABLE pages ADD COLUMN browser_status TEXT NOT NULL DEFAULT 'UNCHECKED'")
+            conn.execute("ALTER TABLE pages ADD COLUMN browser_checked_at TEXT")
+            conn.execute("ALTER TABLE pages ADD COLUMN browser_error TEXT")
+            conn.execute("ALTER TABLE pages ADD COLUMN browser_identity_id TEXT")
+            conn.execute("ALTER TABLE pages ADD COLUMN browser_profile_id TEXT")
+            conn.execute("INSERT INTO schema_version (version) VALUES (7)")
+
 
 def _apply_migration_v3(conn: sqlite3.Connection, preserve_auto_page_id: str = ""):
     """Adds per-Page connection/sheet state and defaults new automation to paused."""

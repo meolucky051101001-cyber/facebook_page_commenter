@@ -49,7 +49,7 @@ def test_v6_migration_preserves_all_statuses_and_is_repeatable(tmp_path):
         assert [row[:len(before[0])] for row in after] == before
         assert conn.execute("SELECT last_seen_post_time FROM pages").fetchone() == ("cursor",)
         assert conn.execute("SELECT is_enabled FROM page_rules").fetchone() == (1,)
-        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (6,)
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (7,)
         assert conn.execute("PRAGMA quick_check").fetchone() == ("ok",)
 
 
@@ -75,7 +75,7 @@ def test_v6_migration_rolls_back_if_interrupted(tmp_path):
         assert "send_cooldown_until" not in [row[1] for row in conn.execute("PRAGMA table_info(pages)")]
         assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (5,)
         migrations.run_migrations(conn)
-        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (6,)
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (7,)
 
 
 def test_lifespan_rejects_second_owner_before_recovery(monkeypatch):

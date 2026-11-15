@@ -12,6 +12,35 @@ import comment_content
 DB_PATH = Path(__file__).parent / "fb_commenter.db"
 
 
+def browser_identity_id(page: Dict[str, Any]) -> str:
+    """Numeric Page identity selected for browser work; names never establish identity."""
+    for value in (page.get("fb_profile_id"), page.get("page_id")):
+        value = str(value or "").strip()
+        if value and value.isascii() and value.isdigit():
+            return value
+    return ""
+
+
+def _selected_transport_ready_sql(alias: str = "p") -> str:
+    """SQL companion of comment_dispatch.send_ready; caller binds pilot Page ID."""
+    identity = f"""CASE
+        WHEN COALESCE({alias}.fb_profile_id, '') <> '' AND {alias}.fb_profile_id NOT GLOB '*[^0-9]*'
+            THEN {alias}.fb_profile_id
+        WHEN {alias}.page_id <> '' AND {alias}.page_id NOT GLOB '*[^0-9]*' THEN {alias}.page_id
+        ELSE '' END"""
+    return f"""(
+        ({alias}.send_mode = 'GRAPH_API'
+         AND {alias}.token_status IN ('OK', 'EXPIRING_SOON') AND {alias}.page_access_token_enc <> ''
+         AND ({alias}.page_id = ? OR ({alias}.connection_checked_at IS NOT NULL AND {alias}.connection_error IS NULL)))
+        OR ({alias}.send_mode = 'BROWSER' AND {alias}.browser_status = 'READY'
+            AND {alias}.browser_checked_at IS NOT NULL AND {alias}.browser_error IS NULL
+            AND COALESCE({alias}.antidetect_profile_id, '') <> ''
+            AND {alias}.browser_profile_id = {alias}.antidetect_profile_id
+            AND COALESCE({alias}.browser_identity_id, '') <> ''
+            AND {alias}.browser_identity_id = ({identity}))
+    )"""
+
+
 def local_day_key(dt_utc: datetime) -> str:
     """Returns the counter date for the configured local day (default UTC+7)."""
     return (dt_utc + timedelta(hours=config.DAILY_COUNTER_UTC_OFFSET_HOURS)).strftime("%Y-%m-%d")
@@ -108,11 +137,12 @@ def update_page_connection_check(
             ))
             if token_status in ("EXPIRED", "MISSING_PERMISSIONS", "IDENTITY_MISMATCH", "INVALID_SECRET"):
                 conn.execute("""
-                    UPDATE pages SET is_active = 0 WHERE page_id = ?
+                    UPDATE pages SET is_active = 0 WHERE page_id = ? AND send_mode = 'GRAPH_API'
                 """, (page_id,))
                 conn.execute("""
                     UPDATE tasks SET status = 'PAUSED', error_message = ?, updated_at = ?
                     WHERE page_id = ? AND status = 'PENDING'
+                      AND EXISTS (SELECT 1 FROM pages p WHERE p.page_id = tasks.page_id AND p.send_mode = 'GRAPH_API')
                 """, (error or "Tạm dừng do kết nối Page không hợp lệ.", checked_at, page_id))
     conn.close()
 
@@ -266,7 +296,7 @@ def upsert_antidetect_page(
         conn.execute("BEGIN IMMEDIATE")
         cur = conn.cursor()
         cur.execute(
-            """SELECT page_id, page_access_token_enc, token_status, fb_profile_id FROM pages
+            """SELECT page_id, page_access_token_enc, token_status, fb_profile_id, antidetect_profile_id FROM pages
                WHERE page_id = ? OR fb_profile_id = ?""",
             (fb_page_id, fb_page_id)
         )
@@ -277,6 +307,11 @@ def upsert_antidetect_page(
 
         if existing:
             target_page_id = existing["page_id"]
+            mapping_changed = existing["antidetect_profile_id"] != antidetect_profile_id
+            if mapping_changed and conn.execute(
+                "SELECT 1 FROM tasks WHERE page_id=? AND status='SENDING' LIMIT 1", (target_page_id,)
+            ).fetchone():
+                return {"action": "conflict", "page_id": target_page_id}
             has_token = bool(existing["page_access_token_enc"])
             new_mode = "HYBRID" if has_token else "ANTIDETECT"
             new_token_status = existing["token_status"] if has_token else "ANTIDETECT_READY"
@@ -303,6 +338,17 @@ def upsert_antidetect_page(
                 target_page_id
             ))
             result_action = "linked_hybrid" if has_token else "updated"
+            if mapping_changed:
+                conn.execute("""
+                    UPDATE pages SET browser_status='UNCHECKED', browser_checked_at=NULL,
+                        browser_error=NULL, browser_identity_id=NULL, browser_profile_id=NULL
+                    WHERE page_id=?
+                """, (target_page_id,))
+                conn.execute("""
+                    UPDATE tasks SET status='PAUSED', error_message=?, updated_at=?
+                    WHERE page_id=? AND status='PENDING'
+                      AND EXISTS (SELECT 1 FROM pages p WHERE p.page_id=tasks.page_id AND p.send_mode='BROWSER')
+                """, ("Profile trình duyệt đã đổi. Kiểm tra kết nối rồi tiếp tục tác vụ.", now, target_page_id))
         else:
             conn.execute("""
                 INSERT INTO pages (
@@ -353,7 +399,9 @@ def get_all_pages() -> List[Dict[str, Any]]:
                p.page_url, p.fb_profile_id,
                a.account_name, r.delay_minutes, r.templates, r.comment_sequence, r.content_revision, r.max_comments_per_day,
                r.is_enabled as rule_enabled, r.source_error, r.source_synced_at,
-               p.connection_checked_at, p.connection_error
+               p.connection_checked_at, p.connection_error,
+               p.send_mode, p.browser_status, p.browser_checked_at, p.browser_error,
+               p.browser_identity_id, p.browser_profile_id
         FROM pages p
         LEFT JOIN accounts a ON p.account_id = a.id
         LEFT JOIN page_rules r ON p.page_id = r.page_id
@@ -375,7 +423,9 @@ def get_page(page_id: str) -> Optional[Dict[str, Any]]:
                p.connection_mode, p.antidetect_profile_id, p.antidetect_profile_name,
                p.page_url, p.fb_profile_id,
                r.delay_minutes, r.templates, r.comment_sequence, r.content_revision, r.max_comments_per_day, r.is_enabled as rule_enabled,
-               r.source_error, r.source_synced_at, p.connection_checked_at, p.connection_error
+               r.source_error, r.source_synced_at, p.connection_checked_at, p.connection_error,
+               p.send_mode, p.browser_status, p.browser_checked_at, p.browser_error,
+               p.browser_identity_id, p.browser_profile_id
         FROM pages p
         LEFT JOIN page_rules r ON p.page_id = r.page_id
         WHERE p.page_id = ? OR p.fb_profile_id = ?
@@ -424,11 +474,22 @@ def invalidate_page_token(page_id: str, encrypted_token: str) -> bool:
             conn.execute("""
                 UPDATE tasks SET status = 'PAUSED', error_message = ?, updated_at = ?
                 WHERE page_id = ? AND status = 'PENDING'
+                  AND EXISTS (SELECT 1 FROM pages p WHERE p.page_id=tasks.page_id AND p.send_mode='GRAPH_API')
             """, (message, now, page_id))
         return bool(changed)
 
 
-def get_page_for_dispatch(page_id: str) -> Optional[Dict[str, Any]]:
+def get_page_for_dispatch(page_id: str, *, transport: str = "selected") -> Optional[Dict[str, Any]]:
+    if transport not in ("selected", "GRAPH_API"):
+        raise ValueError("Cách gửi bình luận không hợp lệ.")
+    page = get_page(page_id)
+    if not page:
+        return None
+    if transport == "selected" and page.get("send_mode") == "BROWSER":
+        # Browser operation never depends on the encryption key or a Graph token.
+        page["page_access_token"] = ""
+        return page
+    page_id = page["page_id"]
     page = get_page_with_decrypted_token(page_id)
     if page and page["token_status"] == "INVALID_SECRET":
         if not invalidate_page_token(page_id, page.get("page_access_token_enc", "")):
@@ -437,15 +498,89 @@ def get_page_for_dispatch(page_id: str) -> Optional[Dict[str, Any]]:
     return page
 
 
+def set_page_send_mode(page_id: str, send_mode: str) -> Dict[str, Any]:
+    """Select a transport explicitly, preserving consent, history, counters and cursors."""
+    if send_mode not in ("GRAPH_API", "BROWSER"):
+        raise ValueError("Chọn GRAPH_API hoặc BROWSER.")
+    now = datetime.now(timezone.utc).isoformat()
+    with closing(get_connection()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute("SELECT * FROM pages WHERE page_id=? OR fb_profile_id=?", (page_id, page_id)).fetchall()
+        if len(rows) != 1:
+            raise ValueError("Không tìm thấy duy nhất một Page.")
+        page = dict(rows[0])
+        page_id = page["page_id"]
+        if page["send_mode"] != send_mode:
+            if conn.execute("SELECT 1 FROM tasks WHERE page_id=? AND status='SENDING' LIMIT 1", (page_id,)).fetchone():
+                raise ValueError("Page đang gửi bình luận. Chờ hoàn tất rồi đổi cách gửi.")
+            if send_mode == "BROWSER" and (not page.get("antidetect_profile_id") or not browser_identity_id(page)):
+                raise ValueError("Page cần profile Antidetect và ID Page dạng số đã xác định.")
+            conn.execute("""
+                UPDATE pages SET send_mode=?, browser_status='UNCHECKED', browser_checked_at=NULL,
+                    browser_error=NULL, browser_identity_id=NULL, browser_profile_id=NULL, updated_at=?
+                WHERE page_id=?
+            """, (send_mode, now, page_id))
+            conn.execute("""
+                UPDATE tasks SET status='PAUSED', error_message=?, updated_at=?
+                WHERE page_id=? AND status='PENDING'
+            """, ("Cách gửi đã đổi. Kiểm tra kết nối rồi tiếp tục tác vụ.", now, page_id))
+    return get_page(page_id)
+
+
+def update_page_browser_check(page_id: str, checked_at: Optional[str] = None,
+                              browser_status: str = "UNCHECKED", error: Optional[str] = None,
+                              identity_id: Optional[str] = None, profile_id: Optional[str] = None) -> bool:
+    """Persist proof only for the currently selected profile and numeric Page identity."""
+    if browser_status not in ("UNCHECKED", "READY", "LOGIN_REQUIRED", "CHECKPOINT", "ERROR"):
+        raise ValueError("Trạng thái kết nối trình duyệt không hợp lệ.")
+    checked_at = checked_at or datetime.now(timezone.utc).isoformat()
+    with closing(get_connection()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM pages WHERE page_id=?", (page_id,)).fetchone()
+        if not row or row["send_mode"] != "BROWSER":
+            return False
+        page = dict(row)
+        expected_identity = browser_identity_id(page)
+        if identity_id is not None and identity_id != expected_identity:
+            return False
+        if profile_id is not None and profile_id != page.get("antidetect_profile_id"):
+            return False
+        if browser_status == "READY" and (error or not expected_identity or not profile_id or not identity_id):
+            return False
+        conn.execute("""
+            UPDATE pages SET browser_status=?, browser_checked_at=?, browser_error=?,
+                browser_identity_id=?, browser_profile_id=?, updated_at=? WHERE page_id=?
+        """, (browser_status, checked_at, error or None,
+               identity_id if browser_status == "READY" else None,
+               profile_id if browser_status == "READY" else None, checked_at, page_id))
+        if browser_status != "READY":
+            conn.execute("""
+                UPDATE tasks SET status='PAUSED', error_message=?, updated_at=?
+                WHERE page_id=? AND status='PENDING'
+            """, (error or "Cần kiểm tra kết nối trình duyệt của Page.", checked_at, page_id))
+    return True
+
+
+def invalidate_page_browser(page_id: str, browser_status: str = "ERROR", error: Optional[str] = None,
+                            *, profile_id: Optional[str] = None, identity_id: Optional[str] = None) -> bool:
+    if browser_status == "READY":
+        raise ValueError("Dùng kiểm tra kết nối để xác nhận trình duyệt sẵn sàng.")
+    return update_page_browser_check(page_id, browser_status=browser_status, error=error,
+                                     profile_id=profile_id, identity_id=identity_id)
+
+
 def update_page_status(page_id: str, is_active: bool, token_status: str, status_note: Optional[str] = None):
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
     with conn:
         conn.execute("""
             UPDATE pages
-            SET is_active = ?, token_status = ?, status_note = ?, updated_at = ?
+            SET is_active = CASE WHEN send_mode='BROWSER' AND ?=0
+                    AND ? IN ('EXPIRED', 'MISSING_PERMISSIONS', 'INVALID_SECRET', 'IDENTITY_MISMATCH')
+                    THEN is_active ELSE ? END,
+                token_status = ?, status_note = ?, updated_at = ?
             WHERE page_id = ?
-        """, (1 if is_active else 0, token_status, status_note, now, page_id))
+        """, (1 if is_active else 0, token_status, 1 if is_active else 0, token_status, status_note, now, page_id))
         if token_status in ("EXPIRED", "MISSING_PERMISSIONS", "INVALID_SECRET"):
             # Pause all pending tasks of this page so they don't keep failing
             conn.execute("""
@@ -454,6 +589,7 @@ def update_page_status(page_id: str, is_active: bool, token_status: str, status_
                     error_message = COALESCE(?, 'Tạm dừng do Token của Page hết hạn hoặc thiếu quyền'),
                     updated_at = ?
                 WHERE page_id = ? AND status = 'PENDING'
+                  AND EXISTS (SELECT 1 FROM pages p WHERE p.page_id=tasks.page_id AND p.send_mode='GRAPH_API')
             """, (status_note, now, page_id))
     conn.close()
 
@@ -736,9 +872,11 @@ def queue_auto_scan(page: Dict[str, Any], posts: List[Dict[str, Any]], checkpoin
     """Commit a scan cursor and its tasks together against the rules used for that scan."""
     with closing(get_connection()) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
-        updated = conn.execute("""
+        updated = conn.execute(f"""
             UPDATE pages SET last_seen_post_time = ?
             WHERE page_id = ? AND is_active = 1 AND last_seen_post_time IS ?
+              AND send_mode = ? AND {_selected_transport_ready_sql('pages')}
+              AND (send_mode != 'BROWSER' OR (antidetect_profile_id IS ? AND browser_identity_id IS ?))
               AND EXISTS (
                   SELECT 1 FROM page_rules r WHERE r.page_id = pages.page_id
                     AND r.is_enabled = 1 AND r.source_error IS NULL
@@ -746,6 +884,8 @@ def queue_auto_scan(page: Dict[str, Any], posts: List[Dict[str, Any]], checkpoin
               )
         """, (
             checkpoint, page["page_id"], page["last_seen_post_time"],
+            page.get("send_mode", "GRAPH_API"), config.PILOT_PAGE_ID,
+            page.get("antidetect_profile_id"), page.get("browser_identity_id"),
             page["templates"], page["delay_minutes"], page["comment_sequence"],
         ))
         if not updated.rowcount:
@@ -799,7 +939,7 @@ def get_due_tasks(limit: int = 10, page_id: Optional[str] = None, include_auto: 
         SELECT t.*, p.page_name, p.last_comment_at,
                p.comments_today_count, p.comments_today_date,
                p.connection_mode, p.antidetect_profile_id, p.antidetect_profile_name,
-               p.page_url, p.fb_profile_id,
+               p.page_url, p.fb_profile_id, p.send_mode, p.browser_status,
                r.max_comments_per_day
         FROM tasks t
         JOIN pages p ON t.page_id = p.page_id
@@ -807,9 +947,8 @@ def get_due_tasks(limit: int = 10, page_id: Optional[str] = None, include_auto: 
         WHERE t.status = 'PENDING' AND t.scheduled_at <= ? AND p.is_active = 1
           AND (? IS NULL OR t.page_id = ?)
           AND (t.source != 'AUTO' OR (? AND r.is_enabled = 1 AND (r.source_error IS NULL OR TRIM(r.source_error) = '')))
-          AND p.token_status IN ('OK', 'EXPIRING_SOON') AND p.page_access_token_enc <> ''
           AND (p.send_cooldown_until IS NULL OR p.send_cooldown_until <= ?)
-          AND (p.page_id = ? OR (p.connection_checked_at IS NOT NULL AND p.connection_error IS NULL))
+          AND {_selected_transport_ready_sql()}
           AND (COALESCE(t.sequence_step, 1) <= 1 OR EXISTS (
               SELECT 1 FROM tasks previous
               WHERE previous.page_id = t.page_id AND previous.post_id = t.post_id
@@ -855,14 +994,14 @@ def claim_due_task(task_id: int, now_iso: str) -> Optional[Dict[str, Any]]:
             except ValueError as exc:
                 conn.execute("UPDATE page_rules SET source_error=? WHERE page_id=?", (str(exc), target["page_id"]))
                 return None
-        row = conn.execute("""
+        row = conn.execute(f"""
             SELECT t.* FROM tasks t
             JOIN pages p ON p.page_id = t.page_id
             LEFT JOIN page_rules r ON r.page_id = t.page_id
             WHERE t.id = ? AND t.status = 'PENDING' AND t.scheduled_at <= ?
-              AND p.is_active = 1 AND p.token_status IN ('OK', 'EXPIRING_SOON')
+              AND p.is_active = 1
               AND (p.send_cooldown_until IS NULL OR p.send_cooldown_until <= ?)
-              AND (p.page_id = ? OR (p.connection_checked_at IS NOT NULL AND p.connection_error IS NULL))
+              AND {_selected_transport_ready_sql()}
               AND (t.source != 'AUTO' OR (r.is_enabled = 1 AND r.source_error IS NULL))
               AND (COALESCE(t.sequence_step, 1) <= 1 OR EXISTS (
                   SELECT 1 FROM tasks previous
@@ -885,16 +1024,18 @@ def release_task_lock(task_id: int) -> bool:
     with conn:
         cursor = conn.cursor()
         now_iso = datetime.now(timezone.utc).isoformat()
-        cursor.execute("""
+        cursor.execute(f"""
             UPDATE tasks
             SET status = CASE WHEN source = 'AUTO' AND EXISTS (
                     SELECT 1 FROM page_rules WHERE page_id = tasks.page_id AND is_enabled = 0
                  ) THEN 'CANCELLED' WHEN EXISTS (
-                     SELECT 1 FROM pages WHERE page_id = tasks.page_id
-                       AND token_status NOT IN ('OK', 'EXPIRING_SOON')
+                     SELECT 1 FROM pages p WHERE p.page_id = tasks.page_id
+                       AND (p.is_active != 1
+                            OR (p.send_mode='GRAPH_API' AND p.token_status NOT IN ('OK', 'EXPIRING_SOON'))
+                            OR (p.send_mode='BROWSER' AND NOT COALESCE({_selected_transport_ready_sql()}, 0)))
                  ) THEN 'PAUSED' ELSE 'PENDING' END, locked_at = NULL, updated_at = ?
             WHERE id = ? AND status = 'SENDING'
-        """, (now_iso, task_id))
+        """, (config.PILOT_PAGE_ID, now_iso, task_id))
         released = cursor.rowcount > 0
     conn.close()
     return released

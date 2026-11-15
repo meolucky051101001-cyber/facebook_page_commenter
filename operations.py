@@ -347,7 +347,7 @@ def moderate(comment_id, action, message="", *, automatic=False, expected_rules=
         item = conn.execute("SELECT * FROM incoming_comments WHERE comment_id=?", (comment_id,)).fetchone()
         if not item:
             raise ValueError("Bình luận chưa có trong hộp thư.")
-        page = db.get_page_for_dispatch(item["page_id"])
+        page = db.get_page_for_dispatch(item["page_id"], transport="GRAPH_API")
         if not comment_dispatch.graph_ready(page):
             raise ValueError("Page cần kết nối Meta hợp lệ.")
         with conn:
