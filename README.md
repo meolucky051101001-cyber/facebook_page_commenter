@@ -2,14 +2,18 @@
 
 Hệ thống quản lý Fanpage đa tài khoản độc lập, định tuyến kịch bản bình luận riêng cho từng Page và tự động lên lịch comment sau một khoảng thời gian ($X$ phút) kể từ khi bài viết mới được đăng.
 
+Cập nhật 16/11/2026: người dùng chọn **Meta Graph API làm đường xử lý cho 19 Page HYBRID** (9 + 10); 47 ANTIDETECT nằm ngoài đợt chạy, giữ yêu cầu pause. Graph lỗi không fallback Browser. Số lượng này được báo tại DB nguồn `.gemini`, chưa xác nhận trong workspace; giữ DB workspace và đồng bộ riêng sau. Xem [kế hoạch Graph mới nhất](docs/KE-HOACH-TICH-HOP-19-PAGE-GRAPH-HYBRID.md) để biết mapping, các bước sửa/test, Pilot một Page và mở rộng theo phạm vi được duyệt.
+
+Đây mới là lựa chọn trong kế hoạch, chưa đổi mode hoặc bật AUTO. Yêu cầu hiện tại là tạm dừng đến khi người dùng cho phép; chưa kiểm tra trạng thái tiến trình thật. Source còn khôi phục run state cũ, maintenance có thể gọi Graph khi pause và Pilot còn miễn một phần xác minh; cần sửa các điểm dùng chung cùng mốc kiểm tra trước POST và recovery trước triển khai. Ba lỗi P1 Browser được hoãn riêng; lỗi P2 cấu hình khóa vẫn bắt buộc sửa cho Graph. Graph API là giao diện chính thức nhưng không bảo đảm tránh hạn chế/khóa; chính sách và giới hạn của Meta vẫn áp dụng.
+
 ---
 
 ## 🎯 Tính năng nổi bật
 
-1. **Quản lý Đa tài khoản cô lập (Anti-Chain Ban):**
-   - Chỉ dùng 1 App Meta duy nhất (thêm các nick làm App Tester).
+1. **Quản lý nhiều tài khoản và Page:**
+   - Hỗ trợ dùng chung App Meta; quyền hữu hiệu và điều kiện truy cập phải được xác minh cho từng Page/thao tác.
    - Mỗi Fanpage được lưu trữ và sử dụng `Page Access Token` độc lập.
-   - Khi 1 nick bị checkpoint hoặc mất quyền, chỉ Page của nick đó dừng, các Page ở nick khác vẫn hoạt động 100% bình thường.
+   - Phân loại lỗi theo phạm vi ảnh hưởng. Giới hạn cấp tài khoản hoặc ứng dụng có thể ảnh hưởng nhiều Page; kế hoạch Graph yêu cầu cooldown/dừng đúng phạm vi, không bảo đảm cô lập mọi hạn chế.
 
 2. **Kịch bản Bình luận riêng biệt theo Page:**
    - Cài đặt thời gian chờ tùy chỉnh ($X$ phút) cho từng Page.
@@ -29,6 +33,8 @@ Hệ thống quản lý Fanpage đa tài khoản độc lập, định tuyến k
 ---
 
 ## 🚀 Hướng dẫn khởi chạy
+
+Các lệnh dưới đây là hướng dẫn chung. Đợt tích hợp Graph hiện chưa được phép khởi chạy thật; cần hoàn tất các điều kiện của kế hoạch và được duyệt thao tác vận hành trước khi dùng DB có token.
 
 ### 1. Cài đặt thư viện phụ thuộc (nếu chưa có)
 ```bash
@@ -79,9 +85,19 @@ Token lỗi giải mã sẽ được đánh dấu INVALID_SECRET và tác vụ G
 
 ### Bình luận bằng trình duyệt Antidetect
 
-Đồng bộ danh mục Antidetect, chọn **Trình duyệt Antidetect** ở Page, bấm **Kiểm tra trình duyệt**, đồng bộ Sheet rồi **Bật tự động**. Nếu profile hết phiên, đăng nhập Facebook lại trong đúng profile rồi kiểm tra lại. Chế độ này dùng phiên trình duyệt, không yêu cầu Page Access Token.
+Phần này mô tả nhánh Browser hiện có để tham khảo. Hướng triển khai đang chọn là Graph; Browser chưa được phép chạy trong đợt này. Ba lỗi P1 về pause cuối DOM, nhận diện hạn chế và lỗi lưu checkpoint vẫn chưa sửa, xem [kế hoạch Browser để làm sau](docs/KE-HOACH-SUA-4-LOI-AN-TOAN-BROWSER.md). Các mô tả cơ chế bên dưới chưa phải xác nhận nghiệm thu đầy đủ.
+
+AUTO theo dõi bài đăng mới từ lúc bật cho từng Page. Mốc bài đã thấy và hàng đợi được lưu cùng nhau trong DB, tiếp tục dùng sau khi khởi động lại. Bật lại sau khi tắt AUTO tạo mốc bắt đầu mới. Tool vẫn kiểm tra danh sách bài định kỳ để phát hiện bài mới, chỉ mở bài cần gửi khi tác vụ đến hạn. Bài phát hiện muộn hơn `MAX_POST_AGE_MIN` (mặc định 120 phút) được bỏ qua. Với Browser, bước xác minh bài và gửi bình luận dùng cùng một tab, có kiểm tra lại danh tính Page và nội dung trước khi gửi.
+
+Quy trình tham khảo sau khi hoàn tất sửa, nghiệm thu và được phép mở lại Browser: đồng bộ danh mục Antidetect, chọn **Trình duyệt Antidetect** ở Page, bấm **Kiểm tra trình duyệt**, đồng bộ Sheet rồi **Bật tự động** trong phạm vi được duyệt. Nếu profile hết phiên, đăng nhập Facebook lại trong đúng profile rồi kiểm tra lại. Chế độ này dùng phiên trình duyệt, không yêu cầu Page Access Token.
 
 Tool xác minh numeric ID Page, bài viết, người bình luận và nội dung ngay trước Enter. Tên Page giống nhau không đủ để xác minh. Mỗi profile chỉ xử lý một thao tác cùng lúc. Tool chỉ đóng phiên browser có `launch_id` do nó sở hữu. Đổi cách gửi tạm dừng tác vụ đang chờ; cần **Khôi phục tác vụ** riêng sau khi kiểm tra, quota và lịch sử vẫn giữ.
+
+Mọi lượt kiểm tra kết nối, quét bài, xác minh bài nhập tay hoặc mở bài để gửi đều dùng chung ngân sách của profile: `BROWSER_MAX_OPERATIONS_PER_PROFILE_PER_DAY=100`, cách nhau ít nhất `BROWSER_MIN_GAP_PER_PROFILE_SEC=60` giây theo mặc định. Lượt đã giữ vẫn được tính khi thao tác thất bại; tranh chấp khóa hoặc lượt bị chặn không tính thêm. Bộ đếm theo ngày UTC+7, lưu qua restart và đổi Page. Scanner luân phiên các Page cùng profile theo lần thử quét gần nhất, kể cả khi không có bài mới; thứ tự này cũng giữ qua restart. Hạn mức bình luận từng Page vẫn áp dụng riêng. Đây là giới hạn tải của tool, không phải ngưỡng Facebook bảo đảm không checkpoint; thao tác ngoài tool không được tính.
+
+Khi thấy đăng nhập lại, checkpoint hoặc thông báo hạn chế hoạt động được hỗ trợ, tool chặn toàn profile, làm mất hiệu lực kiểm tra Browser của các Page cùng profile và chuyển tác vụ PENDING sang PAUSED. Nếu đã nhấn Enter mà chưa xác nhận được kết quả, tác vụ giữ NEED_CHECK, không tự gửi lại. Khóa chặn tồn tại qua restart. Sau khi tự xử lý trên Facebook, dùng **Kiểm tra trình duyệt** để kiểm tra lại (vẫn chịu hạn mức/khoảng cách), rồi kiểm tra từng Page và **Khôi phục tác vụ** riêng. Kiểm tra thành công không tự khôi phục hàng đợi cũ. Các Page ở profile khác và luồng Graph không bị khóa theo profile này.
+
+Trước khi bật AUTO Browser, chạy `python -m pytest -q`: test dùng DB tạm, dữ liệu giả, vô hiệu hóa đọc/ghi `.env` trước khi import cấu hình và chặn HTTP thật. Bộ test kiểm tra hạn mức dùng chung, đồng thời/restart, dừng trước Enter, kết quả chưa rõ sau Enter, đổi danh tính/nội dung/cấu hình và không gửi lại. Kiểm thử mô phỏng chưa thay thế nghiệm thu layout Facebook thật: phải xác minh đúng numeric actor, chủ bài, timestamp tuyệt đối và ID bình luận trên một Page được phép trước khi mở rộng. Không bật AUTO nếu các bằng chứng này chưa đủ.
 
 Khi đổi cách gửi, lịch AUTO còn đối chiếu permalink trong cùng Page để tránh tạo lại chuỗi nếu Graph ID khác Reel ID. Chuỗi cũ giữ nguyên nội dung và thời gian. Việc đối chiếu link không thay thế bước xác minh bài và người đăng trước khi gửi.
 

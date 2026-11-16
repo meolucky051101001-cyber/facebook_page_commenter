@@ -22,9 +22,11 @@ def browser_page(ready_pages, monkeypatch):
     db.set_page_send_mode(page_id, "BROWSER")
     assert db.update_page_browser_check(page_id, datetime.now(timezone.utc).isoformat(), "READY",
                                         identity_id=page_id, profile_id="profile-1")
-    monkeypatch.setattr(browser, "verify_post_for_page_cdp", lambda page, post, **kwargs: {
-        "clean_post_id": post, "permalink_url": f"https://www.facebook.com/{post}",
-    })
+
+    def unexpected_browser_preflight(*args, **kwargs):
+        raise AssertionError("Browser dispatch must verify and send in one tab")
+
+    monkeypatch.setattr(browser, "verify_post_for_page_cdp", unexpected_browser_preflight)
 
     def unexpected(*args, **kwargs):
         raise AssertionError("Selected BROWSER mode must never call Graph")
@@ -151,7 +153,7 @@ def test_browser_busy_preserves_retry_and_quota(browser_page, monkeypatch):
     def busy(*args, **kwargs):
         raise browser.BrowserAutomationError("Profile đang được dùng.", "BROWSER_BUSY", "READY")
 
-    monkeypatch.setattr(browser, "verify_post_for_page_cdp", busy)
+    monkeypatch.setattr(browser, "send_page_comment_cdp", busy)
     scheduler.execute_due_tasks()
     task = assert_task(browser_page, "PENDING")
     assert task["locked_at"] is None
@@ -170,7 +172,7 @@ def test_busy_profile_cannot_starve_other_pages(browser_page, ready_pages, monke
         raise browser.BrowserAutomationError("Profile đang được dùng.", "BROWSER_BUSY", "READY")
 
     calls = []
-    monkeypatch.setattr(browser, "verify_post_for_page_cdp", busy)
+    monkeypatch.setattr(browser, "send_page_comment_cdp", busy)
     monkeypatch.setattr(meta_client, "verify_post_belongs_to_page", lambda post, *args: {"clean_post_id": post})
     monkeypatch.setattr(meta_client, "post_comment", lambda post, page, *args: calls.append(page) or {
         "success": True, "comment_id": "123_456",
@@ -189,7 +191,7 @@ def test_browser_auth_failure_pauses_browser_only(browser_page, monkeypatch, sta
     def auth(*args, **kwargs):
         raise browser.BrowserAutomationError("Cần kiểm tra profile.", "TOKEN_EXPIRED", status)
 
-    monkeypatch.setattr(browser, "verify_post_for_page_cdp", auth)
+    monkeypatch.setattr(browser, "send_page_comment_cdp", auth)
     scheduler.execute_due_tasks()
     assert {task["status"] for task in db.get_all_tasks(page_id=browser_page)} == {"PAUSED"}
     page = db.get_page(browser_page)

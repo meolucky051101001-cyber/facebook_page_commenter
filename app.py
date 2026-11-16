@@ -427,13 +427,19 @@ def verify_connected_page(page_id: str):
         raise HTTPException(status_code=404, detail="Không tìm thấy Page")
     if page.get("send_mode") == "BROWSER":
         result = antidetect_client.verify_page_connection_cdp(page)
-        if result.get("category") == "BROWSER_BUSY":
+        if result.get("category") in ("BROWSER_BUSY", "BROWSER_LIMIT", "BROWSER_BLOCKED"):
             raise HTTPException(409, result.get("error") or "Profile đang bận.")
+        scheduler._record_browser_connection_failure(page, result)
+        if not result.get("success") and result.get("profile_safety_recorded"):
+            # The sender recorded the profile failure while holding its lock.
+            # Do not overwrite a newer recovery after that lock was released.
+            raise HTTPException(409, result.get("error") or "Profile cần kiểm tra lại.")
         status = result.get("browser_status") or "ERROR"
         saved = db.update_page_browser_check(
             page_id, datetime.now(timezone.utc).isoformat(), status,
             error=result.get("error"), identity_id=result.get("identity_id"),
             profile_id=result.get("profile_id"),
+            expected_generation=result.get("safety_generation"),
         )
         if not result.get("success") or not saved:
             raise HTTPException(409, result.get("error") or "Chưa xác minh được đúng Page trong profile đã chọn.")
@@ -1028,6 +1034,7 @@ def index():
                     <div class="col-md-7">
                         <div class="card p-4">
                             <h5 class="fw-bold mb-3"><i class="fa-solid fa-list-check text-primary"></i> Danh sách Fanpage (<span id="pageCount">0</span>)</h5>
+                            <p class="small text-muted">Bật tự động để theo dõi bài đăng mới từ thời điểm bật. Tool kiểm tra danh sách bài định kỳ và lưu lịch sử xử lý.</p>
                             <div class="table-responsive" style="max-height: 620px; overflow-y: auto;">
                                 <table class="table align-middle">
                                     <thead class="table-light sticky-top">
@@ -1304,7 +1311,8 @@ def index():
                 const isPageActive = Number(p.is_active) === 1;
                 const browserMode = p.send_mode === 'BROWSER';
                 const browserLabels = {READY: 'Đã xác minh Page', UNCHECKED: 'Chưa kiểm tra',
-                    LOGIN_REQUIRED: 'Cần đăng nhập Facebook', CHECKPOINT: 'Cần xác minh Facebook', ERROR: 'Cần kiểm tra lại'};
+                    LOGIN_REQUIRED: 'Cần đăng nhập Facebook', CHECKPOINT: 'Cần xác minh Facebook',
+                    RESTRICTED: 'Facebook hạn chế hoạt động', ERROR: 'Cần kiểm tra lại'};
                 const tokenLabels = {OK: 'Token hợp lệ', EXPIRING_SOON: 'Token sắp hết hạn',
                     EXPIRED: 'Token hết hạn', INVALID_SECRET: 'Cần kết nối lại token',
                     MISSING_PERMISSIONS: 'Thiếu quyền Page'};
@@ -1320,7 +1328,7 @@ def index():
                 const tr = document.createElement('tr');
                 tr.innerHTML = `
                     <td><strong>${escapeHtml(p.page_name)}</strong><br><small class="text-muted">ID: ${escapeHtml(p.page_id)}</small></td>
-                    <td><span class="badge bg-light text-dark border text-wrap text-start">${escapeHtml(srcLabel)}</span></td>
+                    <td><span class="badge bg-light text-dark border text-wrap text-start">${escapeHtml(srcLabel)}</span>${browserMode ? '<br><small>Thao tác profile hôm nay: ' + escapeHtml(p.profile_operations_today ?? '—') + '/' + escapeHtml(p.profile_operations_limit ?? '—') + '</small>' : ''}</td>
                     <td><div class="send-mode-control mb-1"></div>${activeBadge}<br>${badgeToken}<br><small class="text-muted">${escapeHtml((browserMode ? p.browser_error : p.connection_error) || p.send_error || p.scan_error || '')}</small></td>
                     <td>${p.rule_enabled ? 'Đã bật' : 'Tạm dừng'}<br><small>${p.delay_minutes ?? '—'} phút · Đã dùng ${p.comments_used_today}/${p.max_comments_per_day ?? '—'}, còn ${p.comments_remaining_today}<br>${escapeHtml(p.source_error || p.send_wait_reason || '')}${p.next_send_at ? '<br>Thử tiếp: ' + escapeHtml(new Date(p.next_send_at).toLocaleString('vi-VN', {timeZone:'Asia/Bangkok'})) : ''}</small></td>
                     <td></td>

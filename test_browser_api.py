@@ -154,3 +154,21 @@ def test_read_auth_failure_invalidates_browser_readiness_immediately(client, che
     monkeypatch.setattr(browser, "get_recent_posts_for_page_cdp", logged_out)
     assert client.get(f"/api/pages/{checked}/recent_posts").status_code == 409
     assert db.get_page(checked)["browser_status"] == "LOGIN_REQUIRED"
+
+
+def test_recorded_failure_does_not_overwrite_a_later_recovery(client, checked, monkeypatch):
+    import browser_safety
+
+    def late_failure(page):
+        browser_safety.block("profile-one", "CHECKPOINT", "Synthetic checkpoint")
+        generation = browser_safety.status("profile-one")["generation"]
+        recovered = browser_safety.clear_block("profile-one", generation)
+        assert db.update_page_browser_check(checked, browser_status="READY", identity_id=checked,
+                                            profile_id="profile-one", expected_generation=recovered["generation"])
+        return {"success": False, "category": "TOKEN_EXPIRED", "browser_status": "CHECKPOINT",
+                "error": "Old synthetic failure", "profile_id": "profile-one", "identity_id": None,
+                "profile_safety_recorded": True}
+
+    monkeypatch.setattr(browser, "verify_page_connection_cdp", late_failure)
+    assert client.post(f"/api/pages/{checked}/check").status_code == 409
+    assert db.get_page(checked)["browser_status"] == "READY"

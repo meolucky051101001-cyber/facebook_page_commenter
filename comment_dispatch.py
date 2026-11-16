@@ -10,6 +10,7 @@ import threading
 
 import config
 import database as db
+import browser_safety
 
 _locks = {}
 _locks_lock = threading.Lock()
@@ -41,7 +42,8 @@ def browser_ready(page):
                 and not page.get("browser_error") and page.get("antidetect_profile_id")
                 and page.get("browser_profile_id") == page.get("antidetect_profile_id")
                 and page.get("browser_identity_id")
-                and page.get("browser_identity_id") == db.browser_identity_id(page))
+                and page.get("browser_identity_id") == db.browser_identity_id(page)
+                and browser_safety.status(page["antidetect_profile_id"])["browser_status"] == "READY")
 
 
 def send_ready(page):
@@ -66,7 +68,7 @@ class Decision:
                 "retry_at": self.retry_at, "message": self.message}
 
 
-def check(page_id, paused, *, automatic=False, require_sheet=False, transport="GRAPH_API"):
+def check(page_id, paused, *, automatic=False, require_sheet=False, transport="GRAPH_API", profile_reserved=False):
     if paused():
         return Decision("SYSTEM_PAUSED", message="Hệ thống đang tạm dừng gửi bình luận.")
     page = db.get_page_for_dispatch(page_id, transport=transport)
@@ -78,6 +80,13 @@ def check(page_id, paused, *, automatic=False, require_sheet=False, transport="G
         return Decision("AUTOMATION_PAUSED", page, message="Tự động của Page đang tạm dừng hoặc cấu hình chưa hợp lệ.")
     now = datetime.now(timezone.utc)
     waits = []
+    if transport == "selected" and page.get("send_mode") == "BROWSER":
+        safety = browser_safety.status(page["antidetect_profile_id"])
+        if not safety["ready"]:
+            if not safety["retry_at"]:
+                return Decision(safety["reason"], page, message=safety["message"])
+            if not profile_reserved:
+                waits.append((safety["retry_at"], safety["reason"], safety["message"]))
     cooldown = db.get_send_cooldown(page, now)
     if cooldown:
         waits.append((cooldown, "WAIT_RATE_LIMIT", "Page đang chờ giới hạn gửi."))
@@ -122,8 +131,18 @@ def page_status(page, paused=False):
         reason = page.get("browser_error") or "Page cần kiểm tra kết nối trình duyệt"
     elif page.get("send_mode", "GRAPH_API") == "GRAPH_API" and (not page.get("is_active") or page.get("token_status") not in ("OK", "EXPIRING_SOON")):
         reason = page.get("status_note") or "Page cần kết nối Meta hợp lệ"
+    profile = {}
+    if page.get("send_mode") == "BROWSER" and page.get("antidetect_profile_id"):
+        safety = browser_safety.status(page["antidetect_profile_id"])
+        profile = {"profile_operations_today": safety["count"],
+                   "profile_operations_limit": safety.get("max_operations_per_day"),
+                   "profile_wait_reason": safety["message"] if not safety["ready"] else None,
+                   "profile_retry_at": safety["retry_at"]}
+        if not paused and not safety["ready"]:
+            if not safety["retry_at"] or not until or datetime.fromisoformat(safety["retry_at"]) >= datetime.fromisoformat(until):
+                reason, until = safety["message"], safety["retry_at"]
     return {"comments_used_today": used, "comments_remaining_today": max(0, limit - used),
-            "send_wait_reason": reason, "next_send_at": until}
+            "send_wait_reason": reason, "next_send_at": until, **profile}
 
 
 @contextmanager

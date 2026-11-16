@@ -14,6 +14,7 @@ import database as db
 import meta_client
 import sheets_sync
 import antidetect_client
+import browser_safety
 
 
 # In-memory status for UI monitoring
@@ -116,9 +117,13 @@ def _record_browser_connection_failure(page, result):
     """Invalidate only the browser binding used by this operation, never its token."""
     category = result.get("category")
     status = result.get("browser_status")
-    if status not in ("LOGIN_REQUIRED", "CHECKPOINT", "ERROR"):
+    if status not in ("LOGIN_REQUIRED", "CHECKPOINT", "RESTRICTED", "ERROR"):
         return
-    if category in ("BROWSER_BUSY", "CANCELLED_BEFORE_SEND", "NETWORK_RETRYABLE", "RATE_LIMIT", "POST_ERROR"):
+    if category in ("BROWSER_BUSY", "BROWSER_LIMIT", "BROWSER_BLOCKED", "CANCELLED_BEFORE_SEND", "NETWORK_RETRYABLE", "RATE_LIMIT", "POST_ERROR"):
+        return
+    if status in ("LOGIN_REQUIRED", "CHECKPOINT", "RESTRICTED"):
+        if not result.get("profile_safety_recorded") and page.get("antidetect_profile_id"):
+            browser_safety.block(page["antidetect_profile_id"], status, result.get("error"))
         return
     db.invalidate_page_browser(
         page["page_id"], status, result.get("error"),
@@ -161,6 +166,50 @@ def detect_new_posts_and_schedule():
         _SCAN_LOCK.release()
 
 
+_BROWSER_SCAN_ATTEMPT_PREFIX = "browser_scan_attempt:"
+
+
+def _fair_scan_order(pages):
+    """Rotate each profile's Browser pages without changing Graph page slots."""
+    with closing(db.get_connection()) as conn:
+        attempts = dict(conn.execute(
+            "SELECT setting_key,setting_value FROM app_settings WHERE setting_key LIKE ?",
+            (_BROWSER_SCAN_ATTEMPT_PREFIX + "%",),
+        ))
+
+    def last_attempt(page):
+        raw = attempts.get(_BROWSER_SCAN_ATTEMPT_PREFIX + page["page_id"])
+        try:
+            parsed = datetime.fromisoformat(raw)
+            if parsed.tzinfo is not None:
+                return parsed.astimezone(timezone.utc)
+        except (TypeError, ValueError, OverflowError):
+            pass
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+    profiles = {}
+    for page in pages:
+        if _send_mode(page) == "BROWSER":
+            profiles.setdefault(page.get("antidetect_profile_id"), []).append(page)
+    ordered = {profile: iter(sorted(group, key=last_attempt)) for profile, group in profiles.items()}
+    return [next(ordered[page.get("antidetect_profile_id")]) if _send_mode(page) == "BROWSER" else page
+            for page in pages]
+
+
+def _scan_browser_posts(page, since):
+    # A denied reservation did not use this Page's turn. Empty scans and failed
+    # browser attempts did, and must rotate even when the post cursor stays put.
+    attempted = True
+    try:
+        return antidetect_client.get_recent_posts_for_page_cdp(page, since_timestamp=since)
+    except antidetect_client.BrowserAutomationError as exc:
+        attempted = exc.category not in ("BROWSER_BUSY", "BROWSER_LIMIT", "BROWSER_BLOCKED")
+        raise
+    finally:
+        if attempted:
+            db.set_setting(_BROWSER_SCAN_ATTEMPT_PREFIX + page["page_id"], datetime.now(timezone.utc).isoformat())
+
+
 def _detect_new_posts_and_schedule():
     """
     Scans all active pages incrementally, detecting newly published posts.
@@ -170,7 +219,7 @@ def _detect_new_posts_and_schedule():
         return
     if not refresh_comment_sheet()["success"]:
         return
-    pages = db.get_all_pages()
+    pages = _fair_scan_order(db.get_all_pages())
     now_utc = datetime.now(timezone.utc)
 
     for p in pages:
@@ -198,14 +247,15 @@ def _detect_new_posts_and_schedule():
                                  (since, page_id))
                 continue
             if _send_mode(page_full) == "BROWSER":
-                posts = antidetect_client.get_recent_posts_for_page_cdp(page_full, since_timestamp=since)
+                posts = _scan_browser_posts(page_full, since)
             else:
                 posts = meta_client.get_recent_posts(page_id, page_full["page_access_token"], since_timestamp=since)
         except antidetect_client.BrowserAutomationError as exc:
             SCHEDULER_METRICS["scan_errors"][page_id] = exc.message
             _record_browser_connection_failure(page_full, exc.as_result())
-            if exc.category in ("BROWSER_BUSY", "NETWORK_RETRYABLE"):
-                _SCAN_BACKOFF_UNTIL[page_id] = now_utc + timedelta(seconds=config.TASK_TICK_SEC)
+            if exc.category in ("BROWSER_BUSY", "BROWSER_LIMIT", "NETWORK_RETRYABLE"):
+                retry_at = exc.as_result().get("retry_at")
+                _SCAN_BACKOFF_UNTIL[page_id] = date_parser.isoparse(retry_at) if retry_at else now_utc + timedelta(seconds=config.TASK_TICK_SEC)
             continue
         except meta_client.MetaAPIError as exc:
             SCHEDULER_METRICS["scan_errors"][page_id] = exc.message
@@ -289,7 +339,7 @@ def _due_task_candidates(include_auto):
             yield task
 
 
-def _prepare_before_submit(task, initial_page, paused, *, refresh_sheet=False):
+def _prepare_before_submit(task, initial_page, paused, *, refresh_sheet=False, profile_reserved=False):
     """Recheck policy after slow browser navigation without acquiring the Page lock again."""
     automatic = task.get("source") == "AUTO"
     if automatic and refresh_sheet and not refresh_comment_sheet(force=True).get("success"):
@@ -298,7 +348,7 @@ def _prepare_before_submit(task, initial_page, paused, *, refresh_sheet=False):
         if automatic and not _comment_sheet_result.get("success"):
             return comment_dispatch.Decision("SOURCE_CHANGED", message="Nguồn bình luận chưa sẵn sàng.")
         latest = comment_dispatch.check(task["page_id"], paused, automatic=automatic,
-                                        require_sheet=automatic, transport="selected")
+                                        require_sheet=automatic, transport="selected", profile_reserved=profile_reserved)
         if not latest.ready:
             return latest
         if not _same_send_connection(initial_page, latest.page):
@@ -355,9 +405,7 @@ def _execute_due_tasks():
                 break
             attempts += 1
             try:
-                if browser:
-                    verified = antidetect_client.verify_post_for_page_cdp(page, task["post_id"], post_url=task.get("post_url"))
-                else:
+                if not browser:
                     verified = meta_client.verify_post_belongs_to_page(task["post_id"], page_id, token)
             except (meta_client.MetaAPIError, antidetect_client.BrowserAutomationError) as exc:
                 result = exc.as_result()
@@ -374,14 +422,16 @@ def _execute_due_tasks():
                         cancellation = {}
 
                         def before_submit():
-                            final = _prepare_before_submit(task, page, paused, refresh_sheet=True)
+                            final = _prepare_before_submit(task, page, paused, refresh_sheet=True, profile_reserved=True)
                             if not final.ready:
                                 cancellation.update(error=final.message, retry_at=final.retry_at)
                             return final.ready
 
+                        # The browser sender verifies the post and its timestamp
+                        # in the same tab it uses to submit the comment.
                         result = antidetect_client.send_page_comment_cdp(
-                            page, verified["clean_post_id"], content,
-                            post_url=verified.get("permalink_url") or task.get("post_url"),
+                            page, task["post_id"], content,
+                            post_url=task.get("post_url"),
                             before_submit=before_submit,
                         )
                         if result.get("category") == "CANCELLED_BEFORE_SEND":
@@ -395,7 +445,7 @@ def _execute_due_tasks():
                     result = exc.as_result()
                 except Exception:
                     result = {"success": False, "category": "NEED_CHECK", "error": "Chưa xác nhận được kết quả gửi. Đối chiếu trên Facebook."}
-            if browser and result.get("category") == "BROWSER_BUSY":
+            if browser and result.get("category") in ("BROWSER_BUSY", "BROWSER_LIMIT", "BROWSER_BLOCKED"):
                 attempts -= 1  # Profile contention must not consume another Page's send budget.
             _record_dispatch_result(task, result, decision.page)
 
@@ -413,13 +463,16 @@ def _record_dispatch_result(task, result, page):
     SCHEDULER_METRICS["send_errors"][page_id] = error
     if _send_mode(page) == "BROWSER":
         _record_browser_connection_failure(page, result)
-        if category in ("BROWSER_BUSY", "CANCELLED_BEFORE_SEND"):
+        if category in ("BROWSER_BUSY", "BROWSER_LIMIT", "CANCELLED_BEFORE_SEND"):
             db.release_task_lock(task_id)
             retry_at = result.get("retry_at") or (
                 datetime.now(timezone.utc) + timedelta(seconds=config.TASK_TICK_SEC)).isoformat()
             db.defer_task(task_id, retry_at, error)
             return
-        if result.get("browser_status") in ("LOGIN_REQUIRED", "CHECKPOINT", "ERROR") and category not in (
+        if category == "BROWSER_BLOCKED":
+            db.update_task_result(task_id, "PAUSED", error_message=error)
+            return
+        if result.get("browser_status") in ("LOGIN_REQUIRED", "CHECKPOINT", "RESTRICTED", "ERROR") and category not in (
                 "NEED_CHECK", "NETWORK_RETRYABLE", "RATE_LIMIT", "POST_ERROR"):
             db.update_task_result(task_id, "PAUSED", error_message=error)
             return

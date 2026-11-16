@@ -100,6 +100,53 @@ def test_sheet_edit_isolates_error_and_updates_pending_auto(pages):
     assert pages.get_all_tasks(source="MANUAL")[0]["status"] == "PENDING"
 
 
+def test_new_posts_only_survives_restart_and_reenable(clock, ready_pages, monkeypatch):
+    page_id, other_page = ready_pages
+    db.set_page_automation(other_page, False)
+    enabled_at = clock.now(timezone.utc)
+    posts = [
+        {"id": "before-enable", "created_time": (enabled_at - timedelta(seconds=1)).isoformat()},
+        {"id": "at-enable", "created_time": enabled_at.isoformat()},
+        {"id": "new-post", "created_time": (enabled_at + timedelta(minutes=1)).isoformat()},
+    ]
+    scanned_since = []
+
+    def recent_posts(page, token, *, since_timestamp):
+        assert page == page_id
+        scanned_since.append(since_timestamp)
+        return posts
+
+    monkeypatch.setattr(meta_client, "get_recent_posts", recent_posts)
+    clock.advance(minutes=2)
+    scheduler.detect_new_posts_and_schedule()
+    tasks = db.get_all_tasks(page_id=page_id)
+    assert [task["post_id"] for task in tasks] == ["new-post"]
+    db.update_task_result(tasks[0]["id"], "SUCCESS", "existing-comment")
+    checkpoint = db.get_page(page_id)["last_seen_post_time"]
+
+    db.init_db()
+    clock.advance(minutes=1)
+    assert not db.set_page_automation(page_id, True)["changed"]
+    assert db.get_page(page_id)["last_seen_post_time"] == checkpoint
+    scheduler.detect_new_posts_and_schedule()
+    assert scanned_since == [enabled_at.isoformat(), checkpoint]
+    assert len(db.get_all_tasks(page_id=page_id)) == 1
+
+    db.set_page_automation(page_id, False)
+    clock.advance(minutes=1)
+    posts.append({"id": "while-disabled", "created_time": clock.now(timezone.utc).isoformat()})
+    clock.advance(minutes=1)
+    resumed_at = clock.now(timezone.utc)
+    assert db.set_page_automation(page_id, True)["changed"]
+    clock.advance(minutes=1)
+    posts.append({"id": "after-reenable", "created_time": clock.now(timezone.utc).isoformat()})
+    scheduler.detect_new_posts_and_schedule()
+    assert scanned_since[-1] == resumed_at.isoformat()
+    assert {task["post_id"]: task["status"] for task in db.get_all_tasks(page_id=page_id)} == {
+        "new-post": "SUCCESS", "after-reenable": "PENDING",
+    }
+
+
 def test_v2_migration_preserves_pilot_history_and_cursor(tmp_path):
     with sqlite3.connect(tmp_path / "v2.sqlite3") as conn:
         migrations._apply_migration_v1(conn)

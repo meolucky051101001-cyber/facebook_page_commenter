@@ -1,17 +1,93 @@
 # Bàn giao hiện trạng Commenter Facebook
 
-Cập nhật: 15/11/2026, Asia/Bangkok. Thư mục làm việc và chạy dịch vụ:
+Cập nhật: 16/11/2026, Asia/Bangkok. Thư mục làm việc và chạy dịch vụ:
 `C:\Projects\Tools\facebook comment\facebook_page_commenter`.
 
-Đọc kế hoạch trong `docs/KE-HOACH-SUA-LOI-COMMENT-TU-DONG.md` và kết quả từng chặng trong `docs/NHAT-KY-TRIEN-KHAI-COMMENT-TU-DONG.md`. Tài liệu `docs/legacy` chỉ để tham khảo lịch sử.
+Ưu tiên đọc `docs/KE-HOACH-TICH-HOP-19-PAGE-GRAPH-HYBRID.md` cho hướng triển khai hiện tại. `docs/KE-HOACH-SUA-LOI-COMMENT-TU-DONG.md`, `docs/NHAT-KY-TRIEN-KHAI-COMMENT-TU-DONG.md` và `docs/legacy` ghi lại các giai đoạn trước; không lấy quyền chạy cũ làm quyền vận hành mới.
 
-## Hiện trạng mới nhất sau triển khai Browser
+## Cập nhật người dùng về Graph/HYBRID — ưu tiên áp dụng
 
-Thông tin dưới đây thay thế các ghi nhận vận hành trước đó.
+**Lựa chọn mới nhất: triển khai Graph API cho 19 HYBRID; 47 ANTIDETECT loại khỏi phạm vi chạy và giữ yêu cầu pause.** Không fallback Browser khi Graph lỗi. Đây là yêu cầu cập nhật kế hoạch, chưa cho phép sửa cấu hình vận hành, đồng bộ DB, gọi Facebook hoặc gửi. API chính thức không bảo đảm tránh ban; vẫn kiểm soát quyền, policy và giới hạn cấp Page/tài khoản/ứng dụng.
+
+Ngày 16/11, người dùng báo đã tự nạp và mã hóa token tài khoản Lê Thị Quyên vào
+`C:\Users\admin\.gemini\antigravity\scratch\facebook_page_commenter\fb_commenter.db`.
+Danh mục được báo là **66 Page = 19 HYBRID + 47 ANTIDETECT**; nhóm HYBRID gồm
+9 Page Bóng Ma Đề Cương và 10 Page Lê Thị Quyên. Các quyền được báo: pages_show_list, pages_read_engagement,
+pages_manage_engagement, pages_manage_posts. Không coi đây là kết quả kiểm tra
+live hoặc dữ liệu đã có trong DB workspace.
+
+Người dùng đã chọn **giữ DB workspace hiện tại; đồng bộ riêng sau**. Không đổi
+DB_PATH, copy/import/attach DB nguồn hoặc suy luận cấu hình mã hóa hai nơi giống
+nhau. Chưa đồng bộ trong lượt này. Mapping đủ mười Page mới và test kế hoạch ở
+`docs/KE-HOACH-TICH-HOP-19-PAGE-GRAPH-HYBRID.md`.
+
+Quy tắc bắt buộc: không đọc `.env`, cookie thật, giá trị ENCRYPTION_KEY; không
+lấy/giải mã/in page_access_token_enc hoặc long_lived_user_token_enc. Chỉ dùng
+page_id, page_name, fb_profile_id, connection_mode, token_status khi cập nhật
+danh mục/Pilot/UI. Không SELECT * hoặc gọi helper lấy token để chẩn đoán. Runtime
+ứng dụng tự lấy token nội bộ khi được cho phép đúng thao tác; không hỏi lại token.
+
+**Giữ yêu cầu tạm dừng cho đến khi người dùng cho phép chạy phạm vi cụ thể.**
+Quyền gửi trong các ghi nhận cũ bên dưới không phải quyền chạy đợt tích hợp này.
+Không tự bật AUTO, đổi send_mode/Pilot, resume task, gọi Graph hoặc mở Browser.
+HYBRID là năng lực kết nối, không phải readiness/quyền gửi. Chưa kiểm tra dịch vụ
+thật nên không xác nhận trạng thái pause hiện tại của tiến trình.
+
+Cần sửa trước triển khai: startup hiện khôi phục run_state=running đã lưu;
+maintenance còn có thể gọi Graph khi paused; PILOT_PAGE_ID còn miễn một phần
+proof kiểm tra Page. Kế hoạch mới yêu cầu pause khi startup và xác minh từng
+Page qua cùng quy tắc Python/SQL/UI. Bổ sung mốc kiểm tra policy trước POST,
+trạng thái gửi bền và recovery NEED_CHECK khi timeout/crash/lỗi lưu kết quả.
+Giữ rule/history/quota/dedupe; Resume không mở toàn bộ opt-in cũ.
+
+Trình tự G0–G4: cách ly test → cấu hình khóa/pause/phạm vi → readiness từng Page
+và mapping → an toàn gửi/lỗi/recovery → hồi quy và bàn giao source.
+G5–G7 là bước riêng sau: người dùng đồng bộ DB → đối chiếu metadata/kiểm tra được
+duyệt → Pilot một Page, một tác vụ → mở rộng theo từng đợt được duyệt tới 19.
+Quyền check không phải quyền gửi; quyền Pilot không phải quyền bật toàn bộ.
+
+Ba lỗi P1 Browser (pause cuối DOM, bỏ sót hạn chế, lỗi lưu checkpoint) vẫn chưa
+sửa, được giữ trong backlog; không chặn nghiệm thu Graph nếu đã loại Browser
+khỏi mọi entry point của đợt chạy và có test chứng minh. Lỗi P2 cấu hình khóa
+dùng chung vẫn bắt buộc sửa. Kế hoạch bốn lỗi Browser giữ chi tiết để làm sau.
+347 tests là mốc trước các sửa mới, không phải nghiệm thu phần kế hoạch này.
+Lượt cập nhật kế hoạch mới chỉ sửa tài liệu; chưa chạy lại test ứng dụng.
+
+## Bổ sung an toàn trong working tree ngày 16/11
+
+Lượt rà soát này bổ sung hạn mức/khoảng cách cho toàn profile Browser, trạng thái
+chặn bền khi checkpoint/hạn chế/đăng nhập lại, và kiểm thử bằng dữ liệu giả.
+Trạng thái lưu trong `app_settings`, không đổi schema 7. Chưa triển khai/restart
+dịch vụ hoặc bật AUTO/gửi Facebook trong lượt này; thông tin vận hành dưới đây
+là ghi nhận của phiên trước, chưa được đọc lại từ DB thật. Xem README để biết
+điều kiện nghiệm thu trước khi bật Browser.
+
+Xác nhận cuối lượt: `python -m pytest -q -o faulthandler_timeout=30` đạt 347 tests,
+1 cảnh báo Starlette/AnyIO deprecation; `git diff --check` sạch. Test chạy bằng
+DB tạm, HTTP/CDP giả và chặn mở file vận hành. Sandbox Windows làm socketpair
+nội bộ của asyncio bị treo; chạy test ngoài sandbox giải quyết vấn đề này.
+Lượt test đầu trước khi siết cách ly vẫn nạp `.env` qua config; đã dừng và sửa
+để bỏ qua cả đọc/ghi dotenv, kèm audit hook chặn file nhạy cảm. Không in bí mật.
+Scanner luân phiên các Page cùng profile, lưu lượt quét qua restart để khoảng
+cách chung không khiến Page đầu tiên chiếm mọi lượt.
+
+Lượt tiếp tục yêu cầu commit/PR ngày 16/11: chạy lại cùng lệnh đạt 347 tests,
+1 cảnh báo Starlette/AnyIO (40,54 giây), không có test bị skip; `git diff --check`
+sạch. Đóng gói thay đổi trên nhánh `codex/profile-safety-graph-plan` để review
+bằng Draft PR. Bốn lỗi đã ghi trong kế hoạch vẫn chưa sửa; kết quả test này
+không phải nghiệm thu triển khai Graph hoặc Browser. Giữ các file legacy và
+`integration/antidetect/web/app.py.before-move` ngoài commit. Không triển khai,
+restart dịch vụ, đồng bộ DB hoặc bật gửi trong lượt này.
+
+## Ghi nhận vận hành của phiên trước — chưa đối chiếu lại
+
+Thông tin dưới đây chỉ là lịch sử. Quy tắc bảo mật, lựa chọn DB và yêu cầu tạm
+dừng ở phần cập nhật Graph/HYBRID phía trên được ưu tiên; không lấy các số lượng,
+PID hoặc quyền chạy cũ làm trạng thái vận hành hiện tại.
 
 - Dịch vụ `pythonw run_background.pyw` tại `http://127.0.0.1:8080`, schema 7,
-  đã khôi phục lúc 23:51 ngày 15/11 sau khi phát hiện tiến trình cũ tắt.
-  PID 12000 trong `backups/browser-followup-20261115/service.pid`. Kiểm tra lại khi tiếp tục.
+  đã cập nhật ngày 16/11 sau khi 268 kiểm thử đạt.
+  PID 34996 trong `backups/new-posts-only-20261116/service.pid`. Kiểm tra lại khi tiếp tục.
 - Hệ thống đang chạy; 65 Page, 65 rule, 8 tài khoản, tất cả send_mode=GRAPH_API.
   Chỉ Chị Đẹp Thích Vẽ bật AUTO. Doll gửi theo đợt thủ công đã được người dùng yêu cầu.
 - 18 tasks: 17 SUCCESS, 1 CANCELLED; không còn PENDING/SENDING/NEED_CHECK sau khi hoàn tất chuỗi Vẽ mới.
@@ -39,7 +115,9 @@ Thông tin dưới đây thay thế các ghi nhận vận hành trước đó.
   Bằng chứng backups/doll-comments-20261115/verified-result.json;
   backup sau gửi post-send-verified.sqlite3 (quick_check=ok).
 
-## Browser mới và việc còn lại
+## Browser của giai đoạn trước — backlog, chưa cho phép chạy
+
+Các ghi nhận dưới đây là lịch sử source/kiểm tra Browser. Hướng ưu tiên hiện tại là Graph theo phần đầu; không tiếp tục Browser hoặc dùng nó làm fallback dựa trên các ghi nhận này.
 
 Đọc docs/KE-HOACH-BINH-LUAN-TRINH-DUYET.md. Đã triển khai schema 7, chọn send_mode,
 trạng thái xác minh browser riêng token, khóa theo profile, scan/verify/send theo
@@ -54,10 +132,11 @@ Tiến trình cũ đã tắt; lần kiểm tra gần nhất server mới ở c�
 Profile 2: c25eebac-3cec-43ec-8d73-51f914b5437b. Người dùng đã đăng nhập lại.
 Probe trước khi gặp cổng quyền chỉ trả access_state=ok nhưng không có actor ID,
 bài số hoặc timestamp; chưa đủ xác minh phiên đăng nhập và khả năng gửi.
-Browser Use vẫn từ chối origin http://127.0.0.1:8000 vì quyền đã lưu/chính sách,
-kể cả sau khi user trả lời “Cho phép kiểm tra Antidetect” rồi “Đã mở quyền”.
-Không dùng raw CDP, terminal hay cửa sổ khác để vượt chặn. Chỉ thử lại khi quyền
-thực tế của công cụ được gỡ; chưa nghiệm thu actor/Reel/timestamp hoặc gửi Browser.
+Ngày 16/11 đã truy cập được giao diện Antidetect qua Browser Use. Profile 2 đọc
+trực tiếp 10 Page. Probe Page/Reel vẫn thiếu numeric actor ID và timestamp,
+chưa nghiệm thu gửi Browser. Người dùng lo checkpoint và chọn chỉ xử lý bài mới
+cần bình luận, hạn chế lượt truy cập thừa. Lượt cập nhật sau lựa chọn này dùng
+kiểm thử mô phỏng và kiểm tra dịch vụ cục bộ.
 Chưa bật browser cho Page nào. Không hỏi lại user tên tool: user chưa có tool,
 đang nhờ xây auto comment trong project này.
 
@@ -71,7 +150,7 @@ Báo cáo trong backups/profile-catalog-review-20261115.
 
 ## Kiểm thử và bảo toàn
 
-264 tests passed, 1 Starlette/AnyIO deprecation. Browser tests mô phỏng,
+268 tests passed, 1 Starlette/AnyIO deprecation. Browser tests mô phỏng,
 không chứng minh layout thật. Migration 6→7 diễn tập giữ mọi cột cũ/history/rule/quota/settings.
 Dịch vụ mới API200,schema 7,65Page,không tự đổi mode.
 
@@ -85,6 +164,15 @@ Việc gửi qua Browser với Graph canonical ID khác Reel ID vẫn cần ánh
 Backups/browser-followup-20261115 có before-restore.sqlite3, after-restore.sqlite3,
 before-restore.json, restored-health.json. quick_check=ok, toàn bộ 18 task giữ nguyên
 từng giá trị qua restart; 17 SUCCESS, 1 CANCELLED; Vẽ AUTO, Doll tắt AUTO.
+
+Backups/new-posts-only-20261116 có before-deploy.sqlite3, deployment-state.json,
+verified-health.json. Đối chiếu đủ 18 task, cách gửi, mốc bài và quyền AUTO từng
+Page qua restart đều giữ nguyên; quick_check=ok, API200, hệ thống running.
+Luồng Browser gộp xác minh bài/thời gian và gửi vào cùng một tab, kiểm tra lại
+danh tính/nội dung trước Enter. Có hồi quy bật AUTO chỉ nhận bài sau mốc bật,
+restart giữ lịch sử và bật lại sau khi tắt tạo mốc mới. Dashboard giải thích
+tool vẫn kiểm tra danh sách bài định kỳ. Bản sửa gồm nhận URL /people/.../ID
+và giảm lượt mở bài đang ở working tree, đã triển khai cục bộ.
 
 Backups/browser-transport-20261115 có schema 7-source.zip,before-schema 7.sqlite3,
 before-deploy.sqlite3,migration-report.json,deployed-health.json,thich-ve-sequence.json,

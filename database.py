@@ -530,9 +530,10 @@ def set_page_send_mode(page_id: str, send_mode: str) -> Dict[str, Any]:
 
 def update_page_browser_check(page_id: str, checked_at: Optional[str] = None,
                               browser_status: str = "UNCHECKED", error: Optional[str] = None,
-                              identity_id: Optional[str] = None, profile_id: Optional[str] = None) -> bool:
+                              identity_id: Optional[str] = None, profile_id: Optional[str] = None,
+                              expected_generation: Optional[int] = None) -> bool:
     """Persist proof only for the currently selected profile and numeric Page identity."""
-    if browser_status not in ("UNCHECKED", "READY", "LOGIN_REQUIRED", "CHECKPOINT", "ERROR"):
+    if browser_status not in ("UNCHECKED", "READY", "LOGIN_REQUIRED", "CHECKPOINT", "RESTRICTED", "ERROR"):
         raise ValueError("Trạng thái kết nối trình duyệt không hợp lệ.")
     checked_at = checked_at or datetime.now(timezone.utc).isoformat()
     with closing(get_connection()) as conn, conn:
@@ -548,6 +549,11 @@ def update_page_browser_check(page_id: str, checked_at: Optional[str] = None,
             return False
         if browser_status == "READY" and (error or not expected_identity or not profile_id or not identity_id):
             return False
+        if browser_status == "READY":
+            import browser_safety
+            safety = browser_safety.status(profile_id)
+            if safety["browser_status"] != "READY" or (expected_generation is not None and safety["generation"] != expected_generation):
+                return False
         conn.execute("""
             UPDATE pages SET browser_status=?, browser_checked_at=?, browser_error=?,
                 browser_identity_id=?, browser_profile_id=?, updated_at=? WHERE page_id=?

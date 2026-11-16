@@ -9,6 +9,8 @@ from types import SimpleNamespace
 import pytest
 
 import antidetect_client as browser
+import browser_safety
+import config
 
 
 CANONICAL = "993921657144854"
@@ -22,6 +24,9 @@ URL = f"https://www.facebook.com/{ALIAS}/posts/{POST}"
 
 @pytest.fixture
 def harness(monkeypatch):
+    # Most tests exercise browser evidence; dedicated tests below exercise cadence.
+    monkeypatch.setattr(config, "BROWSER_MIN_GAP_PER_PROFILE_SEC", 0)
+    monkeypatch.setattr(config, "BROWSER_MAX_OPERATIONS_PER_PROFILE_PER_DAY", 100)
     page = {"page_id": CANONICAL, "fb_profile_id": ALIAS, "page_name": "Page mẫu",
             "antidetect_profile_id": PROFILE, "page_url": f"https://www.facebook.com/{ALIAS}"}
     metadata = [{"id": PROFILE, "facebook_pages": [{"id": ALIAS, "name": "Page mẫu"}]}]
@@ -114,6 +119,7 @@ def test_success_requires_observed_real_comment_id_and_releases_only_owned_tab(h
     assert result["comment_id"] == COMMENT
     assert result["category"] == "SUCCESS"
     assert len(enters(h)) == 1
+    assert [params for method, params in h.calls if method == "Page.navigate"] == [{"url": URL}]
     assert h.closed == [(9222, "owned-tab")]
     assert h.released == [(PROFILE, False, None)]
 
@@ -167,7 +173,8 @@ def test_non_navigation_protocol_error_is_not_retried(harness):
     assert harness.closed == [(9222, "owned-tab")]
 
 
-@pytest.mark.parametrize("field,status", [("loginPresent", "LOGIN_REQUIRED"), ("checkpointPresent", "CHECKPOINT")])
+@pytest.mark.parametrize("field,status", [("loginPresent", "LOGIN_REQUIRED"), ("checkpointPresent", "CHECKPOINT"),
+                                         ("restrictedPresent", "RESTRICTED")])
 def test_auth_page_during_navigation_stops_without_waiting_or_input(harness, field, status):
     harness.readiness = [{"url": URL, "readyState": "loading", "mainPresent": False, field: True}]
     result = send(harness)
@@ -372,7 +379,8 @@ def test_preexisting_id_cannot_prove_new_submission(harness):
     assert len(enters(harness)) == 1
 
 
-@pytest.mark.parametrize("access,status", [("login_required", "LOGIN_REQUIRED"), ("checkpoint", "CHECKPOINT")])
+@pytest.mark.parametrize("access,status", [("login_required", "LOGIN_REQUIRED"), ("checkpoint", "CHECKPOINT"),
+                                          ("restricted", "RESTRICTED")])
 def test_connection_and_send_report_login_or_checkpoint(harness, access, status):
     harness.state["accessState"] = access
     result = browser.verify_page_connection_cdp(harness.page)
@@ -390,6 +398,17 @@ def test_verification_returns_canonical_id_and_requires_absolute_time(harness):
     harness.state["posts"][0]["created_time"] = "2 hours ago"
     with pytest.raises(browser.BrowserAutomationError, match="thời điểm"):
         browser.verify_post_for_page_cdp(harness.page, POST, URL)
+
+
+@pytest.mark.parametrize("created_time", [None, "2 hours ago"])
+def test_send_requires_absolute_time_before_typing(harness, created_time):
+    harness.state["posts"][0]["created_time"] = created_time
+    result = send(harness)
+    assert result["category"] == "INVALID_TARGET"
+    assert "thời điểm" in result["error"]
+    assert not harness.draft
+    assert enters(harness) == []
+    assert harness.closed == [(9222, "owned-tab")]
 
 
 def test_discovery_skips_unknown_or_relative_dates_and_respects_since(harness):
@@ -431,6 +450,124 @@ def test_owned_browser_flag_is_preserved(harness):
     harness.opened_by_us = True
     assert send(harness)["success"] is True
     assert harness.released == [(PROFILE, True, 8000)]
+
+
+@pytest.mark.parametrize("stage", ["before_typing", "after_typing", "after_callback", "after_enter"])
+@pytest.mark.parametrize("access,status", [("checkpoint", "CHECKPOINT"), ("restricted", "RESTRICTED")])
+def test_profile_warning_stops_before_enter_or_quarantines_uncertain_result(harness, stage, access, status):
+    if stage == "before_typing":
+        harness.state["accessState"] = access
+    elif stage == "after_typing":
+        harness.fail_after_insert = lambda: harness.state.update(accessState=access)
+    elif stage == "after_enter":
+        def observed_after_enter():
+            if harness.submitted:
+                harness.state["accessState"] = access
+        harness.before_eval = observed_after_enter
+
+    def callback():
+        if stage == "after_callback":
+            harness.state["accessState"] = access
+        return True
+
+    result = send(harness, before_submit=callback)
+    assert result["browser_status"] == status
+    assert result["profile_safety_recorded"] is True
+    assert bool(enters(harness)) == (stage == "after_enter")
+    if stage == "after_enter":
+        assert result["category"] == "NEED_CHECK"
+    gate = browser_safety.status(PROFILE)
+    assert not gate["ready"] and gate["browser_status"] == status
+    opened = list(harness.opened)
+    assert send(harness)["category"] == "BROWSER_BLOCKED"
+    assert harness.opened == opened
+
+
+def test_warning_is_persisted_before_profile_lock_is_released(harness, monkeypatch):
+    original = browser_safety.block
+    calls = []
+
+    def block(profile, status, message):
+        assert browser._PROFILE_OPERATION_LOCKS[profile].locked()
+        calls.append(status)
+        return original(profile, status, message)
+
+    monkeypatch.setattr(browser_safety, "block", block)
+    harness.state["accessState"] = "restricted"
+    assert not send(harness)["success"]
+    assert calls == ["RESTRICTED"]
+
+
+def test_durable_profile_block_during_callback_prevents_enter(harness):
+    def stop():
+        browser_safety.block(PROFILE, "CHECKPOINT", "Mock checkpoint")
+        return True
+    assert not send(harness, before_submit=stop)["success"]
+    assert enters(harness) == []
+
+
+def test_explicit_check_clears_block_after_verifying_identity(harness):
+    browser_safety.block(PROFILE, "RESTRICTED", "Mock restriction")
+    assert browser.verify_page_connection_cdp(harness.page)["success"]
+    assert browser_safety.status(PROFILE)["browser_status"] == "READY"
+    assert send(harness)["success"]
+
+
+@pytest.mark.parametrize("operation", ["scan", "verify", "send"])
+def test_only_explicit_connection_check_can_probe_a_blocked_profile(harness, monkeypatch, operation):
+    browser_safety.block(PROFILE, "RESTRICTED", "Mock restriction")
+    monkeypatch.setattr(browser, "_read_profiles_readonly", lambda: pytest.fail("Blocked profile metadata must not be read"))
+    if operation == "send":
+        result = send(harness)
+    else:
+        with pytest.raises(browser.BrowserAutomationError) as caught:
+            if operation == "scan":
+                browser.get_recent_posts_for_page_cdp(harness.page)
+            else:
+                browser.verify_post_for_page_cdp(harness.page, POST, URL)
+        result = caught.value.as_result()
+    assert result["category"] == "BROWSER_BLOCKED"
+    assert result["profile_safety_recorded"]
+    assert harness.opened == [] and harness.calls == []
+
+
+def test_check_cannot_clear_a_newer_profile_block(harness):
+    def new_block():
+        browser_safety.block(PROFILE, "CHECKPOINT", "Mock new checkpoint")
+    harness.before_eval = new_block
+    assert not browser.verify_page_connection_cdp(harness.page)["success"]
+    assert browser_safety.status(PROFILE)["browser_status"] == "CHECKPOINT"
+
+
+@pytest.mark.parametrize("operation", ["check", "scan", "verify", "send"])
+def test_profile_daily_budget_blocks_before_metadata_or_browser(harness, monkeypatch, operation):
+    monkeypatch.setattr(config, "BROWSER_MAX_OPERATIONS_PER_PROFILE_PER_DAY", 1)
+    assert browser_safety.reserve_operation(PROFILE)["ready"]
+    monkeypatch.setattr(browser, "_read_profiles_readonly", lambda: pytest.fail("Quota must precede metadata reads"))
+    if operation == "send":
+        result = send(harness)
+    elif operation == "check":
+        result = browser.verify_page_connection_cdp(harness.page)
+    else:
+        with pytest.raises(browser.BrowserAutomationError) as exc:
+            if operation == "scan":
+                browser.get_recent_posts_for_page_cdp(harness.page)
+            else:
+                browser.verify_post_for_page_cdp(harness.page, POST, URL)
+        result = exc.value.as_result()
+    assert result["category"] == "BROWSER_LIMIT" and result["retry_at"]
+    assert harness.opened == [] and harness.calls == []
+
+
+def test_profile_gap_applies_between_pages_and_to_explicit_recovery(harness, monkeypatch):
+    monkeypatch.setattr(config, "BROWSER_MIN_GAP_PER_PROFILE_SEC", 60)
+    assert browser.verify_page_connection_cdp(harness.page)["success"]
+    other_page = {**harness.page, "page_id": "61570000000003"}
+    result = browser.send_page_comment_cdp(other_page, POST, MESSAGE, post_url=URL)
+    assert result["category"] == "BROWSER_LIMIT"
+    browser_safety.block(PROFILE, "CHECKPOINT", "Mock checkpoint")
+    assert browser.verify_page_connection_cdp(harness.page)["category"] == "BROWSER_LIMIT"
+    assert len(harness.opened) == 1
 
 
 @pytest.mark.parametrize("mode", ["rejected", "unreachable_port"])
@@ -568,7 +705,7 @@ def test_strict_url_builder_rejects_arbitrary_database_urls():
 def test_readiness_dom_detects_login_routes_without_form_fields():
     fixture = r"""
 const source = require('fs').readFileSync(0, 'utf8');
-global.document = {readyState:'complete', querySelector:() => null};
+global.document = {readyState:'complete', querySelector:() => null, querySelectorAll:() => []};
 const result = ['/login', '/login.php', '/login/device-based/', '/loginXphp', '/checkpoint/'].map(path => {
   global.location = {href:'https://www.facebook.com' + path, pathname:path};
   return eval(source);
@@ -585,7 +722,8 @@ process.stdout.write(JSON.stringify(result));
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="Node is needed to execute the mock DOM fixture")
-def test_dom_evidence_preserves_timestamp_and_only_accepts_comments_on_target(harness):
+@pytest.mark.parametrize("author_path", [f"/{ALIAS}", f"/people/Ch%E1%BB%8B-%C4%90%E1%BA%B9p/{ALIAS}/"])
+def test_dom_evidence_preserves_timestamp_and_only_accepts_comments_on_target(harness, author_path):
     # This runs only against the constructed DOM below, with no browser/network.
     fixture = r"""
 const config = JSON.parse(require('fs').readFileSync(0, 'utf8'));
@@ -612,7 +750,7 @@ for (const spec of [
   const article = {parentElement:{closest:() => spec.nested ? {} : outer},
     getBoundingClientRect:() => ({width:100,height:50})};
   const body = {innerText:config.message, closest:selector => selector === '[role="article"]' ? article : null};
-  const author = makeLink('https://www.facebook.com/' + config.actor, article);
+  const author = makeLink('https://www.facebook.com' + config.authorPath, article);
   author.closest = selector => selector === '[role="article"]' ? article : (selector.startsWith('h3') ? {} : null);
   const permalink = makeLink('https://www.facebook.com/' + config.actor + '/posts/' + spec.post +
     '?comment_id=' + spec.id + (spec.reply ? '&reply_comment_id=55' : ''), article);
@@ -627,15 +765,53 @@ const inspect = eval('(' + config.source + ')');
 process.stdout.write(JSON.stringify(inspect(config.post, config.message)));
 """
     payload = {"source": browser._BROWSER_EVIDENCE_JS, "url": URL, "post": POST,
-               "message": MESSAGE, "actor": ALIAS}
+               "message": MESSAGE, "actor": ALIAS, "authorPath": author_path}
     completed = subprocess.run([shutil.which("node"), "-e", fixture], input=json.dumps(payload),
                                capture_output=True, text=True, encoding="utf-8", timeout=15)
     assert completed.returncode == 0, completed.stderr
     evidence = json.loads(completed.stdout)
     assert [item["created_time"] for item in evidence["posts"]] == [None, "1794729600"]
-    assert [item["id"] for item in evidence["comments"]] == ["90001"]
+    assert evidence["comments"] == [{"id": "90001", "authorIds": [ALIAS], "text": MESSAGE}]
     assert evidence["commentIds"] == ["90001"]
     harness.state["posts"] = evidence["posts"]
     posts = browser.get_recent_posts_for_page_cdp(harness.page)
     assert len(posts) == 1
     assert posts[0]["id"] == f"{CANONICAL}_{POST}"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="Node is needed to execute the mock DOM fixture")
+@pytest.mark.parametrize("notice,expected", [
+    ("You're temporarily blocked", "restricted"),
+    ("We limit how often you can comment", "restricted"),
+    ("You can’t use this feature right now", "restricted"),
+    ("Your account is restricted", "restricted"),
+    ("Bạn tạm thời bị chặn", "restricted"),
+    ("Chúng tôi giới hạn tần suất bạn có thể bình luận", "restricted"),
+    ("Hiện bạn không thể sử dụng tính năng này", "restricted"),
+    ("Tài khoản của bạn đang bị hạn chế", "restricted"),
+    ("Confirm your identity", "checkpoint"),
+    ("Xác nhận danh tính của bạn", "checkpoint"),
+    ("Comment posted successfully", "ok"),
+])
+def test_rendered_system_notices_detect_restrictions_without_matching_user_content(notice, expected):
+    fixture = r"""
+const config = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+global.location = {href:'https://www.facebook.com/123',pathname:'/123'};
+global.getComputedStyle = () => ({visibility:'visible',display:'block'});
+const inspect = eval('(' + config.source + ')');
+const results = [];
+for (const mode of ['system','article','editor','containsArticle','hidden']) {
+  const el = {innerText:config.notice,
+    closest:() => ['article','editor'].includes(mode) ? {} : null,
+    querySelector:() => mode === 'containsArticle' ? {} : null,
+    getBoundingClientRect:() => ({width:mode === 'hidden' ? 0 : 100,height:30})};
+  global.document = {querySelector:() => null,querySelectorAll:() => [el]};
+  results.push(inspect());
+}
+process.stdout.write(JSON.stringify(results));
+"""
+    completed = subprocess.run([shutil.which("node"), "-e", fixture],
+                               input=json.dumps({"source": browser._BROWSER_ACCESS_STATE_JS, "notice": notice}),
+                               capture_output=True, text=True, encoding="utf-8", timeout=15)
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == [expected, "ok", "ok", "ok", "ok"]

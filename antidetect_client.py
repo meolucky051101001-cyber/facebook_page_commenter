@@ -28,6 +28,7 @@ from contextlib import contextmanager
 import config
 import database as db
 import meta_client
+import browser_safety
 
 _BRIDGE_LOCK = threading.RLock()
 _INPROC_MANAGER = None
@@ -39,17 +40,20 @@ _OWNED_PROFILE_LEASES = {}
 class BrowserAutomationError(RuntimeError):
     """A browser failure with an explicit dispatch category and connection status."""
 
-    def __init__(self, message, category="INVALID_TARGET", browser_status="ERROR"):
+    def __init__(self, message, category="INVALID_TARGET", browser_status="ERROR", retry_at=None):
         super().__init__(message)
         self.category = category
         self.browser_status = browser_status
         self.status = browser_status
         self.message = message
+        self.retry_at = retry_at
+        self.profile_safety_recorded = False
 
     def as_result(self):
         return {"success": False, "comment_id": None, "category": self.category,
                 "error": self.message, "browser_status": self.browser_status,
-                "mode": "ANTIDETECT_CDP", "usage_pct": None}
+                "mode": "ANTIDETECT_CDP", "usage_pct": None, "retry_at": self.retry_at,
+                "profile_safety_recorded": self.profile_safety_recorded}
 
 
 def get_antidetect_dir() -> Path:
@@ -605,27 +609,40 @@ async def _cdp_eval(ws, msg_id: int, expression: str, timeout: float = 10.0) -> 
 
 # DOM evidence is restricted to rendered controls and the selected post. No
 # cookies, credentials, private endpoints, or application internals are read.
-_BROWSER_READINESS_JS = r"""
-(() => ({url: location.href, readyState: document.readyState,
-  mainPresent: Boolean(document.querySelector('[role="main"]')),
-  loginPresent: /^\/(login|login\.php)(\/|$)/i.test(location.pathname) ||
-    Boolean(document.querySelector('input[name="email"]') && document.querySelector('input[name="pass"]')),
-  checkpointPresent: /^\/(checkpoint|two_step_verification|recover)(\/|$)/i.test(location.pathname)
-}))()
+_BROWSER_ACCESS_STATE_JS = r"""
+(() => {
+  if (/^\/(checkpoint|two_step_verification|recover)(\/|$)/i.test(location.pathname)) return 'checkpoint';
+  if (/^\/(login|login\.php)(\/|$)/i.test(location.pathname) ||
+      (document.querySelector('input[name="email"]') && document.querySelector('input[name="pass"]'))) return 'login_required';
+  // Inspect only rendered system notices. A post, comment, or draft quoting a
+  // warning must never be treated as Facebook restricting this session.
+  for (const el of document.querySelectorAll('[role="alert"],[role="alertdialog"],[role="dialog"],[role="status"]')) {
+    if (el.closest('[role="article"],[contenteditable="true"]') ||
+        el.querySelector('[role="article"],[contenteditable="true"]')) continue;
+    const r = el.getBoundingClientRect(), style = getComputedStyle(el);
+    if (r.width <= 2 || r.height <= 2 || style.visibility === 'hidden' || style.display === 'none') continue;
+    const text = String(el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+    if (/confirm your identity|xác nhận danh tính của bạn|security check|kiểm tra bảo mật/i.test(text)) return 'checkpoint';
+    if (/you(?:'|’)?re temporarily blocked|you are temporarily blocked|we limit how often|you (?:can(?:not|'t|’t)) use this feature right now|your account (?:is|has been) restricted|you (?:can(?:not|'t|’t)) comment|bạn (?:tạm thời bị chặn|đang bị chặn tạm thời|không thể bình luận)|chúng tôi giới hạn (?:tần suất|mức độ thường xuyên)|(?:hiện )?bạn không thể (?:sử dụng|dùng) tính năng này|tài khoản của bạn (?:đang |đã )?bị hạn chế/i.test(text)) return 'restricted';
+  }
+  return 'ok';
+})
 """
+
+_BROWSER_READINESS_JS = r"""
+(() => { const access = __ACCESS_STATE__(); return {url: location.href, readyState: document.readyState,
+  mainPresent: Boolean(document.querySelector('[role="main"]')),
+  loginPresent: access === 'login_required', checkpointPresent: access === 'checkpoint',
+  restrictedPresent: access === 'restricted'
+}; })()
+""".replace('__ACCESS_STATE__', _BROWSER_ACCESS_STATE_JS)
 
 _BROWSER_EVIDENCE_JS = r"""
 ((expectedPost, message) => {
-  const out = {url: location.href, accessState: 'ok', actorIds: [],
+  const out = {url: location.href, accessState: __ACCESS_STATE__(), actorIds: [],
     actorOptions: [], actorButtonRect: null, posts: [], comments: [],
     commentIds: [], commentBoxRect: null, commentBoxText: '', focused: false};
-  if (/^\/(checkpoint|two_step_verification|recover)(\/|$)/i.test(location.pathname)) {
-    out.accessState = 'checkpoint'; return out;
-  }
-  if (/^\/(login|login\.php)(\/|$)/i.test(location.pathname) ||
-      (document.querySelector('input[name="email"]') && document.querySelector('input[name="pass"]'))) {
-    out.accessState = 'login_required'; return out;
-  }
+  if (out.accessState !== 'ok') return out;
   const num = x => /^\d+$/.test(String(x || '')) ? String(x) : '';
   const norm = s => String(s || '').replace(/\r\n/g, '\n').replace(/\s+/g, ' ').trim();
   const visible = el => { const r = el.getBoundingClientRect();
@@ -638,8 +655,10 @@ _BROWSER_EVIDENCE_JS = r"""
     return u;
   } catch (_) { return null; } };
   const profile = s => { const u = url(s); if (!u) return '';
-    return /^\/(?:profile.php)?\/?$/.test(u.pathname) ? num(u.searchParams.get('id'))
-      : (/^\/(\d+)\/?$/.exec(u.pathname) || [])[1] || ''; };
+    if (/^\/(?:profile\.php)?\/?$/.test(u.pathname)) return num(u.searchParams.get('id'));
+    const match = /^\/(?:people\/[^/]+\/)?(\d+)\/?$/.exec(u.pathname);
+    return match ? match[1] : '';
+  };
   const post = s => { const u = url(s); if (!u) return null;
     if (u.searchParams.has('comment_id') || u.searchParams.has('reply_comment_id')) return null;
     const m = /^\/(\d+|[^/]+)\/posts\/(\d+)\/?$/.exec(u.pathname);
@@ -744,7 +763,7 @@ _BROWSER_EVIDENCE_JS = r"""
   out.commentIds = [...new Set(out.commentIds)];
   return out;
 })
-"""
+""".replace('__ACCESS_STATE__', _BROWSER_ACCESS_STATE_JS)
 
 
 def _numeric(value):
@@ -824,20 +843,38 @@ def _page_context(page):
 
 def _check_mapping(page, expected):
     current = _page_context(page)
-    if current != expected:
+    if any(current[key] != expected[key] for key in current):
         raise BrowserAutomationError("Ánh xạ Page/profile đã thay đổi; cần kiểm tra kết nối lại.")
 
 
 @contextmanager
-def _profile_operation(page):
-    context = _page_context(page)
+def _profile_operation(page, *, allow_blocked=False):
+    profile_id = str(page.get("antidetect_profile_id") or "").strip()
+    if not profile_id:
+        raise BrowserAutomationError("Page chưa liên kết profile Antidetect.")
     with _BRIDGE_LOCK:
-        lock = _PROFILE_OPERATION_LOCKS.setdefault(context["profile_id"], threading.Lock())
+        lock = _PROFILE_OPERATION_LOCKS.setdefault(profile_id, threading.Lock())
     if not lock.acquire(blocking=False):
         raise BrowserAutomationError("Profile đang xử lý một thao tác khác.", "BROWSER_BUSY", "READY")
     try:
-        _check_mapping(page, context)
-        yield context
+        reservation = browser_safety.reserve_operation(profile_id, allow_blocked=allow_blocked)
+        if not reservation["ready"]:
+            status = reservation.get("browser_status") or "ERROR"
+            category = "BROWSER_LIMIT" if reservation.get("reason", "").startswith("WAIT_PROFILE_") else "BROWSER_BLOCKED"
+            error = BrowserAutomationError(reservation["message"], category, status,
+                                           retry_at=reservation.get("retry_at"))
+            error.profile_safety_recorded = True
+            raise error
+        context = _page_context(page)
+        context["safety_generation"] = reservation["generation"]
+        try:
+            _check_mapping(page, context)
+            yield context
+        except BrowserAutomationError as exc:
+            if exc.browser_status in ("LOGIN_REQUIRED", "CHECKPOINT", "RESTRICTED"):
+                browser_safety.block(profile_id, exc.browser_status, exc.message)
+                exc.profile_safety_recorded = True
+            raise
     finally:
         lock.release()
 
@@ -902,6 +939,9 @@ def _validate_state(state):
         raise BrowserAutomationError("Profile cần đăng nhập Facebook lại.", "TOKEN_EXPIRED", "LOGIN_REQUIRED")
     if access == "checkpoint":
         raise BrowserAutomationError("Profile đang ở bước xác minh Facebook.", "TOKEN_EXPIRED", "CHECKPOINT")
+    if access == "restricted":
+        raise BrowserAutomationError("Facebook đang hạn chế hoạt động của profile; cần xử lý và kiểm tra lại.",
+                                     "ACTIVITY_RESTRICTED", "RESTRICTED")
     _facebook_url(state.get("url"))
     if access != "ok":
         raise BrowserAutomationError("Không xác định được trạng thái đăng nhập Facebook.")
@@ -978,6 +1018,9 @@ class _BrowserSession:
             if isinstance(state, dict):
                 if state.get("checkpointPresent"):
                     raise BrowserAutomationError("Profile đang ở bước xác minh Facebook.", "TOKEN_EXPIRED", "CHECKPOINT")
+                if state.get("restrictedPresent"):
+                    raise BrowserAutomationError("Facebook đang hạn chế hoạt động của profile; cần xử lý và kiểm tra lại.",
+                                                 "ACTIVITY_RESTRICTED", "RESTRICTED")
                 if state.get("loginPresent"):
                     raise BrowserAutomationError("Profile cần đăng nhập Facebook lại.", "TOKEN_EXPIRED", "LOGIN_REQUIRED")
                 try:
@@ -1051,13 +1094,19 @@ def _run_read(page, context, url, operation):
 
 def verify_page_connection_cdp(page):
     try:
-        with _profile_operation(page) as context:
+        with _profile_operation(page, allow_blocked=True) as context:
             async def operation(session):
                 state = await _confirm_actor(session, context)
                 return {"success": True, "error": None, "browser_status": "READY",
                         "identity_id": context["identity_id"], "profile_id": context["profile_id"],
                         "observed_identity_ids": sorted(set(state["actorIds"]))}
-            return _run_read(page, context, f"https://www.facebook.com/{context['identity_id']}", operation)
+            result = _run_read(page, context, f"https://www.facebook.com/{context['identity_id']}", operation)
+            cleared = browser_safety.clear_block(context["profile_id"], context["safety_generation"])
+            if not cleared["cleared"]:
+                raise BrowserAutomationError("Trạng thái an toàn của profile đã đổi trong khi kiểm tra; chưa cho phép gửi.",
+                                             "BROWSER_BLOCKED")
+            result["safety_generation"] = cleared["generation"]
+            return result
     except BrowserAutomationError as exc:
         return {**exc.as_result(), "identity_id": None, "profile_id": page.get("antidetect_profile_id")}
 
@@ -1125,7 +1174,7 @@ def send_page_comment_cdp(page, post_id, message, post_url=None, before_submit=N
             async def operation(session):
                 nonlocal submitted
                 state = await _confirm_actor(session, context, numeric_post, message)
-                _verified_post(state, context, numeric_post)
+                _verified_post(state, context, numeric_post, require_timestamp=True)
                 _check_mapping(page, context)
                 if not state.get("commentBoxRect") or state.get("commentBoxText"):
                     raise BrowserAutomationError("Không có ô bình luận trống được xác minh trong đúng bài viết.")
@@ -1158,6 +1207,10 @@ def send_page_comment_cdp(page, post_id, message, post_url=None, before_submit=N
                     raise BrowserAutomationError("Đã thấy bình luận trùng nội dung trước khi gửi; cần kiểm tra để tránh đăng lặp.", "NEED_CHECK", "READY")
                 baseline.update(ready.get("commentIds") or [])
                 _check_mapping(page, context)
+                safety = browser_safety.status(context["profile_id"])
+                if safety.get("browser_status") != "READY" or safety.get("generation") != context["safety_generation"]:
+                    raise BrowserAutomationError("Profile đã bị dừng trong khi chuẩn bị gửi.",
+                                                 "BROWSER_BLOCKED", safety.get("browser_status") or "ERROR")
                 # Set before dispatch: a lost response to keyDown is uncertain,
                 # even if the subsequent keyUp never completes.
                 submitted = True
@@ -1177,8 +1230,10 @@ def send_page_comment_cdp(page, post_id, message, post_url=None, before_submit=N
             return asyncio.run(_with_browser_tab(context, url, operation))
     except BrowserAutomationError as exc:
         if submitted:
-            return BrowserAutomationError("Kết quả gửi chưa xác định. Cần kiểm tra bài viết trước khi gửi lại.",
-                                          "NEED_CHECK", exc.browser_status).as_result()
+            uncertain = BrowserAutomationError("Kết quả gửi chưa xác định. Cần kiểm tra bài viết trước khi gửi lại.",
+                                               "NEED_CHECK", exc.browser_status)
+            uncertain.profile_safety_recorded = exc.profile_safety_recorded
+            return uncertain.as_result()
         return exc.as_result()
     except Exception as exc:
         return BrowserAutomationError(
