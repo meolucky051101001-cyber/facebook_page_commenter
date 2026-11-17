@@ -65,6 +65,7 @@ def test_profile_stop_quarantines_siblings_but_other_transports_continue(profile
 
     def send(page, post, content, *, before_submit, **kwargs):
         assert before_submit()
+        assert kwargs["final_submit_gate"]()
         browser_calls.append(page["page_id"])
         if page["page_id"] == a:
             return {"success": False, "category": "NEED_CHECK" if after_enter else "TOKEN_EXPIRED",
@@ -248,6 +249,7 @@ def test_final_callback_can_use_last_reserved_daily_slot(profile_pages, monkeypa
         assert safety.reserve_operation(page["antidetect_profile_id"])["ready"]
         assert not safety.status(page["antidetect_profile_id"])["ready"]
         assert before_submit()
+        assert kwargs["final_submit_gate"]()
         sends.append(True)
         return {"success": True, "comment_id": "synthetic-result"}
 

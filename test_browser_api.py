@@ -161,8 +161,8 @@ def test_recorded_failure_does_not_overwrite_a_later_recovery(client, checked, m
 
     def late_failure(page):
         browser_safety.block("profile-one", "CHECKPOINT", "Synthetic checkpoint")
-        generation = browser_safety.status("profile-one")["generation"]
-        recovered = browser_safety.clear_block("profile-one", generation)
+        check = browser_safety.begin_operation("profile-one", page_id=checked, kind="check", allow_blocked=True)
+        recovered = browser_safety.clear_block("profile-one", check["generation"], operation_id=check["operation_id"])
         assert db.update_page_browser_check(checked, browser_status="READY", identity_id=checked,
                                             profile_id="profile-one", expected_generation=recovered["generation"])
         return {"success": False, "category": "TOKEN_EXPIRED", "browser_status": "CHECKPOINT",

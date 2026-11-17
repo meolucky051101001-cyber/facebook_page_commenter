@@ -33,12 +33,22 @@ def has_app_credentials() -> bool:
 # 2. Encryption Key for Tokens
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "").strip()
 if not ENCRYPTION_KEY:
-    # Auto-generate a Fernet key and persist to .env
+    if DOTENV_DISABLED:
+        raise RuntimeError("Thiếu khóa mã hóa bền vững; đã dừng khởi động.")
+    # Bootstrap only when the generated key has been persisted successfully.
     new_key = Fernet.generate_key().decode("utf-8")
-    ENCRYPTION_KEY = new_key
-    if not DOTENV_DISABLED:
+    try:
         with open(ENV_FILE, "a", encoding="utf-8") as f:
             f.write(f"\nENCRYPTION_KEY={new_key}\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError:
+        raise RuntimeError("Không lưu được khóa mã hóa; đã dừng khởi động.") from None
+    ENCRYPTION_KEY = new_key
+try:
+    Fernet(ENCRYPTION_KEY.encode("utf-8"))
+except (TypeError, ValueError):
+    raise RuntimeError("Khóa mã hóa không hợp lệ; đã dừng khởi động.") from None
 
 # 3. Intervals & Performance Settings
 POST_SCAN_INTERVAL_SEC = int(os.getenv("POST_SCAN_INTERVAL_SEC", "240"))

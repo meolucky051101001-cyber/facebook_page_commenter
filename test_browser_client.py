@@ -2,6 +2,7 @@
 import copy
 import json
 import shutil
+import sqlite3
 import subprocess
 import threading
 from types import SimpleNamespace
@@ -11,6 +12,8 @@ import pytest
 import antidetect_client as browser
 import browser_safety
 import config
+import scheduler
+import submit_control
 
 
 CANONICAL = "993921657144854"
@@ -266,6 +269,63 @@ def test_before_submit_cancel_runs_after_typing_and_prevents_enter(harness):
     assert enters(harness) == []
 
 
+def test_pause_during_last_dom_inspection_prevents_enter(harness):
+    def prepared():
+        harness.before_eval = lambda: scheduler.SCHEDULER_METRICS.update(paused_all=True)
+        return True
+    result = send(harness, before_submit=prepared)
+    assert result["category"] == "CANCELLED_BEFORE_SEND"
+    assert enters(harness) == []
+
+
+def test_pause_resume_during_last_dom_invalidates_existing_send(harness):
+    def change():
+        submit_control.invalidate_all()
+        scheduler.SCHEDULER_METRICS["paused_all"] = False
+    def prepared():
+        harness.before_eval = change
+        return True
+    result = send(harness, before_submit=prepared)
+    assert result["category"] == "CANCELLED_BEFORE_SEND"
+    assert enters(harness) == []
+
+
+def test_final_policy_gate_runs_after_dom_and_can_cancel(harness):
+    calls = []
+    def prepare():
+        calls.append("prepare")
+        harness.before_eval = lambda: calls.append("dom")
+        return True
+    def final_gate():
+        calls.append("gate")
+        return False
+    result = send(harness, prepare_for_submit=prepare, final_submit_gate=final_gate)
+    assert calls == ["prepare", "dom", "gate"]
+    assert result["category"] == "CANCELLED_BEFORE_SEND"
+    assert enters(harness) == []
+
+
+def test_profile_block_after_final_safety_read_still_prevents_enter(harness):
+    def final_gate():
+        browser_safety.block(PROFILE, "RESTRICTED", "Synthetic restriction before admission")
+        return True
+    result = send(harness, final_submit_gate=final_gate)
+    assert result["category"] == "CANCELLED_BEFORE_SEND"
+    assert enters(harness) == []
+    assert browser_safety.status(PROFILE)["browser_status"] == "RESTRICTED"
+
+
+def test_slow_final_dom_evidence_expires_without_enter(harness, monkeypatch):
+    now = {"value": 0.0}
+    monkeypatch.setattr(browser, "_submit_time", lambda: now["value"], raising=False)
+    def prepare():
+        harness.before_eval = lambda: now.update(value=3.0)
+        return True
+    result = send(harness, before_submit=prepare)
+    assert result["category"] == "CANCELLED_BEFORE_SEND"
+    assert enters(harness) == []
+
+
 def test_mapping_change_after_typing_prevents_enter(harness):
     harness.fail_after_insert = lambda: harness.metadata.clear()
     result = send(harness)
@@ -487,10 +547,10 @@ def test_warning_is_persisted_before_profile_lock_is_released(harness, monkeypat
     original = browser_safety.block
     calls = []
 
-    def block(profile, status, message):
+    def block(profile, status, message, **kwargs):
         assert browser._PROFILE_OPERATION_LOCKS[profile].locked()
         calls.append(status)
-        return original(profile, status, message)
+        return original(profile, status, message, **kwargs)
 
     monkeypatch.setattr(browser_safety, "block", block)
     harness.state["accessState"] = "restricted"
@@ -511,6 +571,80 @@ def test_explicit_check_clears_block_after_verifying_identity(harness):
     assert browser.verify_page_connection_cdp(harness.page)["success"]
     assert browser_safety.status(PROFILE)["browser_status"] == "READY"
     assert send(harness)["success"]
+
+
+@pytest.mark.parametrize("after_enter", [False, True])
+def test_checkpoint_persistence_failure_keeps_original_error_and_blocks(harness, monkeypatch, after_enter):
+    original = browser_safety.block
+    def failed_block(*args, **kwargs):
+        raise sqlite3.OperationalError("synthetic failure")
+    monkeypatch.setattr(browser_safety, "block", failed_block)
+    if after_enter:
+        def warning():
+            if harness.submitted:
+                harness.state["accessState"] = "checkpoint"
+        harness.before_eval = warning
+    else:
+        harness.state["accessState"] = "checkpoint"
+    result = send(harness)
+    assert result["browser_status"] == "CHECKPOINT"
+    assert result["category"] == ("NEED_CHECK" if after_enter else "TOKEN_EXPIRED")
+    assert result["safety_persistence_failed"]
+    assert not result["profile_safety_recorded"]
+    assert bool(enters(harness)) == after_enter
+    assert browser_safety.status(PROFILE)["browser_status"] == "CHECKPOINT"
+    opened = list(harness.opened)
+    assert send(harness)["category"] == "BROWSER_BLOCKED"
+    assert harness.opened == opened
+    # A deliberate check can recover without requiring a process restart.
+    monkeypatch.setattr(browser_safety, "block", original)
+    harness.before_eval = None
+    harness.state["accessState"] = "ok"
+    assert browser.verify_page_connection_cdp(harness.page)["success"]
+
+
+def test_success_evidence_survives_safety_cleanup_failure(harness, monkeypatch):
+    original = browser_safety._write
+    calls = []
+    def fail_finish(*args):
+        calls.append(True)
+        if len(calls) == 2:
+            raise sqlite3.OperationalError("synthetic cleanup failure")
+        return original(*args)
+    monkeypatch.setattr(browser_safety, "_write", fail_finish)
+    result = send(harness)
+    assert result["success"] and result["comment_id"] == COMMENT
+    assert result["safety_persistence_failed"]
+    assert len(enters(harness)) == 1
+    assert not browser_safety.status(PROFILE)["ready"]
+    assert send(harness)["category"] == "BROWSER_BLOCKED"
+    assert len(enters(harness)) == 1
+
+
+@pytest.mark.parametrize("structured", [False, True])
+def test_failed_final_safety_read_preserves_marker_and_prevents_enter(harness, monkeypatch, structured):
+    original = browser_safety.status
+    def unreadable(*args, **kwargs):
+        if structured:
+            return {"ready": False, "browser_status": "ERROR", "safety_persistence_failed": True}
+        raise sqlite3.OperationalError("synthetic final read failure")
+    monkeypatch.setattr(browser_safety, "status", unreadable)
+    result = send(harness)
+    assert result["category"] == "BROWSER_BLOCKED"
+    assert result["safety_persistence_failed"]
+    assert enters(harness) == []
+    monkeypatch.setattr(browser_safety, "status", original)
+    assert not browser_safety.status(PROFILE)["ready"]
+    assert send(harness)["category"] == "BROWSER_BLOCKED"
+
+
+def test_failed_operation_reservation_never_reads_profile_or_opens_browser(harness, monkeypatch):
+    def failed_write(*args):
+        raise sqlite3.OperationalError("synthetic reservation failure")
+    monkeypatch.setattr(browser_safety, "_write", failed_write)
+    monkeypatch.setattr(browser, "_read_profiles_readonly", lambda: pytest.fail("No metadata before committed marker"))
+    assert send(harness)["category"] == "BROWSER_BLOCKED"
+    assert harness.opened == [] and harness.calls == []
 
 
 @pytest.mark.parametrize("operation", ["scan", "verify", "send"])
@@ -783,6 +917,9 @@ process.stdout.write(JSON.stringify(inspect(config.post, config.message)));
 @pytest.mark.parametrize("notice,expected", [
     ("You're temporarily blocked", "restricted"),
     ("We limit how often you can comment", "restricted"),
+    ("We restrict certain activity to protect our community.", "restricted"),
+    ("Chúng tôi hạn chế một số hoạt động để bảo vệ cộng đồng của mình.", "restricted"),
+    ("Chúng tôi hạn chế một số hoạt động nhằm bảo vệ cộng đồng.", "restricted"),
     ("You can’t use this feature right now", "restricted"),
     ("Your account is restricted", "restricted"),
     ("Bạn tạm thời bị chặn", "restricted"),

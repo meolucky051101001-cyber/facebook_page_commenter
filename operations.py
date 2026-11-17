@@ -12,6 +12,7 @@ import comment_dispatch
 import database as db
 import meta_client
 import scheduler
+import submit_control
 from sheets_sync import validate_spintax_braces
 from spintax import spin
 
@@ -77,6 +78,9 @@ def cancel_publication(publication_id):
 
 def recover_interrupted_operations(conn):
     with conn:
+        interrupted = conn.execute("""SELECT page_id FROM publications WHERE status='PUBLISHING'
+            UNION SELECT page_id FROM incoming_comments WHERE action_pending IS NOT NULL""").fetchall()
+        db.quarantine_interrupted_graph_pages(conn, [row[0] for row in interrupted])
         conn.execute("""
             UPDATE publications SET status = 'NEED_CHECK',
                 error = 'Chưa rõ Facebook đã nhận lệnh. Đối chiếu Page trước khi lên lịch lại.'
@@ -116,6 +120,7 @@ def _publication_state(job, status, error=None, post_id=None):
 
 
 def _process_publication(job):
+    ticket = submit_control.snapshot(job["page_id"])
     page = db.get_page_with_decrypted_token(job["page_id"])
     if not page or not scheduler.graph_ready(page):
         if job["status"] == "PENDING":
@@ -146,16 +151,22 @@ def _process_publication(job):
             """, (now.isoformat(), job["id"])).rowcount
         if not claimed:
             return
-        if scheduler.SCHEDULER_METRICS["paused_all"]:
+        caption = spin(job["caption"])
+        latest = db.get_page_for_dispatch(page_id, transport="GRAPH_API")
+        ready = (comment_dispatch.graph_ready(latest)
+                 and latest["page_access_token"] == token
+                 and not db.get_send_cooldown(latest, datetime.now(timezone.utc)))
+        if not ready or not submit_control.commit(ticket, lambda: scheduler.SCHEDULER_METRICS["paused_all"]):
             _publication_state(job, "PENDING")
             return
         try:
             post_id = meta_client.publish_page_post(
-                page_id, token, job["media_type"], job["media_url"], spin(job["caption"]),
+                page_id, token, job["media_type"], job["media_url"], caption,
             )
             _publication_state(job, "PROCESSING", post_id=post_id)
             started_at = now
         except meta_client.MetaAPIError as exc:
+            _record_graph_write_failure(page, exc)
             _publication_state(job, "NEED_CHECK", exc.message)
             return
         except Exception:
@@ -282,7 +293,8 @@ def set_moderation_rules(page_id, hide_phone, keyword, reply):
         raise ValueError("Nhập cả từ khóa và nội dung trả lời, hoặc để trống cả hai.")
     rules = {"hide_phone": hide_phone, "keyword": keyword, "reply": reply,
              "since": datetime.now(timezone.utc).isoformat()}
-    db.set_setting("moderation:" + page["page_id"], json.dumps(rules, ensure_ascii=False))
+    with submit_control.mutation(page["page_id"], automatic=True):
+        db.set_setting("moderation:" + page["page_id"], json.dumps(rules, ensure_ascii=False))
     return rules
 
 
@@ -309,7 +321,7 @@ def apply_moderation_rules(page_id):
         if scheduler.SCHEDULER_METRICS["paused_all"] or get_moderation_rules(page_id) != rules:
             break
         if rules["hide_phone"] and item["has_phone"] and not item["hidden"]:
-            moderate(item["comment_id"], "hide")
+            moderate(item["comment_id"], "hide", automatic=True, expected_rules=rules)
         if (pattern and not item["reply_id"] and pattern.search(item["message"])
                 and not scheduler.SCHEDULER_METRICS["paused_all"]):
             result = moderate(item["comment_id"], "reply", rules["reply"], automatic=True, expected_rules=rules)
@@ -343,34 +355,63 @@ def moderate(comment_id, action, message="", *, automatic=False, expected_rules=
         return _reply(comment_id, message, automatic=automatic, expected_rules=expected_rules)
     if action not in ("hide", "unhide"):
         raise ValueError("Thao tác bình luận không hợp lệ.")
+    paused = lambda: scheduler.SCHEDULER_METRICS["paused_all"]
+    if paused():
+        return comment_dispatch.Decision("SYSTEM_PAUSED", message="Hệ thống đang tạm dừng thao tác trên Facebook.").public()
     with _inbox_lock, closing(db.get_connection()) as conn:
         item = conn.execute("SELECT * FROM incoming_comments WHERE comment_id=?", (comment_id,)).fetchone()
         if not item:
             raise ValueError("Bình luận chưa có trong hộp thư.")
-        page = db.get_page_for_dispatch(item["page_id"], transport="GRAPH_API")
-        if not comment_dispatch.graph_ready(page):
-            raise ValueError("Page cần kết nối Meta hợp lệ.")
-        with conn:
-            claimed = conn.execute("UPDATE incoming_comments SET action_pending=? WHERE comment_id=? AND action_pending IS NULL",
-                                   (action, comment_id)).rowcount
-        if not claimed:
-            raise ValueError("Bình luận đang xử lý hoặc cần đối chiếu trên Facebook.")
+        page_id = item["page_id"]
+        ticket = submit_control.snapshot(page_id, automatic=automatic)
+        lock = comment_dispatch.page_lock(page_id)
+        if not lock.acquire(blocking=False):
+            return comment_dispatch.Decision("WAIT_BUSY", message="Page đang xử lý thao tác khác.").public()
         try:
-            hidden = action == "hide"
-            result = meta_client.page_request("POST", comment_id, page["page_access_token"], {"is_hidden": str(hidden).lower()})
-            if result.get("success") is not True:
-                raise ValueError("Meta chưa xác nhận cập nhật bình luận.")
+            page = db.get_page_for_dispatch(page_id, transport="GRAPH_API")
+            if not comment_dispatch.graph_ready(page):
+                raise ValueError("Page cần kết nối Meta hợp lệ.")
+            cooldown = db.get_send_cooldown(page, datetime.now(timezone.utc))
+            if cooldown:
+                return comment_dispatch.Decision("WAIT_RATE_LIMIT", retry_at=cooldown,
+                                                 message="Page đang chờ giới hạn Meta.").public()
+            if automatic and (not page.get("rule_enabled") or expected_rules != get_moderation_rules(page_id)):
+                return comment_dispatch.Decision("AUTOMATION_PAUSED", message="Quy tắc tự động đã thay đổi.").public()
             with conn:
-                conn.execute("UPDATE incoming_comments SET hidden=?,action_pending=NULL WHERE comment_id=?", (hidden, comment_id))
-        except Exception as exc:
-            _store_inbox_failure(conn, comment_id, exc)
-            raise ValueError("Chưa xác nhận được kết quả. Đối chiếu trên Facebook.") from None
+                claimed = conn.execute("UPDATE incoming_comments SET action_pending=? WHERE comment_id=? AND action_pending IS NULL",
+                                       (action, comment_id)).rowcount
+            if not claimed:
+                raise ValueError("Bình luận đang xử lý hoặc cần đối chiếu trên Facebook.")
+            latest = db.get_page_for_dispatch(page_id, transport="GRAPH_API")
+            ready = (comment_dispatch.graph_ready(latest)
+                     and latest["page_access_token"] == page["page_access_token"]
+                     and (not automatic or (latest.get("rule_enabled") and expected_rules == get_moderation_rules(page_id))))
+            if not ready or not submit_control.commit(ticket, paused):
+                with conn:
+                    conn.execute("UPDATE incoming_comments SET action_pending=NULL WHERE comment_id=? AND action_pending=?",
+                                 (comment_id, action))
+                return comment_dispatch.Decision("SYSTEM_PAUSED" if paused() else "PAGE_CHANGED",
+                                                 message="Đã dừng thao tác vì hệ thống hoặc cấu hình thay đổi.").public()
+            try:
+                hidden = action == "hide"
+                result = meta_client.page_request("POST", comment_id, latest["page_access_token"], {"is_hidden": str(hidden).lower()})
+                if result.get("success") is not True:
+                    raise ValueError("Meta chưa xác nhận cập nhật bình luận.")
+                with conn:
+                    conn.execute("UPDATE incoming_comments SET hidden=?,action_pending=NULL WHERE comment_id=?", (hidden, comment_id))
+            except Exception as exc:
+                if isinstance(exc, meta_client.MetaAPIError):
+                    _record_graph_write_failure(latest, exc)
+                _store_inbox_failure(conn, comment_id, exc)
+                raise ValueError("Chưa xác nhận được kết quả. Đối chiếu trên Facebook.") from None
+        finally:
+            lock.release()
     return {"success": True}
 
 
 def _store_inbox_failure(conn, comment_id, exc):
     pending = None if isinstance(exc, meta_client.MetaAPIError) and exc.category in {
-        "MISSING_PERMISSIONS", "TOKEN_EXPIRED", "RATE_LIMIT", "POST_ERROR"} else "NEED_CHECK"
+        "MISSING_PERMISSIONS", "TOKEN_EXPIRED", "RATE_LIMIT", "POST_ERROR", "RESTRICTED"} else "NEED_CHECK"
     with conn:
         conn.execute("UPDATE incoming_comments SET action_pending=? WHERE comment_id=?", (pending, comment_id))
 
@@ -383,6 +424,7 @@ def _reply(comment_id, message, *, automatic=False, expected_rules=None):
         if not item:
             raise ValueError("Bình luận chưa có trong hộp thư.")
         page_id = item["page_id"]
+        ticket = submit_control.snapshot(page_id, automatic=automatic)
         paused = lambda: scheduler.SCHEDULER_METRICS["paused_all"]
         with comment_dispatch.guard(page_id, paused, automatic=automatic) as decision:
             if item["reply_id"] or item["action_pending"]:
@@ -398,7 +440,8 @@ def _reply(comment_id, message, *, automatic=False, expected_rules=None):
                 raise ValueError("Bình luận đang xử lý hoặc đã được trả lời.")
             latest = comment_dispatch.check(page_id, paused, automatic=automatic)
             rules_changed = automatic and expected_rules != get_moderation_rules(page_id)
-            if not latest.ready or latest.page["page_access_token"] != decision.page["page_access_token"] or rules_changed:
+            if (not latest.ready or latest.page["page_access_token"] != decision.page["page_access_token"]
+                    or rules_changed or not submit_control.commit(ticket, paused)):
                 with conn:
                     conn.execute("UPDATE incoming_comments SET action_pending=NULL WHERE comment_id=? AND action_pending='reply'", (comment_id,))
                 return latest.public() if not latest.ready else comment_dispatch.Decision("PAGE_CHANGED", message="Kết nối hoặc quy tắc Page đã đổi. Vui lòng thử lại.").public()
@@ -412,18 +455,24 @@ def _reply(comment_id, message, *, automatic=False, expected_rules=None):
                     if changed:
                         db.record_comment_success(conn, page_id, datetime.now(timezone.utc))
             except meta_client.MetaAPIError as exc:
+                until = _record_graph_write_failure(latest.page, exc)
                 _store_inbox_failure(conn, comment_id, exc)
                 if exc.category == "RATE_LIMIT":
-                    until = db.record_rate_limit(page_id, exc.as_result())
                     return comment_dispatch.Decision("WAIT_RATE_LIMIT", retry_at=until, message=exc.message).public()
-                if exc.category in ("TOKEN_EXPIRED", "MISSING_PERMISSIONS"):
-                    db.update_page_status(page_id, bool(latest.page["is_active"]),
-                                          "EXPIRED" if exc.category == "TOKEN_EXPIRED" else exc.category, exc.message)
                 raise
             except Exception as exc:
                 _store_inbox_failure(conn, comment_id, exc)
                 raise ValueError("Chưa xác nhận được kết quả. Vui lòng đối chiếu trên Facebook.") from None
     return {"success": True, "reply_id": reply}
+
+
+def _record_graph_write_failure(page, exc):
+    if exc.category == "RATE_LIMIT":
+        return db.record_rate_limit(page["page_id"], exc.as_result())
+    elif exc.category in ("TOKEN_EXPIRED", "MISSING_PERMISSIONS", "RESTRICTED"):
+        comment_dispatch.quarantine_graph(page["page_id"])
+        db.update_page_status(page["page_id"], bool(page["is_active"]),
+                              "EXPIRED" if exc.category == "TOKEN_EXPIRED" else exc.category, exc.message)
 
 
 def get_report(days):

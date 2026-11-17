@@ -1,5 +1,7 @@
 # Kế hoạch sửa bốn lỗi an toàn Browser
 
+> Cập nhật 17/11/2026: đã triển khai source và regression test theo [luồng Graph và Browser](KE-HOACH-VAN-HANH-GRAPH-VA-BROWSER.md). Các quyết định hoãn Browser và trạng thái “chưa sửa” bên dưới là lịch sử kế hoạch 16/11. Chưa chạy dịch vụ hoặc nghiệm thu Facebook thật; xem nhật ký triển khai để biết kết quả test thực chạy.
+
 Ngày lập: 16/11/2026, Asia/Bangkok. Đây là kế hoạch triển khai, chưa phải ghi nhận đã sửa hoặc đã nghiệm thu. Mốc tham chiếu là working tree hiện tại và kết quả 347 test đạt ở phiên trước.
 
 Cập nhật theo thông tin mới của người dùng: hỗ trợ 19 Page HYBRID có Graph API (9 Page của Bóng Ma Đề Cương + 10 Page của Lê Thị Quyên), cùng 47 Page ANTIDETECT. Chi tiết mapping và luồng bổ sung ở `docs/KE-HOACH-TICH-HOP-19-PAGE-GRAPH-HYBRID.md`. Đây là danh mục được báo từ DB `.gemini`, chưa xác nhận trong DB workspace. Người dùng chọn giữ DB workspace và đồng bộ riêng sau. Mọi đường chạy giữ pause cho đến khi được cho phép; token/HYBRID/Pilot không cấp quyền chạy.

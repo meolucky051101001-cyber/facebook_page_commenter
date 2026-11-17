@@ -48,8 +48,9 @@ def test_browser_task_sends_without_graph_token(browser_page, monkeypatch):
     queue_due(browser_page, browser_page + "_123")
     calls = []
 
-    def send(page, post, content, *, post_url, before_submit):
+    def send(page, post, content, *, post_url, before_submit, final_submit_gate):
         assert before_submit()
+        assert final_submit_gate()
         calls.append((page["antidetect_profile_id"], post, content, post_url))
         return {"success": True, "comment_id": "123_456"}
 
@@ -91,7 +92,7 @@ def test_browser_final_callback_stops_changed_policy(browser_page, monkeypatch, 
     queue_due(browser_page, browser_page + "_123")
     submitted = []
 
-    def send(page, post, content, *, post_url, before_submit):
+    def send(page, post, content, *, post_url, before_submit, final_submit_gate):
         if change == "pause":
             scheduler.SCHEDULER_METRICS["paused_all"] = True
         elif change == "disable":
@@ -107,7 +108,7 @@ def test_browser_final_callback_stops_changed_policy(browser_page, monkeypatch, 
                 elif change == "quota":
                     conn.execute("UPDATE pages SET comments_today_count=20,comments_today_date=? WHERE page_id=?",
                                  (db.local_day_key(datetime.now(timezone.utc)), browser_page))
-        if before_submit():
+        if before_submit() and final_submit_gate():
             submitted.append(True)
             return {"success": True, "comment_id": "unexpected"}
         return {"success": False, "category": "CANCELLED_BEFORE_SEND", "error": "policy changed"}
@@ -130,8 +131,8 @@ def test_browser_refreshes_sheet_before_enter_and_reprepares_changed_single(brow
             sheets_sync.sync_comment_sheet_rows([HEADERS, [browser_page, "A", "Updated comment", "10"]])
         return {"success": True}
 
-    def send(page, post, content, *, post_url, before_submit):
-        if not before_submit():
+    def send(page, post, content, *, post_url, before_submit, final_submit_gate):
+        if not before_submit() or not final_submit_gate():
             return {"success": False, "category": "CANCELLED_BEFORE_SEND"}
         sent.append(content)
         return {"success": True, "comment_id": "123_456"}
@@ -209,6 +210,7 @@ def test_browser_ambiguous_submit_never_retries_automatically(browser_page, monk
 
     def send(*args, before_submit, **kwargs):
         assert before_submit()
+        assert kwargs["final_submit_gate"]()
         calls.append(True)
         return result.copy()
 

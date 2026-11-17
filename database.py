@@ -1,4 +1,5 @@
-from contextlib import closing, nullcontext
+from contextlib import closing, nullcontext, ExitStack
+from functools import wraps
 import sqlite3
 import json
 from datetime import datetime, timezone, timedelta
@@ -9,8 +10,20 @@ import crypto
 import migrations
 import comment_content
 import post_identity
+import submit_control
 
 DB_PATH = Path(__file__).parent / "fb_commenter.db"
+
+
+def _page_mutation(function=None, *, automatic=False):
+    """Block new admissions while a Page policy mutation waits for SQLite."""
+    def decorate(target):
+        @wraps(target)
+        def changed(page_id, *args, **kwargs):
+            with submit_control.mutation(page_id, automatic=automatic):
+                return target(page_id, *args, **kwargs)
+        return changed
+    return decorate(function) if function is not None else decorate
 
 
 def browser_identity_id(page: Dict[str, Any]) -> str:
@@ -23,7 +36,7 @@ def browser_identity_id(page: Dict[str, Any]) -> str:
 
 
 def _selected_transport_ready_sql(alias: str = "p") -> str:
-    """SQL companion of comment_dispatch.send_ready; caller binds pilot Page ID."""
+    """SQL companion of comment_dispatch.send_ready; every Page needs proof."""
     identity = f"""CASE
         WHEN COALESCE({alias}.fb_profile_id, '') <> '' AND {alias}.fb_profile_id NOT GLOB '*[^0-9]*'
             THEN {alias}.fb_profile_id
@@ -32,7 +45,7 @@ def _selected_transport_ready_sql(alias: str = "p") -> str:
     return f"""(
         ({alias}.send_mode = 'GRAPH_API'
          AND {alias}.token_status IN ('OK', 'EXPIRING_SOON') AND {alias}.page_access_token_enc <> ''
-         AND ({alias}.page_id = ? OR ({alias}.connection_checked_at IS NOT NULL AND {alias}.connection_error IS NULL)))
+         AND {alias}.connection_checked_at IS NOT NULL AND {alias}.connection_error IS NULL)
         OR ({alias}.send_mode = 'BROWSER' AND {alias}.browser_status = 'READY'
             AND {alias}.browser_checked_at IS NOT NULL AND {alias}.browser_error IS NULL
             AND COALESCE({alias}.antidetect_profile_id, '') <> ''
@@ -103,6 +116,7 @@ def set_setting(setting_key: str, setting_value: str) -> None:
     conn.close()
 
 
+@_page_mutation
 def update_page_connection_check(
     page_id: str,
     checked_at: str,
@@ -110,10 +124,17 @@ def update_page_connection_check(
     token_status: Optional[str] = None,
     missing_permissions: Optional[List[str]] = None,
     expires_at: Optional[str] = None,
-) -> None:
+    *, expected_connection: Optional[Dict[str, Any]] = None,
+) -> bool:
     """Records a read-only connection check without reactivating a paused Page."""
-    conn = get_connection()
-    with conn:
+    with closing(get_connection()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if expected_connection is not None:
+            current = conn.execute("""SELECT page_access_token_enc,account_id,send_mode,fb_profile_id
+                FROM pages WHERE page_id=?""", (page_id,)).fetchone()
+            if current is None or any(current[field] != expected_connection.get(field)
+                                      for field in ("page_access_token_enc", "account_id", "send_mode", "fb_profile_id")):
+                return False
         if token_status is None:
             conn.execute("""
                 UPDATE pages
@@ -136,7 +157,7 @@ def update_page_connection_check(
                 checked_at,
                 page_id,
             ))
-            if token_status in ("EXPIRED", "MISSING_PERMISSIONS", "IDENTITY_MISMATCH", "INVALID_SECRET"):
+            if token_status in ("EXPIRED", "MISSING_PERMISSIONS", "IDENTITY_MISMATCH", "INVALID_SECRET", "RESTRICTED"):
                 conn.execute("""
                     UPDATE pages SET is_active = 0 WHERE page_id = ? AND send_mode = 'GRAPH_API'
                 """, (page_id,))
@@ -145,7 +166,29 @@ def update_page_connection_check(
                     WHERE page_id = ? AND status = 'PENDING'
                       AND EXISTS (SELECT 1 FROM pages p WHERE p.page_id = tasks.page_id AND p.send_mode = 'GRAPH_API')
                 """, (error or "Tạm dừng do kết nối Page không hợp lệ.", checked_at, page_id))
-    conn.close()
+    if checked_at and not error and token_status in ("OK", "EXPIRING_SOON"):
+        import comment_dispatch
+        comment_dispatch.clear_graph_quarantine(page_id)
+    return True
+
+
+def quarantine_interrupted_graph_pages(conn, page_ids):
+    """Require fresh Page proof after an interrupted outgoing Graph operation."""
+    ids = list(dict.fromkeys(str(value) for value in page_ids))
+    if not ids:
+        return
+    message = "Cần kiểm tra kết nối Page sau thao tác Graph bị gián đoạn và đối chiếu kết quả trên Facebook."
+    now = datetime.now(timezone.utc).isoformat()
+    marks = ",".join("?" for _ in ids)
+    for page_id in ids:
+        submit_control.invalidate_page(page_id)
+    conn.execute(f"""UPDATE pages SET connection_checked_at=NULL,connection_error=?,
+        token_status=CASE WHEN token_status IN ('OK','EXPIRING_SOON') THEN 'UNVERIFIED' ELSE token_status END,
+        updated_at=? WHERE page_id IN ({marks})""", (message, now, *ids))
+    conn.execute(f"""UPDATE tasks SET status='PAUSED',error_message=?,updated_at=?
+        WHERE status='PENDING' AND page_id IN ({marks})
+          AND EXISTS (SELECT 1 FROM pages p WHERE p.page_id=tasks.page_id AND p.send_mode='GRAPH_API')""",
+                 (message, now, *ids))
 
 
 def recover_stale_tasks(
@@ -170,6 +213,9 @@ def recover_stale_tasks(
     with conn:
         cursor = conn.cursor()
         if startup:
+            interrupted = conn.execute("""SELECT DISTINCT t.page_id FROM tasks t JOIN pages p ON p.page_id=t.page_id
+                WHERE t.status='SENDING' AND p.send_mode='GRAPH_API'""").fetchall()
+            quarantine_interrupted_graph_pages(conn, [row[0] for row in interrupted])
             cursor.execute("""
                 UPDATE tasks
                 SET status = 'NEED_CHECK',
@@ -226,6 +272,7 @@ def upsert_account(account_name: str, user_id: Optional[str] = None, long_lived_
     return acc_id
 
 
+@_page_mutation
 def upsert_page(
     page_id: str,
     page_name: str,
@@ -239,7 +286,7 @@ def upsert_page(
     conn = get_connection()
     token_enc = crypto.encrypt_token(page_access_token)
     perms_json = json.dumps(missing_permissions or [])
-    is_active = 0 if token_status in ("EXPIRED", "MISSING_PERMISSIONS", "UNVERIFIED", "IDENTITY_MISMATCH") else 1
+    is_active = 0 if token_status in ("EXPIRED", "MISSING_PERMISSIONS", "UNVERIFIED", "IDENTITY_MISMATCH", "RESTRICTED") else 1
     now = datetime.now(timezone.utc).isoformat()
     with conn:
         conn.execute("""
@@ -293,7 +340,7 @@ def upsert_antidetect_page(
     result_action = "inserted"
     target_page_id = fb_page_id
 
-    with closing(conn), conn:
+    with ExitStack() as mutations, closing(conn), conn:
         conn.execute("BEGIN IMMEDIATE")
         cur = conn.cursor()
         cur.execute(
@@ -313,6 +360,7 @@ def upsert_antidetect_page(
                 "SELECT 1 FROM tasks WHERE page_id=? AND status='SENDING' LIMIT 1", (target_page_id,)
             ).fetchone():
                 return {"action": "conflict", "page_id": target_page_id}
+            mutations.enter_context(submit_control.mutation(target_page_id))
             has_token = bool(existing["page_access_token_enc"])
             new_mode = "HYBRID" if has_token else "ANTIDETECT"
             new_token_status = existing["token_status"] if has_token else "ANTIDETECT_READY"
@@ -351,6 +399,7 @@ def upsert_antidetect_page(
                       AND EXISTS (SELECT 1 FROM pages p WHERE p.page_id=tasks.page_id AND p.send_mode='BROWSER')
                 """, ("Profile trình duyệt đã đổi. Kiểm tra kết nối rồi tiếp tục tác vụ.", now, target_page_id))
         else:
+            mutations.enter_context(submit_control.mutation(target_page_id))
             conn.execute("""
                 INSERT INTO pages (
                     page_id, page_name, page_access_token_enc, account_id,
@@ -462,6 +511,7 @@ def get_page_with_decrypted_token(page_id: str) -> Optional[Dict[str, Any]]:
     return res
 
 
+@_page_mutation
 def invalidate_page_token(page_id: str, encrypted_token: str) -> bool:
     """Quarantine only the token that failed, without overwriting a reconnect."""
     now = datetime.now(timezone.utc).isoformat()
@@ -499,18 +549,20 @@ def get_page_for_dispatch(page_id: str, *, transport: str = "selected") -> Optio
     return page
 
 
+@_page_mutation
 def set_page_send_mode(page_id: str, send_mode: str) -> Dict[str, Any]:
     """Select a transport explicitly, preserving consent, history, counters and cursors."""
     if send_mode not in ("GRAPH_API", "BROWSER"):
         raise ValueError("Chọn GRAPH_API hoặc BROWSER.")
     now = datetime.now(timezone.utc).isoformat()
-    with closing(get_connection()) as conn, conn:
+    with ExitStack() as mutations, closing(get_connection()) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         rows = conn.execute("SELECT * FROM pages WHERE page_id=? OR fb_profile_id=?", (page_id, page_id)).fetchall()
         if len(rows) != 1:
             raise ValueError("Không tìm thấy duy nhất một Page.")
         page = dict(rows[0])
         page_id = page["page_id"]
+        mutations.enter_context(submit_control.mutation(page_id))
         if page["send_mode"] != send_mode:
             if conn.execute("SELECT 1 FROM tasks WHERE page_id=? AND status='SENDING' LIMIT 1", (page_id,)).fetchone():
                 raise ValueError("Page đang gửi bình luận. Chờ hoàn tất rồi đổi cách gửi.")
@@ -528,6 +580,7 @@ def set_page_send_mode(page_id: str, send_mode: str) -> Dict[str, Any]:
     return get_page(page_id)
 
 
+@_page_mutation
 def update_page_browser_check(page_id: str, checked_at: Optional[str] = None,
                               browser_status: str = "UNCHECKED", error: Optional[str] = None,
                               identity_id: Optional[str] = None, profile_id: Optional[str] = None,
@@ -576,6 +629,7 @@ def invalidate_page_browser(page_id: str, browser_status: str = "ERROR", error: 
                                      profile_id=profile_id, identity_id=identity_id)
 
 
+@_page_mutation
 def update_page_status(page_id: str, is_active: bool, token_status: str, status_note: Optional[str] = None):
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
@@ -583,12 +637,12 @@ def update_page_status(page_id: str, is_active: bool, token_status: str, status_
         conn.execute("""
             UPDATE pages
             SET is_active = CASE WHEN send_mode='BROWSER' AND ?=0
-                    AND ? IN ('EXPIRED', 'MISSING_PERMISSIONS', 'INVALID_SECRET', 'IDENTITY_MISMATCH')
+                    AND ? IN ('EXPIRED', 'MISSING_PERMISSIONS', 'INVALID_SECRET', 'IDENTITY_MISMATCH', 'RESTRICTED')
                     THEN is_active ELSE ? END,
                 token_status = ?, status_note = ?, updated_at = ?
             WHERE page_id = ?
         """, (1 if is_active else 0, token_status, 1 if is_active else 0, token_status, status_note, now, page_id))
-        if token_status in ("EXPIRED", "MISSING_PERMISSIONS", "INVALID_SECRET"):
+        if token_status in ("EXPIRED", "MISSING_PERMISSIONS", "INVALID_SECRET", "RESTRICTED"):
             # Pause all pending tasks of this page so they don't keep failing
             conn.execute("""
                 UPDATE tasks
@@ -620,7 +674,9 @@ def get_send_cooldown(page: Dict[str, Any], now: datetime) -> Optional[str]:
 
 def record_rate_limit(page_id: str, result: Dict[str, Any]) -> str:
     now = datetime.now(timezone.utc)
-    with closing(get_connection()) as conn, conn:
+    scope = result.get("rate_limit_scope", "PAGE")
+    # A shared limit must invalidate in-flight preparations on affected accounts.
+    with submit_control.mutation(page_id if scope == "PAGE" else None), closing(get_connection()) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         page = conn.execute("SELECT * FROM pages WHERE page_id = ?", (page_id,)).fetchone()
         scope = result.get("rate_limit_scope", "PAGE")
@@ -753,12 +809,18 @@ def update_page_rule(
 
     now = datetime.now(timezone.utc).isoformat()
     cancelled_auto = 0
-    with (conn if should_close else nullcontext()):
+    with ExitStack() as mutations, (conn if should_close else nullcontext()):
         previous = conn.execute(
-            "SELECT is_enabled FROM page_rules WHERE page_id = ?",
+            "SELECT is_enabled,delay_minutes,templates,max_comments_per_day FROM page_rules WHERE page_id = ?",
             (page_id,),
         ).fetchone()
         was_enabled = bool(previous["is_enabled"]) if previous else False
+        if previous is None or previous["max_comments_per_day"] != max_comments_per_day:
+            mutations.enter_context(submit_control.mutation(page_id))
+        elif (previous["delay_minutes"] != delay_minutes
+              or json.loads(previous["templates"]) != templates
+              or (is_enabled is not None and was_enabled != bool(is_enabled))):
+            mutations.enter_context(submit_control.mutation(page_id, automatic=True))
         conn.execute("""
             INSERT INTO page_rules (page_id, delay_minutes, templates, max_comments_per_day, is_enabled, updated_at)
             VALUES (?, ?, ?, ?, ?, ?)
@@ -788,6 +850,7 @@ def update_page_rule(
     return cancelled_auto
 
 
+@_page_mutation(automatic=True)
 def set_page_automation(page_id: str, enabled: bool) -> Dict[str, Any]:
     """Toggles only the per-Page automation permission, independent of Sheet data."""
     now = datetime.now(timezone.utc).isoformat()
@@ -821,6 +884,7 @@ def set_page_automation(page_id: str, enabled: bool) -> Dict[str, Any]:
             "cancelled_auto_tasks": cancelled_auto}
 
 
+@_page_mutation
 def update_page_daily_limit(page_id: str, limit: int) -> None:
     with closing(get_connection()) as conn, conn:
         conn.execute("UPDATE page_rules SET max_comments_per_day = ? WHERE page_id = ?", (limit, page_id))
@@ -891,7 +955,7 @@ def queue_auto_scan(page: Dict[str, Any], posts: List[Dict[str, Any]], checkpoin
               )
         """, (
             checkpoint, page["page_id"], page["last_seen_post_time"],
-            page.get("send_mode", "GRAPH_API"), config.PILOT_PAGE_ID,
+            page.get("send_mode", "GRAPH_API"),
             page.get("antidetect_profile_id"), page.get("browser_identity_id"),
             page["templates"], page["delay_minutes"], page["comment_sequence"],
         ))
@@ -977,7 +1041,7 @@ def get_due_tasks(limit: int = 10, page_id: Optional[str] = None, include_auto: 
         {exclude_sql}
         ORDER BY t.scheduled_at ASC, t.id ASC
         LIMIT ?
-    """, (now_utc, page_id, page_id, include_auto, now_utc, config.PILOT_PAGE_ID, now_utc, *excluded, limit))
+    """, (now_utc, page_id, page_id, include_auto, now_utc, now_utc, *excluded, limit))
     rows = []
     for r in cursor.fetchall():
         d = dict(r)
@@ -1028,7 +1092,7 @@ def claim_due_task(task_id: int, now_iso: str) -> Optional[Dict[str, Any]]:
                     AND previous.status = 'SUCCESS'
                     AND julianday(previous.updated_at, '+' || t.sequence_gap_minutes || ' minutes') <= julianday(?)
               ))
-        """, (task_id, now_iso, now_iso, config.PILOT_PAGE_ID, now_iso)).fetchone()
+        """, (task_id, now_iso, now_iso, now_iso)).fetchone()
         if not row:
             return None
         conn.execute("UPDATE tasks SET status = 'SENDING', locked_at = ?, updated_at = ? WHERE id = ?",
@@ -1053,7 +1117,7 @@ def release_task_lock(task_id: int) -> bool:
                             OR (p.send_mode='BROWSER' AND NOT COALESCE({_selected_transport_ready_sql()}, 0)))
                  ) THEN 'PAUSED' ELSE 'PENDING' END, locked_at = NULL, updated_at = ?
             WHERE id = ? AND status = 'SENDING'
-        """, (config.PILOT_PAGE_ID, now_iso, task_id))
+        """, (now_iso, task_id))
         released = cursor.rowcount > 0
     conn.close()
     return released

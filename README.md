@@ -2,9 +2,9 @@
 
 Hệ thống quản lý Fanpage đa tài khoản độc lập, định tuyến kịch bản bình luận riêng cho từng Page và tự động lên lịch comment sau một khoảng thời gian ($X$ phút) kể từ khi bài viết mới được đăng.
 
-Cập nhật 16/11/2026: người dùng chọn **Meta Graph API làm đường xử lý cho 19 Page HYBRID** (9 + 10); 47 ANTIDETECT nằm ngoài đợt chạy, giữ yêu cầu pause. Graph lỗi không fallback Browser. Số lượng này được báo tại DB nguồn `.gemini`, chưa xác nhận trong workspace; giữ DB workspace và đồng bộ riêng sau. Xem [kế hoạch Graph mới nhất](docs/KE-HOACH-TICH-HOP-19-PAGE-GRAPH-HYBRID.md) để biết mapping, các bước sửa/test, Pilot một Page và mở rộng theo phạm vi được duyệt.
+Cập nhật 17/11/2026: triển khai **chọn Graph API hoặc Browser theo từng Page**. Page có kết nối Graph hợp lệ có thể dùng Graph; Page còn lại có thể dùng phiên đăng nhập sẵn trong profile Antidetect của tài khoản quản lý. Không tự đổi cách gửi khi Graph lỗi. Xem [luồng Graph và Browser](docs/KE-HOACH-VAN-HANH-GRAPH-VA-BROWSER.md).
 
-Đây mới là lựa chọn trong kế hoạch, chưa đổi mode hoặc bật AUTO. Yêu cầu hiện tại là tạm dừng đến khi người dùng cho phép; chưa kiểm tra trạng thái tiến trình thật. Source còn khôi phục run state cũ, maintenance có thể gọi Graph khi pause và Pilot còn miễn một phần xác minh; cần sửa các điểm dùng chung cùng mốc kiểm tra trước POST và recovery trước triển khai. Ba lỗi P1 Browser được hoãn riêng; lỗi P2 cấu hình khóa vẫn bắt buộc sửa cho Graph. Graph API là giao diện chính thức nhưng không bảo đảm tránh hạn chế/khóa; chính sách và giới hạn của Meta vẫn áp dụng.
+Đã sửa source và bổ sung test an toàn; **chưa đổi mode, đồng bộ DB hoặc bật AUTO thật**. Mỗi lần khởi động đều tạm dừng, kể cả DB từng lưu trạng thái running. Maintenance và đồng bộ Sheet tự động không chạy khi pause; kiểm tra kết nối chủ động không mở quyền gửi. Danh mục 66 Page (19 HYBRID + 47 ANTIDETECT) là thông tin được báo tại DB `.gemini`, chưa xác nhận tại workspace; vẫn giữ DB workspace và đồng bộ riêng sau. Graph và Browser đều chịu chính sách, quyền và giới hạn của Meta.
 
 ---
 
@@ -34,7 +34,7 @@ Cập nhật 16/11/2026: người dùng chọn **Meta Graph API làm đường x
 
 ## 🚀 Hướng dẫn khởi chạy
 
-Các lệnh dưới đây là hướng dẫn chung. Đợt tích hợp Graph hiện chưa được phép khởi chạy thật; cần hoàn tất các điều kiện của kế hoạch và được duyệt thao tác vận hành trước khi dùng DB có token.
+Các lệnh dưới đây là hướng dẫn chung. Đợt tích hợp hiện chưa được phép khởi chạy thật; cần nghiệm thu và được duyệt thao tác vận hành trước khi dùng DB hoặc phiên đăng nhập thật.
 
 ### 1. Cài đặt thư viện phụ thuộc (nếu chưa có)
 ```bash
@@ -85,7 +85,7 @@ Token lỗi giải mã sẽ được đánh dấu INVALID_SECRET và tác vụ G
 
 ### Bình luận bằng trình duyệt Antidetect
 
-Phần này mô tả nhánh Browser hiện có để tham khảo. Hướng triển khai đang chọn là Graph; Browser chưa được phép chạy trong đợt này. Ba lỗi P1 về pause cuối DOM, nhận diện hạn chế và lỗi lưu checkpoint vẫn chưa sửa, xem [kế hoạch Browser để làm sau](docs/KE-HOACH-SUA-4-LOI-AN-TOAN-BROWSER.md). Các mô tả cơ chế bên dưới chưa phải xác nhận nghiệm thu đầy đủ.
+Browser sử dụng phiên đăng nhập cục bộ của từng tài khoản trong profile Antidetect; không cần nhập hoặc xuất cookie thô. Các Page cùng tài khoản dùng chung profile và ngân sách thao tác. Source đã bổ sung chốt gửi sau DOM cuối, nhận diện thông báo hạn chế và phục hồi dấu thao tác sau gián đoạn. Kiểm thử giả lập chưa thay thế nghiệm thu Facebook thật trên Page được phép; chưa bật AUTO hoặc tự đổi mode trong DB vận hành.
 
 AUTO theo dõi bài đăng mới từ lúc bật cho từng Page. Mốc bài đã thấy và hàng đợi được lưu cùng nhau trong DB, tiếp tục dùng sau khi khởi động lại. Bật lại sau khi tắt AUTO tạo mốc bắt đầu mới. Tool vẫn kiểm tra danh sách bài định kỳ để phát hiện bài mới, chỉ mở bài cần gửi khi tác vụ đến hạn. Bài phát hiện muộn hơn `MAX_POST_AGE_MIN` (mặc định 120 phút) được bỏ qua. Với Browser, bước xác minh bài và gửi bình luận dùng cùng một tab, có kiểm tra lại danh tính Page và nội dung trước khi gửi.
 
@@ -103,7 +103,7 @@ Khi đổi cách gửi, lịch AUTO còn đối chiếu permalink trong cùng Pa
 
 Chỉ ghi SUCCESS khi thấy ID bình luận mới đúng Page/nội dung. Kết quả không rõ sau Enter chuyển NEED_CHECK và không tự gửi lại. Layout thiếu ID hoặc timestamp tuyệt đối sẽ bị chặn; hiện chưa hỗ trợ link `pfbid`/rút gọn qua trình duyệt. Cần nghiệm thu layout trên phiên Facebook đã đăng nhập trước khi bật nhiều Page. Xem `docs/KE-HOACH-BINH-LUAN-TRINH-DUYET.md`.
 
-Ứng dụng khóa theo đường dẫn DB trước khi recovery, kể cả chạy qua `run.py`, `run_background.pyw` hoặc Uvicorn trực tiếp. Chỉ một tiến trình được dùng DB. Trạng thái chạy được lưu trong DB: chưa có trạng thái thì tạm dừng, đã có thì khôi phục trạng thái đã lưu. Để cập nhật dịch vụ, tạm dừng trước, sao lưu bằng SQLite Backup API và kiểm tra bản sao. Nếu đã gửi sau nâng cấp, phải giữ lịch sử gửi mới khi rollback để tránh mất khóa chống trùng.
+Ứng dụng khóa theo đường dẫn DB trước khi recovery, kể cả chạy qua `run.py`, `run_background.pyw` hoặc Uvicorn trực tiếp. Chỉ một tiến trình được dùng DB. **Startup luôn lưu trạng thái tạm dừng** và cách ly profile có thao tác dở trước khi khởi động worker. Pause dừng nhận lượt gửi mới; lượt đã chốt gửi có thể đang diễn ra và kết quả chưa rõ giữ NEED_CHECK. Để cập nhật dịch vụ, tạm dừng trước, sao lưu bằng SQLite Backup API và kiểm tra bản sao. Nếu đã gửi sau nâng cấp, phải giữ lịch sử gửi mới khi rollback để tránh mất khóa chống trùng.
 
 ---
 

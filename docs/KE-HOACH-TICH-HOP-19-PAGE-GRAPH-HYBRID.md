@@ -1,5 +1,7 @@
 # Kế hoạch ưu tiên Meta Graph API cho 19 Page HYBRID
 
+> Cập nhật 17/11/2026: người dùng đã chọn triển khai kết hợp Graph và Browser theo từng Page. [Luồng mới](KE-HOACH-VAN-HANH-GRAPH-VA-BROWSER.md) thay thế quyết định chỉ chạy Graph bên dưới. Phần dưới giữ làm lịch sử kế hoạch 16/11 và mapping do người dùng cung cấp; các mục ghi “chưa sửa” không phải trạng thái source hiện tại. DB thật vẫn chưa được đối chiếu hoặc đổi mode.
+
 Cập nhật 16/11/2026, Asia/Bangkok, theo thông tin người dùng. Đây là kế hoạch và quy trình làm việc, chưa xác nhận đã đồng bộ DB workspace hoặc đã triển khai.
 
 **Quyết định mới nhất: chọn Meta Graph API làm đường xử lý cho đợt triển khai 19 Page HYBRID.** 47 Page ANTIDETECT nằm ngoài phạm vi chạy và tiếp tục thuộc diện phải pause; Browser không phải phương án dự phòng khi Graph lỗi. Yêu cầu lần này chỉ cập nhật kế hoạch, chưa đổi cấu hình, đồng bộ DB, kiểm tra Facebook hoặc bật gửi.

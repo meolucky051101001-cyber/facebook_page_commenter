@@ -15,6 +15,7 @@ import csv
 import json
 import os
 import re
+import sqlite3
 import sys
 import threading
 import time
@@ -23,18 +24,30 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from contextlib import contextmanager
+from contextlib import contextmanager, closing
 
 import config
 import database as db
 import meta_client
 import browser_safety
+import submit_control
 
 _BRIDGE_LOCK = threading.RLock()
 _INPROC_MANAGER = None
 _INPROC_LAUNCHER = None
 _PROFILE_OPERATION_LOCKS = {}
 _OWNED_PROFILE_LEASES = {}
+_MAX_SUBMIT_EVIDENCE_AGE_SEC = 2.0
+
+
+def _submit_time():
+    return time.monotonic()
+
+
+def _dispatch_paused():
+    # Lazy import avoids a cycle; this predicate performs no I/O.
+    import scheduler
+    return scheduler.SCHEDULER_METRICS["paused_all"]
 
 
 class BrowserAutomationError(RuntimeError):
@@ -48,12 +61,14 @@ class BrowserAutomationError(RuntimeError):
         self.message = message
         self.retry_at = retry_at
         self.profile_safety_recorded = False
+        self.safety_persistence_failed = False
 
     def as_result(self):
         return {"success": False, "comment_id": None, "category": self.category,
                 "error": self.message, "browser_status": self.browser_status,
                 "mode": "ANTIDETECT_CDP", "usage_pct": None, "retry_at": self.retry_at,
-                "profile_safety_recorded": self.profile_safety_recorded}
+                "profile_safety_recorded": self.profile_safety_recorded,
+                "safety_persistence_failed": self.safety_persistence_failed}
 
 
 def get_antidetect_dir() -> Path:
@@ -623,7 +638,7 @@ _BROWSER_ACCESS_STATE_JS = r"""
     if (r.width <= 2 || r.height <= 2 || style.visibility === 'hidden' || style.display === 'none') continue;
     const text = String(el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
     if (/confirm your identity|xác nhận danh tính của bạn|security check|kiểm tra bảo mật/i.test(text)) return 'checkpoint';
-    if (/you(?:'|’)?re temporarily blocked|you are temporarily blocked|we limit how often|you (?:can(?:not|'t|’t)) use this feature right now|your account (?:is|has been) restricted|you (?:can(?:not|'t|’t)) comment|bạn (?:tạm thời bị chặn|đang bị chặn tạm thời|không thể bình luận)|chúng tôi giới hạn (?:tần suất|mức độ thường xuyên)|(?:hiện )?bạn không thể (?:sử dụng|dùng) tính năng này|tài khoản của bạn (?:đang |đã )?bị hạn chế/i.test(text)) return 'restricted';
+    if (/you(?:'|’)?re temporarily blocked|you are temporarily blocked|we limit how often|we restrict (?:certain|some) activit(?:y|ies) to protect (?:our|the) community|you (?:can(?:not|'t|’t)) use this feature right now|your account (?:is|has been) restricted|you (?:can(?:not|'t|’t)) comment|bạn (?:tạm thời bị chặn|đang bị chặn tạm thời|không thể bình luận)|chúng tôi giới hạn (?:tần suất|mức độ thường xuyên)|chúng tôi hạn chế một số hoạt động (?:để|nhằm) bảo vệ cộng đồng|(?:hiện )?bạn không thể (?:sử dụng|dùng) tính năng này|tài khoản của bạn (?:đang |đã )?bị hạn chế/i.test(text)) return 'restricted';
   }
   return 'ok';
 })
@@ -848,35 +863,91 @@ def _check_mapping(page, expected):
 
 
 @contextmanager
-def _profile_operation(page, *, allow_blocked=False):
+def _profile_operation(page, *, allow_blocked=False, kind="verify"):
     profile_id = str(page.get("antidetect_profile_id") or "").strip()
     if not profile_id:
         raise BrowserAutomationError("Page chưa liên kết profile Antidetect.")
+    if not _numeric(page.get("page_id")):
+        raise BrowserAutomationError("Page cần ID dạng số và liên kết profile Antidetect hợp lệ.")
     with _BRIDGE_LOCK:
         lock = _PROFILE_OPERATION_LOCKS.setdefault(profile_id, threading.Lock())
     if not lock.acquire(blocking=False):
         raise BrowserAutomationError("Profile đang xử lý một thao tác khác.", "BROWSER_BUSY", "READY")
+    context = None
+    reservation = None
+    primary_error = None
+    preserve_marker = False
     try:
-        reservation = browser_safety.reserve_operation(profile_id, allow_blocked=allow_blocked)
+        try:
+            reservation = browser_safety.begin_operation(
+                profile_id, page_id=str(page.get("page_id") or ""), kind=kind,
+                allow_blocked=allow_blocked)
+        except Exception:
+            raise BrowserAutomationError("Không lưu được lượt thao tác an toàn; chưa mở trình duyệt.",
+                                         "BROWSER_BLOCKED", "RECOVERY_REQUIRED") from None
         if not reservation["ready"]:
             status = reservation.get("browser_status") or "ERROR"
-            category = "BROWSER_LIMIT" if reservation.get("reason", "").startswith("WAIT_PROFILE_") else "BROWSER_BLOCKED"
+            reason = reservation.get("reason", "")
+            category = ("BROWSER_LIMIT" if reason.startswith("WAIT_PROFILE_") else
+                        "BROWSER_BUSY" if reason == "PROFILE_BUSY" else "BROWSER_BLOCKED")
             error = BrowserAutomationError(reservation["message"], category, status,
                                            retry_at=reservation.get("retry_at"))
             error.profile_safety_recorded = True
+            error.safety_persistence_failed = bool(reservation.get("safety_persistence_failed"))
             raise error
-        context = _page_context(page)
-        context["safety_generation"] = reservation["generation"]
         try:
+            context = _page_context(page)
+            context["safety_generation"] = reservation["generation"]
+            context["operation_id"] = reservation["operation_id"]
             _check_mapping(page, context)
             yield context
         except BrowserAutomationError as exc:
+            primary_error = exc
+            preserve_marker = exc.safety_persistence_failed
             if exc.browser_status in ("LOGIN_REQUIRED", "CHECKPOINT", "RESTRICTED"):
-                browser_safety.block(profile_id, exc.browser_status, exc.message)
-                exc.profile_safety_recorded = True
+                try:
+                    recorded = browser_safety.block(profile_id, exc.browser_status, exc.message,
+                                                     operation_id=reservation["operation_id"])
+                    exc.safety_persistence_failed = bool(recorded.get("safety_persistence_failed"))
+                    exc.profile_safety_recorded = not exc.safety_persistence_failed
+                except Exception:
+                    browser_safety.latch(profile_id, exc.browser_status, exc.message)
+                    exc.safety_persistence_failed = True
+                preserve_marker = exc.safety_persistence_failed
             raise
+        except sqlite3.Error:
+            # An unexpected safety/DB failure leaves the committed marker for
+            # recovery. Never turn this operation into an ordinary clean retry.
+            preserve_marker = True
+            browser_safety.latch(profile_id, "RECOVERY_REQUIRED", "Thao tác bị gián đoạn; cần kiểm tra lại profile.")
+            raise BrowserAutomationError("Không hoàn tất đối chiếu trạng thái an toàn; profile đã dừng.",
+                                         "BROWSER_BLOCKED", "RECOVERY_REQUIRED") from None
     finally:
-        lock.release()
+        try:
+            if reservation and reservation.get("ready") and preserve_marker:
+                browser_safety.abandon_operation(profile_id, reservation["operation_id"])
+            if reservation and reservation.get("ready") and not preserve_marker:
+                try:
+                    finished = browser_safety.finish_operation(
+                        profile_id, reservation["operation_id"], reservation["generation"])
+                    failed = not finished.get("completed")
+                    if failed:
+                        browser_safety.latch(profile_id, "RECOVERY_REQUIRED", "Không xác nhận được kết thúc thao tác; cần kiểm tra profile.")
+                except Exception:
+                    browser_safety.latch(profile_id, "RECOVERY_REQUIRED", "Không lưu được kết thúc thao tác; cần kiểm tra lại profile.")
+                    failed = True
+                if failed:
+                    if context is not None:
+                        context["safety_persistence_failed"] = True
+                    if primary_error is not None:
+                        primary_error.safety_persistence_failed = True
+                    elif kind != "send":
+                        error = BrowserAutomationError("Không lưu được trạng thái kiểm tra; profile vẫn dừng.",
+                                                        "BROWSER_BLOCKED", "RECOVERY_REQUIRED")
+                        error.safety_persistence_failed = True
+                        raise error
+        finally:
+            lock.release()
 
 
 def build_facebook_post_url(page_id, post_id, page_url=None, post_url=None):
@@ -1094,25 +1165,28 @@ def _run_read(page, context, url, operation):
 
 def verify_page_connection_cdp(page):
     try:
-        with _profile_operation(page, allow_blocked=True) as context:
+        with _profile_operation(page, allow_blocked=True, kind="check") as context:
             async def operation(session):
                 state = await _confirm_actor(session, context)
                 return {"success": True, "error": None, "browser_status": "READY",
                         "identity_id": context["identity_id"], "profile_id": context["profile_id"],
                         "observed_identity_ids": sorted(set(state["actorIds"]))}
             result = _run_read(page, context, f"https://www.facebook.com/{context['identity_id']}", operation)
-            cleared = browser_safety.clear_block(context["profile_id"], context["safety_generation"])
+            cleared = browser_safety.clear_block(context["profile_id"], context["safety_generation"],
+                                                 operation_id=context["operation_id"])
             if not cleared["cleared"]:
-                raise BrowserAutomationError("Trạng thái an toàn của profile đã đổi trong khi kiểm tra; chưa cho phép gửi.",
-                                             "BROWSER_BLOCKED")
+                error = BrowserAutomationError("Trạng thái an toàn của profile đã đổi trong khi kiểm tra; chưa cho phép gửi.",
+                                                "BROWSER_BLOCKED")
+                error.safety_persistence_failed = bool(cleared.get("safety_persistence_failed"))
+                raise error
             result["safety_generation"] = cleared["generation"]
-            return result
+        return result
     except BrowserAutomationError as exc:
         return {**exc.as_result(), "identity_id": None, "profile_id": page.get("antidetect_profile_id")}
 
 
 def get_recent_posts_for_page_cdp(page, since_timestamp=None):
-    with _profile_operation(page) as context:
+    with _profile_operation(page, kind="scan") as context:
         since = _timestamp(since_timestamp) if since_timestamp is not None else None
         if since_timestamp is not None and since is None:
             raise BrowserAutomationError("Mốc thời gian quét bài viết không hợp lệ.")
@@ -1141,7 +1215,7 @@ def get_recent_posts_for_page_cdp(page, since_timestamp=None):
 
 
 def verify_post_for_page_cdp(page, post_id, post_url=None):
-    with _profile_operation(page) as context:
+    with _profile_operation(page, kind="verify") as context:
         numeric_post, url = _target_post(context, post_id, post_url)
         async def operation(session):
             state = await _confirm_actor(session, context, numeric_post)
@@ -1164,12 +1238,18 @@ def _matching_comment_ids(state, context, message):
     return matches
 
 
-def send_page_comment_cdp(page, post_id, message, post_url=None, before_submit=None):
+def send_page_comment_cdp(page, post_id, message, post_url=None, before_submit=None,
+                          *, prepare_for_submit=None, final_submit_gate=None):
     submitted = False
+    context = None
+    ticket = submit_control.snapshot(str(page.get("page_id") or ""),
+                                     profile_id=str(page.get("antidetect_profile_id") or ""))
     try:
         if not isinstance(message, str) or not message.strip():
             raise BrowserAutomationError("Nội dung bình luận không được để trống.")
-        with _profile_operation(page) as context:
+        if _dispatch_paused():
+            raise BrowserAutomationError("Hệ thống đang tạm dừng gửi bình luận.", "CANCELLED_BEFORE_SEND", "READY")
+        with _profile_operation(page, kind="send") as context:
             numeric_post, url = _target_post(context, post_id, post_url)
             async def operation(session):
                 nonlocal submitted
@@ -1194,10 +1274,12 @@ def send_page_comment_cdp(page, post_id, message, post_url=None, before_submit=N
                     raise BrowserAutomationError("Nội dung/ô nhập/Page thay đổi trước khi gửi; đã hủy thao tác.", "CANCELLED_BEFORE_SEND")
                 baseline.update(final.get("commentIds") or [])
                 _check_mapping(page, context)
-                if before_submit is not None and not before_submit():
+                prepare = prepare_for_submit or before_submit
+                if prepare is not None and not prepare():
                     raise BrowserAutomationError("Tác vụ đã dừng hoặc cấu hình thay đổi trước khi gửi.", "CANCELLED_BEFORE_SEND", "READY")
                 # The callback may refresh Sheets over HTTP. DOM evidence from
                 # before that potentially slow call is no longer sufficient.
+                evidence_started = _submit_time()
                 ready = await session.inspect(numeric_post, message)
                 _verified_post(ready, context, numeric_post)
                 if not ready.get("focused") or not _identity_matches(ready, context) or \
@@ -1207,10 +1289,35 @@ def send_page_comment_cdp(page, post_id, message, post_url=None, before_submit=N
                     raise BrowserAutomationError("Đã thấy bình luận trùng nội dung trước khi gửi; cần kiểm tra để tránh đăng lặp.", "NEED_CHECK", "READY")
                 baseline.update(ready.get("commentIds") or [])
                 _check_mapping(page, context)
-                safety = browser_safety.status(context["profile_id"])
+                try:
+                    with closing(sqlite3.connect(db.DB_PATH, timeout=0.2)) as safety_conn:
+                        safety_conn.execute("PRAGMA query_only=ON")
+                        safety = browser_safety.status(context["profile_id"], conn=safety_conn)
+                except Exception:
+                    browser_safety.latch(context["profile_id"], "RECOVERY_REQUIRED", "Không đọc được trạng thái an toàn trước gửi.")
+                    error = BrowserAutomationError("Không đọc được trạng thái an toàn; chưa gửi bình luận.",
+                                                   "BROWSER_BLOCKED", "RECOVERY_REQUIRED")
+                    error.safety_persistence_failed = True
+                    raise error from None
+                if safety.get("safety_persistence_failed"):
+                    blocked_status = safety.get("browser_status")
+                    if blocked_status not in ("LOGIN_REQUIRED", "CHECKPOINT", "RESTRICTED"):
+                        blocked_status = "RECOVERY_REQUIRED"
+                    browser_safety.latch(context["profile_id"], blocked_status, "Không đối chiếu được trạng thái an toàn trước gửi.")
+                    error = BrowserAutomationError("Không đối chiếu được trạng thái an toàn; chưa gửi bình luận.",
+                                                   "BROWSER_BLOCKED", blocked_status)
+                    error.safety_persistence_failed = True
+                    raise error
                 if safety.get("browser_status") != "READY" or safety.get("generation") != context["safety_generation"]:
                     raise BrowserAutomationError("Profile đã bị dừng trong khi chuẩn bị gửi.",
                                                  "BROWSER_BLOCKED", safety.get("browser_status") or "ERROR")
+                if _submit_time() - evidence_started > _MAX_SUBMIT_EVIDENCE_AGE_SEC:
+                    raise BrowserAutomationError("Bằng chứng bài viết đã cũ; đã hủy trước khi gửi.", "CANCELLED_BEFORE_SEND", "READY")
+                if final_submit_gate is not None and not final_submit_gate():
+                    raise BrowserAutomationError("Quyền gửi hoặc cấu hình đã thay đổi; đã hủy trước khi gửi.", "CANCELLED_BEFORE_SEND", "READY")
+                if (_submit_time() - evidence_started > _MAX_SUBMIT_EVIDENCE_AGE_SEC
+                        or not submit_control.commit(ticket, _dispatch_paused)):
+                    raise BrowserAutomationError("Lượt gửi đã bị dừng hoặc quá hạn trước khi chốt.", "CANCELLED_BEFORE_SEND", "READY")
                 # Set before dispatch: a lost response to keyDown is uncertain,
                 # even if the subsequent keyUp never completes.
                 submitted = True
@@ -1227,18 +1334,26 @@ def send_page_comment_cdp(page, post_id, message, post_url=None, before_submit=N
                         return {"success": True, "category": "SUCCESS", "comment_id": fresh.pop(),
                                 "error": None, "browser_status": "READY", "mode": "ANTIDETECT_CDP", "usage_pct": None}
                 raise BrowserAutomationError("Đã gửi Enter nhưng chưa xác nhận được ID bình luận mới đúng Page/nội dung. Cần kiểm tra, không tự gửi lại.", "NEED_CHECK", "READY")
-            return asyncio.run(_with_browser_tab(context, url, operation))
+            result = asyncio.run(_with_browser_tab(context, url, operation))
+        if context.get("safety_persistence_failed"):
+            result["safety_persistence_failed"] = True
+        return result
     except BrowserAutomationError as exc:
         if submitted:
             uncertain = BrowserAutomationError("Kết quả gửi chưa xác định. Cần kiểm tra bài viết trước khi gửi lại.",
                                                "NEED_CHECK", exc.browser_status)
             uncertain.profile_safety_recorded = exc.profile_safety_recorded
+            uncertain.safety_persistence_failed = exc.safety_persistence_failed
             return uncertain.as_result()
         return exc.as_result()
     except Exception as exc:
-        return BrowserAutomationError(
+        failed_safety = bool(context and context.get("safety_persistence_failed"))
+        error = BrowserAutomationError(
             f"Lỗi CDP ({type(exc).__name__}); " + ("cần kiểm tra bài viết trước khi gửi lại." if submitted else "chưa gửi bình luận."),
-            "NEED_CHECK" if submitted else "NETWORK_RETRYABLE").as_result()
+            "NEED_CHECK" if submitted else ("BROWSER_BLOCKED" if failed_safety else "NETWORK_RETRYABLE"),
+            "RECOVERY_REQUIRED" if failed_safety else "ERROR")
+        error.safety_persistence_failed = failed_safety
+        return error.as_result()
 
 
 # Compatibility entry points delegate to the same numeric-identity safety gates.

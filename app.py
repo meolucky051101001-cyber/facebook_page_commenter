@@ -26,6 +26,8 @@ import spintax
 import operations
 import comment_dispatch
 import service_lock
+import browser_safety
+import submit_control
 
 
 
@@ -33,9 +35,11 @@ import service_lock
 async def lifespan(app: FastAPI):
     with service_lock.exclusive_database(db.DB_PATH):
         db.init_db()
+        # Previous process consent never starts a new service session.
+        scheduler.set_system_paused(True)
         with closing(db.get_connection()) as conn:
             operations.recover_interrupted_operations(conn)
-        scheduler.SCHEDULER_METRICS["paused_all"] = db.get_setting("automation_run_state") != "running"
+        browser_safety.recover_interrupted_operations()
         loops = [asyncio.create_task(loop()) for loop in (
             scheduler.loop_post_scanner, scheduler.loop_task_executor, scheduler.loop_maintenance,
             operations.loop_publications, operations.loop_inbox,
@@ -307,14 +311,15 @@ def get_metrics():
 
 @app.post("/api/system/pause")
 def set_pause(req: PauseRequest):
+    request_version = scheduler.begin_run_state_request(req.paused)
     if not req.paused:
         enabled_pages = [p for p in db.get_all_pages() if p.get("rule_enabled")]
         if enabled_pages:
             result = scheduler.refresh_comment_sheet(force=True)
             if not result.get("success"):
                 raise HTTPException(status_code=409, detail=result.get("error", "Không đồng bộ được tab bình luận."))
-    scheduler.set_system_paused(req.paused)
-    return {"success": True, "paused": req.paused}
+    paused = scheduler.set_system_paused(req.paused, expected_version=request_version)
+    return {"success": True, "paused": paused}
 
 
 @app.post("/api/sync")
@@ -351,9 +356,9 @@ def sync_from_antidetect():
 
 def _public_graph_ready(page):
     return bool(page.get("is_active") and page.get("has_page_token")
+                and not comment_dispatch.graph_quarantined(page.get("page_id", ""))
                 and page.get("token_status") in ("OK", "EXPIRING_SOON")
-                and (page["page_id"] == config.PILOT_PAGE_ID
-                     or (page.get("connection_checked_at") and not page.get("connection_error"))))
+                and page.get("connection_checked_at") and not page.get("connection_error"))
 
 
 def _public_send_ready(page):
@@ -456,10 +461,13 @@ def verify_connected_page(page_id: str):
         error = error.replace(page["page_access_token"], "[đã ẩn]")
         if config.META_APP_SECRET:
             error = error.replace(config.META_APP_SECRET, "[đã ẩn]")
-    db.update_page_connection_check(
+    saved = db.update_page_connection_check(
         page_id, datetime.now(timezone.utc).isoformat(), error, status,
         info.get("missing_scopes"), info.get("expires_at"),
+        expected_connection=page,
     )
+    if not saved:
+        raise HTTPException(409, "Kết nối Page đã thay đổi trong lúc kiểm tra. Hãy kiểm tra lại.")
     if not result.get("success"):
         raise HTTPException(status_code=409, detail=error or "Kiểm tra kết nối Page thất bại.")
     return status
@@ -493,7 +501,8 @@ def preview_page(page_id: str):
 def set_page_automation(page_id: str, req: PageAutomationRequest):
     # Stop requests remain immediate; enabling cannot race a send or mode change.
     if not req.enabled:
-        return _set_page_automation(page_id, req)
+        with submit_control.mutation(page_id, automatic=True):
+            return _set_page_automation(page_id, req)
     with _page_configuration_guard(page_id):
         return _set_page_automation(page_id, req)
 
@@ -919,7 +928,7 @@ def index():
                 <span id="systemStatusBadge" class="badge bg-secondary py-2 px-3">Đang kiểm tra trạng thái</span>
                 <span id="pilotStatus" class="small text-light"></span>
                 <button id="unlockBtn" class="btn btn-sm btn-outline-light" onclick="unlockDashboard()" hidden>Mở khóa Dashboard</button>
-                <button id="pauseBtn" class="btn btn-sm btn-outline-warning" onclick="togglePause()"><i class="fa-solid fa-pause"></i> Tạm dừng khẩn cấp</button>
+                <button id="pauseBtn" class="btn btn-sm btn-outline-warning" title="Dừng nhận lượt gửi mới; lượt đang gửi có thể hoàn tất." onclick="togglePause()"><i class="fa-solid fa-pause"></i> Tạm dừng</button>
             </div>
         </div>
     </nav>
@@ -1002,8 +1011,10 @@ def index():
                         <div class="card p-4 border-start border-4 border-success mb-3">
                             <h5 class="fw-bold mb-2 text-success"><i class="fa-solid fa-shield-halved"></i> Đồng bộ từ Antidetect Python</h5>
                             <p class="text-muted small mb-2">
-                                Đồng bộ danh mục Page và profile. Chọn Graph API hoặc Trình duyệt Antidetect cho từng Page,
-                                kiểm tra kết nối, đồng bộ tab Comments - Multi-Page rồi bật tự động.
+                                Chọn Graph API hoặc Browser (phiên đăng nhập) riêng cho từng Page.
+                                Mỗi tài khoản Facebook dùng một profile Antidetect riêng; tool dùng phiên đã đăng nhập,
+                                không yêu cầu nhập cookie. Kiểm tra đúng ID Page trước khi bật tự động.
+                                Đổi cách gửi tạm dừng tác vụ đang chờ; kiểm tra thành công không tự chạy lại.
                             </p>
 
                             <div id="antidetectSummary" class="small text-secondary mb-3">Đang kiểm tra dữ liệu Antidetect...</div>
@@ -1259,7 +1270,7 @@ def index():
                     statusBadge.className = 'badge bg-success py-2 px-3';
                     statusBadge.innerHTML = '<i class="fa-solid fa-circle-check"></i> Hệ thống đang chạy';
                     pauseBtn.className = 'btn btn-sm btn-outline-warning';
-                    pauseBtn.innerHTML = '<i class="fa-solid fa-pause"></i> Tạm dừng khẩn cấp';
+                    pauseBtn.innerHTML = '<i class="fa-solid fa-pause"></i> Tạm dừng';
                 }
             } catch(e) {}
         }
@@ -1312,10 +1323,11 @@ def index():
                 const browserMode = p.send_mode === 'BROWSER';
                 const browserLabels = {READY: 'Đã xác minh Page', UNCHECKED: 'Chưa kiểm tra',
                     LOGIN_REQUIRED: 'Cần đăng nhập Facebook', CHECKPOINT: 'Cần xác minh Facebook',
-                    RESTRICTED: 'Facebook hạn chế hoạt động', ERROR: 'Cần kiểm tra lại'};
+                    RESTRICTED: 'Facebook hạn chế hoạt động', RECOVERY_REQUIRED: 'Cần kiểm tra sau gián đoạn',
+                    ERROR: 'Cần kiểm tra lại'};
                 const tokenLabels = {OK: 'Token hợp lệ', EXPIRING_SOON: 'Token sắp hết hạn',
                     EXPIRED: 'Token hết hạn', INVALID_SECRET: 'Cần kết nối lại token',
-                    MISSING_PERMISSIONS: 'Thiếu quyền Page'};
+                    MISSING_PERMISSIONS: 'Thiếu quyền Page', RESTRICTED: 'Facebook hạn chế hoạt động'};
                 const statusText = browserMode ? (browserLabels[p.browser_status] || 'Chưa kiểm tra')
                     : (p.has_page_token ? (tokenLabels[p.token_status] || 'Cần kiểm tra Meta') : 'Chưa kết nối Meta');
                 const badgeToken = `<span class="badge ${p.send_ready ? 'bg-success' : 'bg-warning text-dark'}">${escapeHtml(statusText)}</span>`;
@@ -1336,7 +1348,7 @@ def index():
                 const modeSelect = document.createElement('select');
                 modeSelect.className = 'form-select form-select-sm';
                 modeSelect.setAttribute('aria-label', 'Cách gửi của ' + p.page_name);
-                for (const [value, label] of [['GRAPH_API', 'Graph API'], ['BROWSER', 'Trình duyệt Antidetect']]) {
+                for (const [value, label] of [['GRAPH_API', 'Graph API'], ['BROWSER', 'Browser (phiên đăng nhập)']]) {
                     const option = new Option(label, value);
                     option.disabled = value === 'BROWSER' && !p.antidetect_profile_id;
                     modeSelect.appendChild(option);

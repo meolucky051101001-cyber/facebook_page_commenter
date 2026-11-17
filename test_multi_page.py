@@ -44,9 +44,13 @@ def pages(tmp_path, monkeypatch):
     return db
 
 
-def test_two_pages_dedupe_checkpoint_and_dispatch(pages, monkeypatch):
-    old = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
-    new = datetime.now(timezone.utc).isoformat()
+def test_two_pages_dedupe_checkpoint_and_dispatch(pages, monkeypatch, clock):
+    # Windows wall-clock reads can share the same tick as the second Page's
+    # enable checkpoint. Model a post strictly after both activation cursors.
+    clock.value = max(datetime.fromisoformat(pages.get_page(page_id)["last_seen_post_time"])
+                      for page_id in (PAGE_A, PAGE_B)) + timedelta(seconds=1)
+    old = (clock.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    new = clock.now(timezone.utc).isoformat()
     monkeypatch.setattr(meta_client, "get_recent_posts", lambda *args, **kwargs: [
         {"id": "old", "created_time": old}, {"id": "same-post", "created_time": new},
     ])

@@ -15,6 +15,7 @@ import meta_client
 import sheets_sync
 import antidetect_client
 import browser_safety
+import submit_control
 
 
 # In-memory status for UI monitoring
@@ -35,17 +36,37 @@ SCHEDULER_METRICS: Dict[str, Any] = {
 _SCAN_LOCK = threading.Lock()
 _EXEC_LOCK = threading.Lock()
 _RUN_STATE_LOCK = threading.Lock()
+_RUN_REQUEST_LOCK = threading.Lock()
+_RUN_REQUEST_VERSION = 0
 _COMMENT_SHEET_LOCK = threading.Lock()
 _last_comment_sheet_read = float("-inf")
 _comment_sheet_result = {"success": False, "error": "Chưa đọc tab bình luận."}
 
 
-def set_system_paused(paused: bool) -> None:
-    with _RUN_STATE_LOCK:
+def begin_run_state_request(paused: bool) -> int:
+    """Order operator intent before any slow Resume preparation."""
+    global _RUN_REQUEST_VERSION
+    with submit_control.mutation(), _RUN_REQUEST_LOCK:
+        _RUN_REQUEST_VERSION += 1
         if paused:
             SCHEDULER_METRICS["paused_all"] = True
-        db.set_setting("automation_run_state", "paused" if paused else "running")
-        SCHEDULER_METRICS["paused_all"] = paused
+        return _RUN_REQUEST_VERSION
+
+
+def set_system_paused(paused: bool, *, expected_version: Optional[int] = None) -> bool:
+    # Publish cancellation before waiting for a DB/other state writer. Resume
+    # never revives a ticket created before the stop, even if DB writing fails.
+    with submit_control.mutation():
+        request_version = begin_run_state_request(paused) if expected_version is None else expected_version
+        with _RUN_STATE_LOCK:
+            with _RUN_REQUEST_LOCK:
+                if request_version != _RUN_REQUEST_VERSION:
+                    return SCHEDULER_METRICS["paused_all"]
+            db.set_setting("automation_run_state", "paused" if paused else "running")
+            with _RUN_REQUEST_LOCK:
+                if request_version == _RUN_REQUEST_VERSION:
+                    SCHEDULER_METRICS["paused_all"] = paused
+                return SCHEDULER_METRICS["paused_all"]
 
 
 def comment_sheet_url() -> str:
@@ -264,6 +285,9 @@ def _detect_new_posts_and_schedule():
             elif exc.category in ("TOKEN_EXPIRED", "MISSING_PERMISSIONS"):
                 status = "EXPIRED" if exc.category == "TOKEN_EXPIRED" else exc.category
                 db.update_page_status(page_id, bool(p["is_active"]), status, exc.message)
+            elif exc.category == "RESTRICTED":
+                comment_dispatch.quarantine_graph(page_id)
+                db.update_page_status(page_id, bool(p["is_active"]), "RESTRICTED", exc.message)
             continue
         except Exception:
             SCHEDULER_METRICS["scan_errors"][page_id] = "Không thể đọc bài hoặc cấu hình Page."
@@ -366,6 +390,31 @@ def _prepare_before_submit(task, initial_page, paused, *, refresh_sheet=False, p
         return latest
 
 
+def _final_submit_gate(task, initial_page, paused, ticket, *, profile_reserved=False):
+    """No HTTP, waiting Sheet mutex or browser work after the final DOM read."""
+    if not _COMMENT_SHEET_LOCK.acquire(blocking=False):
+        return comment_dispatch.Decision("SOURCE_BUSY", message="Nguồn bình luận đang cập nhật; đã hủy lượt gửi.")
+    try:
+        automatic = task.get("source") == "AUTO"
+        if automatic and not _comment_sheet_result.get("success"):
+            return comment_dispatch.Decision("SOURCE_CHANGED", message="Nguồn bình luận chưa sẵn sàng.")
+        latest = comment_dispatch.final_check(
+            task["page_id"], paused, initial_page, automatic=automatic,
+            require_sheet=automatic, transport="selected", profile_reserved=profile_reserved, task=task,
+        )
+        if not latest.ready:
+            return latest
+        revision = task.get("content_revision") or ""
+        if (_send_mode(initial_page) == "BROWSER" and automatic and task.get("sequence_step") is None
+                and not revision.startswith("snapshot:") and revision != comment_content.rule_revision(latest.page)):
+            return comment_dispatch.Decision("SOURCE_CHANGED", message="Mẫu hoặc lịch bình luận đã đổi.")
+        if not submit_control.commit(ticket, paused):
+            return comment_dispatch.Decision("CANCELLED_BEFORE_SEND", message="Quyền gửi đã thay đổi; đã hủy lượt gửi.")
+        return latest
+    finally:
+        _COMMENT_SHEET_LOCK.release()
+
+
 def _execute_due_tasks():
     if SCHEDULER_METRICS["paused_all"]:
         return
@@ -377,6 +426,7 @@ def _execute_due_tasks():
             break
         task_id, page_id = task["id"], task["page_id"]
         automatic = task.get("source") == "AUTO"
+        ticket = submit_control.snapshot(page_id, automatic=automatic)
         with comment_dispatch.guard(page_id, paused, automatic=automatic, require_sheet=automatic,
                                     transport="selected") as decision:
             if not decision.ready:
@@ -427,12 +477,19 @@ def _execute_due_tasks():
                                 cancellation.update(error=final.message, retry_at=final.retry_at)
                             return final.ready
 
+                        def final_submit_gate():
+                            final = _final_submit_gate(task, page, paused, ticket, profile_reserved=True)
+                            if not final.ready:
+                                cancellation.update(error=final.message, retry_at=final.retry_at)
+                            return final.ready
+
                         # The browser sender verifies the post and its timestamp
                         # in the same tab it uses to submit the comment.
                         result = antidetect_client.send_page_comment_cdp(
                             page, task["post_id"], content,
                             post_url=task.get("post_url"),
                             before_submit=before_submit,
+                            final_submit_gate=final_submit_gate,
                         )
                         if result.get("category") == "CANCELLED_BEFORE_SEND":
                             result.update(cancellation)
@@ -440,6 +497,11 @@ def _execute_due_tasks():
                             result = {"success": False, "category": "NEED_CHECK",
                                       "error": "Chưa có mã bình luận xác thực từ trình duyệt. Đối chiếu trên Facebook."}
                     else:
+                        final = _final_submit_gate(task, page, paused, ticket)
+                        if not final.ready:
+                            db.release_task_lock(task_id)
+                            db.defer_task(task_id, final.retry_at, final.message)
+                            continue
                         result = meta_client.post_comment(verified["clean_post_id"], page_id, token, content)
                 except antidetect_client.BrowserAutomationError as exc:
                     result = exc.as_result()
@@ -478,10 +540,13 @@ def _record_dispatch_result(task, result, page):
             return
     if category == "NEED_CHECK":
         db.update_task_result(task_id, "NEED_CHECK", error_message=error)
-    elif category in ("TOKEN_EXPIRED", "MISSING_PERMISSIONS"):
-        db.update_task_result(task_id, "PAUSED", error_message=error)
+    elif category in ("TOKEN_EXPIRED", "MISSING_PERMISSIONS", "RESTRICTED"):
+        # If persisting the Page block fails, retain SENDING as a durable
+        # interrupted-write marker; startup recovery invalidates Graph proof.
+        comment_dispatch.quarantine_graph(page_id)
         status = "EXPIRED" if category == "TOKEN_EXPIRED" else category
         db.update_page_status(page_id, bool(page["is_active"]), status, error)
+        db.update_task_result(task_id, "PAUSED", error_message=error)
     elif category in ("RATE_LIMIT", "NETWORK_RETRYABLE"):
         if category == "RATE_LIMIT":
             retry_at = db.record_rate_limit(page_id, result)
@@ -548,17 +613,23 @@ def run_maintenance_cycle():
     Runs periodic maintenance:
     1. Recovers only tasks stuck in SENDING for > 5 minutes (startup=False).
     2. Checks token health ONLY when debug_token actually succeeded (`checked=True`).
-    3. Refreshes Google Sheet configuration even while sending is paused.
+    3. Performs external reads only while the system is running.
     """
     db.recover_stale_tasks(startup=False, stale_after_seconds=300)
+    if SCHEDULER_METRICS["paused_all"]:
+        return
 
     for p in db.get_all_pages():
+        if SCHEDULER_METRICS["paused_all"]:
+            return
         pid = p["page_id"]
         if not p.get("rule_enabled") or _send_mode(p) == "BROWSER":
             continue
         full_p = db.get_page_for_dispatch(pid)
         if not full_p or not full_p.get("page_access_token"):
             continue
+        if SCHEDULER_METRICS["paused_all"]:
+            return
         info = meta_client.debug_token(full_p["page_access_token"])
         if info.get("checked") is not True:
             continue
@@ -572,7 +643,7 @@ def run_maintenance_cycle():
             continue
         db.update_page_status(pid, bool(p["is_active"]), status, note)
 
-    if comment_sheet_url():
+    if not SCHEDULER_METRICS["paused_all"] and comment_sheet_url():
         refresh_comment_sheet()
 
 
@@ -603,11 +674,11 @@ async def loop_post_scanner():
 
 
 async def loop_task_executor():
-    """Loop 2: Refresh Page templates while paused and dispatch enabled tasks."""
+    """Loop 2: Refresh and dispatch only while explicitly running."""
     while True:
-        await run_worker(refresh_comment_sheet)
         if not SCHEDULER_METRICS["paused_all"]:
             try:
+                await run_worker(refresh_comment_sheet)
                 await run_worker(execute_due_tasks)
                 SCHEDULER_METRICS["task_exec"]["last_run"] = datetime.now(timezone.utc).isoformat()
                 SCHEDULER_METRICS["task_exec"]["last_error"] = None

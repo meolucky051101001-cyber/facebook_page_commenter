@@ -1,11 +1,13 @@
 # Bàn giao hiện trạng Commenter Facebook
 
-Cập nhật: 16/11/2026, Asia/Bangkok. Thư mục làm việc và chạy dịch vụ:
+Cập nhật: 17/11/2026, Asia/Bangkok. Thư mục làm việc:
 `C:\Projects\Tools\facebook comment\facebook_page_commenter`.
 
-Ưu tiên đọc `docs/KE-HOACH-TICH-HOP-19-PAGE-GRAPH-HYBRID.md` cho hướng triển khai hiện tại. `docs/KE-HOACH-SUA-LOI-COMMENT-TU-DONG.md`, `docs/NHAT-KY-TRIEN-KHAI-COMMENT-TU-DONG.md` và `docs/legacy` ghi lại các giai đoạn trước; không lấy quyền chạy cũ làm quyền vận hành mới.
+Ưu tiên đọc `docs/KE-HOACH-VAN-HANH-GRAPH-VA-BROWSER.md` cho luồng mới. Đã triển khai source/test kết hợp: Graph hoặc phiên đăng nhập Browser được chọn riêng cho từng Page, không fallback. Startup luôn Pause; chưa đổi DB vận hành, mode, opt-in hoặc bật AUTO. Không đọc `.env`, DB thật, cookie, token hoặc khóa thật trong lần triển khai này. Kết quả kiểm thử thực chạy nằm ở mục 17/11 trong `docs/NHAT-KY-TRIEN-KHAI-COMMENT-TU-DONG.md`.
 
-## Cập nhật người dùng về Graph/HYBRID — ưu tiên áp dụng
+Các phần ngày 16/11 và 15/11 bên dưới là lịch sử. Quyết định cũ hoãn Browser và nhận định các lỗi chưa sửa không còn phản ánh source mới; số liệu DB/dịch vụ cũ không phải trạng thái hiện tại. Quyền chạy cũ không cấp quyền vận hành mới. DB workspace vẫn là nguồn đích, đồng bộ từ `.gemini` riêng sau.
+
+## Lịch sử cập nhật Graph/HYBRID — 16/11
 
 **Lựa chọn mới nhất: triển khai Graph API cho 19 HYBRID; 47 ANTIDETECT loại khỏi phạm vi chạy và giữ yêu cầu pause.** Không fallback Browser khi Graph lỗi. Đây là yêu cầu cập nhật kế hoạch, chưa cho phép sửa cấu hình vận hành, đồng bộ DB, gọi Facebook hoặc gửi. API chính thức không bảo đảm tránh ban; vẫn kiểm soát quyền, policy và giới hạn cấp Page/tài khoản/ứng dụng.
 
