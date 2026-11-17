@@ -61,6 +61,23 @@ def _run_ready(coroutine):
 def proxy():
     calls = []
     responses = {
+        "/api/profile-safety": (200, {
+            "read_only": True, "paused_all": True, "generated_at": "2026-11-18T01:00:00Z",
+            "profiles": [{"profile_id": "shared", "profile_name": "Synthetic profile", "page_count": 1,
+                          "page_names": ["Browser fixture"], "status": "READY", "reason": "READY",
+                          "operations_today": 5, "operations_limit": 30, "wait_reason": None, "retry_at": None,
+                          "blocked_page_ids": [], "verified_page_ids": [PAGE], "private": INJECTED_PRIVATE_VALUE}],
+            "blocked_pages": [], "pages_needing_attention": [], "private": INJECTED_PRIVATE_VALUE,
+        }),
+        "/api/preflight": (200, {
+            "read_only": True, "scope": "catalog", "paused_all": True, "generated_at": "2026-11-18T01:00:00Z",
+            "eligible_pages": 1, "enabled_pages": 1, "blocked_pages": 0, "blocked_profiles": 0,
+            "source_errors": 0, "needs_check_count": 1,
+            "task_counts": {key: 1 if key == "NEED_CHECK" else 0 for key in workspace.TASK_STATUSES},
+            "findings": [{"severity": "warning", "code": "NEED_CHECK", "page_id": PAGE,
+                          "page_name": "Browser fixture", "profile_id": "shared", "reason": "Review task",
+                          "private": INJECTED_PRIVATE_VALUE}], "private": INJECTED_PRIVATE_VALUE,
+        }),
         "/api/metrics": (200, {
             "metrics": {"paused_all": True, "sheet_sync": {
                 "sheet_url": "https://docs.google.com/spreadsheets/d/synthetic/edit",
@@ -148,6 +165,7 @@ def proxy():
 
 @pytest.mark.parametrize("method,path,body", [
     ("GET", "/api/commenter/state", None),
+    ("GET", "/api/commenter/preflight", None),
     ("GET", "/api/commenter/tasks?status=NEED_CHECK&page_id=" + PAGE, None),
     ("GET", f"/api/commenter/pages/{PAGE}/preview", None),
     ("POST", f"/api/commenter/pages/{PAGE}/check", None),
@@ -182,7 +200,7 @@ def test_refresh_reads_only_fixed_endpoints_and_public_projection(proxy):
     assert response.status_code == 200
     assert sorted(calls) == sorted([
         ("GET", "/api/metrics", None), ("GET", "/api/pages", None),
-        ("GET", "/api/tasks?limit=200", None),
+        ("GET", "/api/tasks?limit=200", None), ("GET", "/api/profile-safety", None),
     ])
     assert INJECTED_PRIVATE_VALUE not in response.text
     data = response.json()
@@ -191,6 +209,53 @@ def test_refresh_reads_only_fixed_endpoints_and_public_projection(proxy):
     assert data["pages"][0]["has_page_token"] is False
     assert data["pages"][0]["profile_operations_today"] == 5
     assert data["tasks"][0]["status"] == "NEED_CHECK"
+    assert data["profile_safety"]["profiles"][0]["status"] == "READY"
+
+
+def test_preflight_only_reads_fixed_route_and_strips_nested_private_fields(proxy):
+    request, calls, _ = proxy
+    response = request("GET", "/api/commenter/preflight?path=/api/sync")
+    assert response.status_code == 200
+    assert calls == [("GET", "/api/preflight", None)]
+    assert response.json()["read_only"] is True
+    assert response.json()["needs_check_count"] == 1
+    assert INJECTED_PRIVATE_VALUE not in response.text
+
+
+@pytest.mark.parametrize("key,value", [("read_only", False), ("paused_all", "false"),
+    ("findings", {}), ("task_counts", {}), ("needs_check_count", None), ("eligible_pages", True)])
+def test_preflight_rejects_untrusted_or_incomplete_report(proxy, key, value):
+    request, _, responses = proxy
+    responses["/api/preflight"][1][key] = value
+    assert request("GET", "/api/commenter/preflight").status_code == 502
+
+
+@pytest.mark.parametrize("key,value", [("status", "UNKNOWN"), ("page_names", [None]),
+    ("page_count", True), ("operations_today", "unknown"), ("verified_page_ids", None)])
+def test_profile_report_corruption_fails_closed(proxy, key, value):
+    request, _, responses = proxy
+    responses["/api/profile-safety"][1]["profiles"][0][key] = value
+    assert request("GET", "/api/commenter/state").status_code == 502
+
+
+def test_unknown_profile_counter_stays_unknown_and_does_not_become_ready(proxy):
+    request, _, responses = proxy
+    profile = responses["/api/profile-safety"][1]["profiles"][0]
+    profile.update(status="BLOCKED", reason="SAFETY_STATE_INVALID", operations_today=None, operations_limit=None,
+                   blocked_page_ids=[PAGE], verified_page_ids=[])
+    response = request("GET", "/api/commenter/state")
+    assert response.status_code == 200
+    assert response.json()["profile_safety"]["profiles"][0]["operations_today"] is None
+
+
+def test_nested_private_values_in_readiness_text_are_rejected(proxy):
+    request, _, responses = proxy
+    responses["/api/profile-safety"][1]["profiles"][0]["wait_reason"] = {"private": INJECTED_PRIVATE_VALUE}
+    response = request("GET", "/api/commenter/state")
+    assert response.status_code == 502 and INJECTED_PRIVATE_VALUE not in response.text
+    responses["/api/preflight"][1]["findings"][0]["reason"] = {"private": INJECTED_PRIVATE_VALUE}
+    response = request("GET", "/api/commenter/preflight")
+    assert response.status_code == 502 and INJECTED_PRIVATE_VALUE not in response.text
 
 
 @pytest.mark.parametrize("pause", [None, 0, 1, "false"])

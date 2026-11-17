@@ -1,3 +1,15 @@
+# Bổ sung profile và preflight — 18/11/2026, Asia/Bangkok
+
+Hoàn tất source: `operational_readiness.py` tổng hợp metadata công khai, chốt profile và toàn bộ task counts bằng truy vấn aggregate. API `/api/profile-safety` và `/api/preflight` chỉ đọc, không giải mã token, không quét bài, kiểm tra kết nối, đồng bộ Sheet, reserve quota hay sửa trạng thái. Profile Browser phân biệt READY, WAITING (quota/gap/busy), BLOCKED (checkpoint/latch/recovery/metadata lỗi). Proof từng Page giữ riêng; Graph cùng mapping không bị chặn theo profile Browser. Counter chưa xác định giữ `null`, UI hiện `—`.
+
+Giao diện Antidetect thêm **Profile & an toàn**, preflight chủ động với kết quả ở đầu panel và danh sách lỗi cuộn được. Tác vụ NEED_CHECK được đếm cả ngoài 500 bản ghi dashboard. Pause có đường gửi riêng để dừng khi check hoặc Resume còn chờ; refresh cũ không ghi đè ý định mới. Giao diện hiển thị giờ UTC+7, giữ bộ lọc, không tự chạy preflight hoặc gửi khi tải trang.
+
+Kiểm thử: `python -m pytest -q -o faulthandler_timeout=30 --tb=short` đạt **563 passed** trong **99.90 giây**, một cảnh báo deprecation Starlette/AnyIO. Bộ riêng preflight/proxy đạt **132 passed**. Python/JavaScript syntax và diff whitespace đạt. `python verify_commenter_ui.py` chạy headless browser mới với mọi request bị intercept bằng fixture 66 Page (19 Graph + 47 Browser), xác nhận trạng thái profile, preflight chỉ GET, chặn AUTO/restore khi profile lỗi, không tràn ngang ở 390px và Pause trong khi check/Resume đang chờ. Ảnh kiểm thử ở `.pytest_cache/commenter-ui/`; script cần Playwright/Chromium đã cài sẵn, không tự tải.
+
+Không đọc `.env`, DB/cookie/token thật hoặc gọi Facebook. Chưa đồng bộ DB, đổi mode/opt-in, mở profile hoặc khởi chạy/restart dịch vụ. Bản integration mới ở source workspace, chưa copy vào Antidetect cài đặt bên ngoài. Bộ duyệt quyền ban đầu lỗi dịch vụ/timeout; lần thử lại qua cùng luồng phê duyệt đã chạy thành công UI và full suite.
+
+---
+
 # Cập nhật source Graph và Browser — 17/11/2026
 
 Đã triển khai chọn Graph/Browser theo từng Page, dùng phiên đăng nhập cục bộ của profile tài khoản; không thêm nhập/xuất cookie thô và không fallback Browser khi Graph lỗi. Source startup luôn lưu Pause, chặn maintenance/Sheet tự động khi pause, bỏ miễn proof Pilot và chặn hide/unhide/reply/publication trước lệnh ghi.

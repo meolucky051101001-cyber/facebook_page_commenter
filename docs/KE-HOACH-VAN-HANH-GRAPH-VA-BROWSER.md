@@ -1,6 +1,6 @@
 # Luồng chọn Graph API và Browser theo từng Page
 
-Cập nhật 17/11/2026, Asia/Bangkok. Người dùng cho phép triển khai source/test của phương án kết hợp. Tài liệu này thay thế quyết định chỉ triển khai Graph ngày 16/11; không cấp quyền khởi chạy dịch vụ, gửi thử hoặc bật AUTO thật.
+Cập nhật 18/11/2026, Asia/Bangkok. Người dùng cho phép triển khai source/test của phương án kết hợp và bảng an toàn profile/preflight. Tài liệu này thay thế quyết định chỉ triển khai Graph ngày 16/11; không cấp quyền khởi chạy dịch vụ, gửi thử hoặc bật AUTO thật.
 
 ## Phạm vi dữ liệu và cách gửi
 
@@ -29,6 +29,10 @@ Mỗi Page có ba dòng chuỗi với Thứ tự 1/2/3; số phút là mốc t�
 Quota bình luận Page còn dùng chung với trả lời trong tool. Ngân sách Browser tính thêm check/scan/verify/send của mọi Page chung profile. Giữ mặc định 100 thao tác/profile/ngày và 60 giây giữa thao tác; không tự tăng để đáp ứng số Page. Với polling 240 giây, riêng scan liên tục có thể dùng hết 100 lượt sau khoảng 6 giờ 40 phút. Trước khi chạy cả ngày cần chọn lịch quét/ngân sách phù hợp số Page thực tế. Bài phát hiện muộn hơn MAX_POST_AGE_MIN (mặc định 120 phút) bị bỏ qua; chưa hỗ trợ URL rút gọn/pfbid ở Browser.
 
 ## Nghiệm thu và vận hành riêng sau
+
+Đã thêm API chỉ đọc `/api/profile-safety`, `/api/preflight` và proxy cùng origin trong Antidetect. Bảng profile dùng trực tiếp trạng thái an toàn hiện hành, gồm latch bộ nhớ, marker gián đoạn, quota và khoảng cách. READY của chốt profile khác proof của từng Page; thao tác đang chạy hiển thị WAITING, metadata không hợp lệ hiển thị BLOCKED với counter chưa xác định. Preflight đọc toàn bộ task counts bằng aggregate, không nạp nội dung lịch sử hoặc token. Có thể có NEED_CHECK đồng thời với Page khác đã chuẩn bị; không tự khôi phục task đó.
+
+Quy trình trên UI: giữ Pause → xem **Profile & an toàn** → chạy preflight chỉ đọc → xử lý nguồn hoặc cấu hình bị báo lỗi → kiểm tra từng Page trong phạm vi được duyệt → chạy lại preflight. Snapshot không cấp quyền chạy và không thay thế admission cuối. Chỉ xem/check một Page không được coi là đồng ý Resume/AUTO. Nút Pause luôn có thể gửi yêu cầu dừng kể cả khi check/Resume đang chờ; kết quả cũ không ghi đè trạng thái sau yêu cầu dừng.
 
 - Source/test dùng DB tạm, khóa và credential giả, HTTP/CDP mô phỏng; không đọc `.env`, DB vận hành, cookie, token hoặc khóa thật.
 - Không đổi DB_PATH, PILOT_PAGE_ID, send_mode hay opt-in thật trong lần triển khai này.

@@ -286,6 +286,7 @@ def status(profile_id: str, *, conn=None) -> Dict[str, Any]:
         state["day"] = db.local_day_key(now)
         state["count"] = 0
     result = _decision(state, now, ready=True)
+    result["operation_in_progress"] = bool(state["operation"] and _is_active(profile_id, state["operation"]))
     result["max_operations_per_day"] = max_ops
     result["min_gap_seconds"] = min_gap
     if state["browser_status"] != "READY":

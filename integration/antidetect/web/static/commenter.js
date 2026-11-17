@@ -2,7 +2,8 @@
 (() => {
   'use strict';
   const $ = id => document.getElementById(id);
-  const state = {pages: [], tasks: [], overview: {}, online: false, loading: false, busy: false, selectedPage: null, previewRequest: 0, taskRequest: 0};
+  const state = {pages: [], tasks: [], overview: {}, profileSafety: null, preflight: null, preflightBusy: false, preflightAt: null, preflightStale: false, preflightRequest: 0, online: false, loading: false, busy: false, pauseBusy: false, resuming: false, revision: 0, selectedPage: null, previewRequest: 0, taskRequest: 0};
+  let refreshPromise = null;
   const taskLabels = {PENDING: 'Chờ lịch', SENDING: 'Đang gửi', SUCCESS: 'Thành công', FAILED: 'Lỗi', NEED_CHECK: 'Cần đối chiếu', CANCELLED: 'Đã hủy', PAUSED: 'Tạm dừng'};
   const taskColors = {SUCCESS: 'green', SENDING: 'blue', FAILED: 'red', NEED_CHECK: 'amber'};
   const mode = page => page.send_mode === 'BROWSER' ? 'BROWSER' : 'GRAPH_API';
@@ -15,11 +16,12 @@
   const number = value => Number.isFinite(Number(value)) ? Number(value) : 0;
   const knownPause = () => typeof state.overview.metrics?.paused_all === 'boolean';
   const paused = () => state.overview.metrics?.paused_all === true;
-  const mayOperate = () => state.online && !state.busy;
+  const mayOperate = () => state.online && !state.busy && !state.pauseBusy;
+  const counterText = value => value == null ? '—' : String(number(value));
   const dateText = value => {
     if (!value) return '—';
     const date = new Date(value);
-    return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString('vi-VN', {day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'});
+    return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString('vi-VN', {timeZone: 'Asia/Bangkok', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'}) + ' UTC+7';
   };
   const node = (tag, className, text) => {
     const element = document.createElement(tag);
@@ -36,8 +38,12 @@
     return element;
   };
   const pageById = id => state.pages.find(page => String(page.page_id) === String(id));
-  const issues = page => [...new Set(['connection_error', 'browser_error', 'scan_error', 'source_error', 'send_error', 'profile_wait_reason', 'send_wait_reason'].map(key => page[key]).filter(Boolean))];
-  const automationReady = page => ready(page) && active(page) && !page.source_error && Boolean(page.source_synced_at);
+  const safetyProfiles = () => Array.isArray(state.profileSafety) ? state.profileSafety : (Array.isArray(state.profileSafety?.profiles) ? state.profileSafety.profiles : []);
+  const pageProfileSafety = page => mode(page) === 'BROWSER' ? safetyProfiles().find(item => String(item.profile_id) === String(page.antidetect_profile_id)) : null;
+  const profileBlocked = item => item && String(item.status).toUpperCase() !== 'READY';
+  const pageProfileBlocked = page => mode(page) === 'BROWSER' && (!pageProfileSafety(page) || profileBlocked(pageProfileSafety(page)));
+  const issues = page => [...new Set([pageProfileBlocked(page) ? (pageProfileSafety(page)?.wait_reason || 'Chưa xác minh trạng thái an toàn chung của profile Browser.') : null, ...['connection_error', 'browser_error', 'scan_error', 'source_error', 'send_error', 'profile_wait_reason', 'send_wait_reason'].map(key => page[key])].filter(Boolean))];
+  const automationReady = page => ready(page) && !pageProfileBlocked(page) && active(page) && !page.source_error && Boolean(page.source_synced_at);
   const canCheck = page => mode(page) === 'BROWSER' ? Boolean(page.antidetect_profile_id) : Boolean(page.has_page_token);
 
   function notice(message, error = false) {
@@ -60,24 +66,38 @@
     }
     return data;
   }
-  async function refresh({report = false, force = false} = {}) {
-    if (state.loading || (state.busy && !force)) return false;
+  function refresh(options = {}) {
+    if (refreshPromise) return options.force ? refreshPromise.then(() => refresh(options)) : refreshPromise;
+    if ((state.busy || state.pauseBusy) && !options.force) return Promise.resolve(false);
+    refreshPromise = refreshOnce(options).finally(() => {refreshPromise = null;});
+    return refreshPromise;
+  }
+  async function refreshOnce({report = false} = {}) {
+    const revision = state.revision;
     state.loading = true;
     $('refresh').disabled = true;
     try {
       const data = await api('state');
+      if (revision !== state.revision) return false;
       if (!data.overview || !Array.isArray(data.pages) || !Array.isArray(data.tasks)) throw new Error('Dữ liệu trạng thái chưa đầy đủ.');
       state.overview = data.overview;
       state.pages = data.pages;
       state.tasks = data.tasks;
+      state.profileSafety = data.profile_safety || null;
+      if (data.preflight?.read_only === true) {
+        state.preflight = data.preflight;
+        state.preflightStale = false;
+      }
       state.online = true;
       if ($('task-filter').value || $('task-page-filter').value) await loadTasks(false);
       else state.taskRequest++;
-      $('updated-at').textContent = 'Cập nhật lúc ' + new Date().toLocaleTimeString('vi-VN', {hour: '2-digit', minute: '2-digit', second: '2-digit'});
+      state.preflightStale = Boolean(state.preflight);
+      $('updated-at').textContent = 'Cập nhật lúc ' + new Date().toLocaleTimeString('vi-VN', {timeZone: 'Asia/Bangkok', hour: '2-digit', minute: '2-digit', second: '2-digit'}) + ' UTC+7';
       render();
       if (report) notice('Đã làm mới trạng thái.');
       return true;
     } catch (error) {
+      if (revision !== state.revision) return false;
       state.online = false;
       $('updated-at').textContent = 'Chưa kết nối được Commenter. Dữ liệu đang hiển thị có thể đã cũ.';
       render();
@@ -85,12 +105,15 @@
       return false;
     } finally {
       state.loading = false;
-      $('refresh').disabled = state.busy;
+      $('refresh').disabled = state.busy || state.pauseBusy;
     }
   }
   async function mutate(path, body, fallback) {
     if (!mayOperate()) return;
     state.busy = true;
+    state.revision++;
+    state.preflightStale = true;
+    state.preflightRequest++;
     render();
     try {
       const result = await api(path, body);
@@ -102,6 +125,27 @@
       await refresh({force: true});
     } finally {
       state.busy = false;
+      render();
+    }
+  }
+  async function requestPause() {
+    if (state.pauseBusy) return;
+    state.pauseBusy = true;
+    state.revision++;
+    state.preflightStale = true;
+    state.preflightRequest++;
+    render();
+    try {
+      const result = await api('system/pause', {paused: true});
+      if (typeof result.paused !== 'boolean') throw new Error('Chưa xác nhận được trạng thái Pause.');
+      state.overview.metrics = {...state.overview.metrics, paused_all: result.paused};
+      notice(result.paused ? 'Đã tạm dừng nhận lượt gửi mới. Lượt đã được chốt có thể đang hoàn tất.' : 'Hệ thống chưa xác nhận Pause. Hãy đối chiếu lại.', !result.paused);
+      await refresh({force: true});
+    } catch (error) {
+      state.online = false;
+      notice(error.message + ' Chưa xác nhận được Pause; hãy kiểm tra dịch vụ.', true);
+    } finally {
+      state.pauseBusy = false;
       render();
     }
   }
@@ -145,16 +189,17 @@
     $('runtime-dot').className = 'status-dot ' + status;
     $('runtime-state').textContent = !online ? 'Chưa có kết nối vận hành' : paused() ? 'Hệ thống đang tạm dừng' : 'Hệ thống đang chạy';
     $('runtime-description').textContent = !online ? 'Kiểm tra dịch vụ cục bộ, sau đó làm mới trạng thái.' : paused() ? 'Chưa nhận lượt gửi mới. Bạn có thể kiểm tra kết nối và chuẩn bị cấu hình.' : 'Các Page đã bật tự động sẽ xử lý theo lịch và hạn mức.';
-    $('pause-toggle').textContent = online && paused() ? 'Tiếp tục hệ thống' : 'Tạm dừng toàn bộ';
-    $('pause-toggle').className = 'button ' + (online && paused() ? 'primary' : 'warning');
-    $('pause-toggle').disabled = !online || state.busy;
+    $('pause-toggle').textContent = online && paused() && !state.resuming ? 'Tiếp tục hệ thống' : 'Tạm dừng toàn bộ';
+    $('pause-toggle').className = 'button ' + (online && paused() && !state.resuming ? 'primary' : 'warning');
+    // Stop remains available while a connection check or Resume is pending.
+    $('pause-toggle').disabled = state.pauseBusy || (online && paused() && state.busy && !state.resuming);
     $('footer-connection').textContent = online ? '● Commenter đã kết nối' : '● Commenter chưa kết nối';
     const counts = state.overview.task_counts || {};
     $('stat-pages').textContent = state.online ? state.pages.length : '—';
     const graph = state.pages.filter(page => mode(page) === 'GRAPH_API').length;
     $('stat-transports').textContent = `${graph} Graph API · ${state.pages.length - graph} Browser`;
     $('stat-auto').textContent = state.online ? state.pages.filter(enabled).length : '—';
-    $('stat-ready').textContent = state.pages.filter(ready).length + ' Page có kết nối sẵn sàng';
+    $('stat-ready').textContent = state.pages.filter(page => ready(page) && !pageProfileBlocked(page)).length + ' Page qua kiểm tra kết nối/profile';
     $('stat-pending').textContent = state.online ? number(counts.PENDING) : '—';
     $('stat-sending').textContent = number(counts.SENDING) + ' đang gửi · ' + number(counts.PAUSED) + ' tạm dừng · 500 gần nhất';
     $('stat-review').textContent = state.online ? number(counts.NEED_CHECK) : '—';
@@ -177,6 +222,74 @@
     state.pages.forEach(page => $('task-page-filter').add(new Option(page.page_name || page.page_id, String(page.page_id))));
     $('task-page-filter').value = taskPage;
   }
+  function renderSafety() {
+    const profiles = safetyProfiles();
+    const blocked = profiles.filter(profileBlocked);
+    $('tab-blocked-count').textContent = blocked.length ? blocked.length + ' chờ' : '';
+    $('run-preflight').disabled = !mayOperate() || state.preflightBusy;
+    $('run-preflight').textContent = state.preflightBusy ? 'Đang kiểm tra…' : 'Chạy preflight';
+    $('profile-safety-list').replaceChildren();
+    $('profile-safety-empty').hidden = profiles.length > 0;
+    $('profile-safety-empty').textContent = state.profileSafety ? 'Chưa có Page nào sử dụng Browser.' : 'Chưa tải được trạng thái an toàn profile.';
+    profiles.forEach(item => {
+      const blocked = profileBlocked(item);
+      const card = node('article', 'profile-safety-card ' + String(item.status || 'UNKNOWN').toLowerCase());
+      const heading = node('div', 'profile-safety-heading');
+      const title = node('div'); title.append(node('h3', '', item.profile_name || item.profile_id || 'Chưa ghép profile'), node('span', 'subline', item.profile_id || ''));
+      const status = String(item.status || 'UNKNOWN').toUpperCase();
+      heading.append(title, badge(status === 'READY' ? 'Chốt profile sẵn sàng' : status === 'BLOCKED' ? 'Bị chặn' : status === 'WAITING' ? 'Đang chờ' : 'Cần kiểm tra', status === 'READY' ? 'green' : status === 'BLOCKED' ? 'red' : 'amber'));
+      const facts = node('dl', 'detail-facts');
+      fact(facts, 'Page dùng Browser', String(number(item.page_count)));
+      fact(facts, 'Thao tác hôm nay', `${counterText(item.operations_today)} / ${counterText(item.operations_limit)}`);
+      fact(facts, 'Page đã xác minh riêng', String(Array.isArray(item.verified_page_ids) ? item.verified_page_ids.length : 0));
+      fact(facts, 'Có thể thử lại', dateText(item.retry_at));
+      card.append(heading, facts);
+      if (blocked) card.append(node('p', 'profile-block-summary', `Trạng thái này áp dụng cho cả ${number(item.page_count)} Page Browser trong profile.`));
+      if (item.wait_reason) card.append(node('p', 'block-reason', item.wait_reason));
+      const names = Array.isArray(item.page_names) ? item.page_names : [];
+      if (names.length) {const pages = node('details', 'profile-page-list'); pages.append(node('summary', '', 'Danh sách Page')); const list = node('ul'); names.forEach(name => list.append(node('li', '', name))); pages.append(list); card.append(pages);}
+      if (item.profile_id) card.append(button('Xem các Page →', () => {$('profile-filter').value = String(item.profile_id); $('mode-filter').value = 'BROWSER'; $('page-filter').value = ''; $('page-search').value = ''; renderPages(); selectTab('pages', true);}, 'secondary'));
+      $('profile-safety-list').append(card);
+    });
+    renderPreflight();
+  }
+  function renderPreflight() {
+    const result = state.preflight;
+    $('preflight-summary').replaceChildren();
+    $('preflight-findings').replaceChildren();
+    if (!result) {$('preflight-status').textContent = state.preflightBusy ? 'Đang kiểm tra cấu hình và trạng thái đã lưu…' : 'Chưa chạy kiểm tra.'; return;}
+    $('preflight-status').textContent = !state.online ? 'Mất kết nối · Kết quả có thể đã cũ.' : state.preflightStale ? 'Trạng thái có thể đã thay đổi · Chạy lại preflight để đối chiếu.' : (state.preflightAt ? 'Kiểm tra lúc ' + dateText(state.preflightAt) : 'Trạng thái chỉ đọc mới nhất');
+    const size = value => Array.isArray(value) ? value.length : counterText(value);
+    const summary = [['Page AUTO đã chuẩn bị', size(result.eligible_pages)], ['Page cần xử lý / chờ', size(result.blocked_pages)], ['Profile bị chặn', size(result.blocked_profiles)], ['Nguồn cần xử lý', size(result.source_errors)], ['Tác vụ cần đối chiếu · toàn bộ', size(result.needs_check_count)]];
+    summary.forEach(([title, value]) => {const item = node('div', 'preflight-stat'); item.append(node('span', '', title), node('strong', '', value)); $('preflight-summary').append(item);});
+    const findings = Array.isArray(result.findings) ? result.findings : [];
+    if (!findings.length) {$('preflight-findings').append(node('p', 'muted', 'Không có vấn đề cấu hình được ghi nhận.')); return;}
+    findings.forEach(finding => {
+      const severity = String(finding.severity || '').toUpperCase();
+      const item = node('article', 'preflight-finding');
+      const heading = node('div', 'task-heading');
+      heading.append(badge(severity === 'INFO' ? 'Thông tin' : severity === 'ERROR' ? 'Cần xử lý' : 'Đang chờ / lưu ý', severity === 'ERROR' ? 'red' : severity === 'INFO' ? 'blue' : 'amber'), node('strong', '', finding.page_name || finding.page_id || finding.profile_id || 'Hệ thống'));
+      item.append(heading, node('p', '', finding.reason || 'Cần đối chiếu trạng thái.'));
+      if (finding.page_id) item.append(button('Chi tiết Page', () => openPage(String(finding.page_id)), 'secondary', Boolean(pageById(finding.page_id))));
+      $('preflight-findings').append(item);
+    });
+  }
+  async function runPreflight() {
+    if (!mayOperate() || state.preflightBusy) return;
+    const request = ++state.preflightRequest;
+    state.preflightBusy = true;
+    renderSafety();
+    try {
+      const result = await api('preflight');
+      if (request !== state.preflightRequest) return;
+      if (result.read_only !== true || !Array.isArray(result.findings) || typeof result.paused_all !== 'boolean') throw new Error('Kết quả preflight không hợp lệ.');
+      state.preflight = result;
+      state.preflightAt = result.generated_at || new Date().toISOString();
+      state.preflightStale = false;
+      notice('Đã hoàn tất preflight chỉ đọc.');
+    } catch (error) {if (request === state.preflightRequest) {state.preflightStale = true; notice(error.message, true);}}
+    finally {state.preflightBusy = false; renderSafety();}
+  }
   function renderPages() {
     const query = $('page-search').value.trim().toLocaleLowerCase('vi');
     const filter = $('page-filter').value;
@@ -197,7 +310,7 @@
       const open = node('button', 'page-name', page.page_name || page.page_id); open.type = 'button'; open.addEventListener('click', () => openPage(page.page_id));
       name.append(open, node('span', 'subline', page.page_id), node('div', 'profile-line', profile(page)));
       const connection = node('td');
-      connection.append(node('span', 'mode-label', modeName(page)), badge(ready(page) ? 'Đã xác minh' : 'Cần kiểm tra', ready(page) ? 'green' : 'amber'));
+      connection.append(node('span', 'mode-label', modeName(page)), badge(pageProfileBlocked(page) ? 'Profile chưa sẵn sàng' : ready(page) ? 'Đã xác minh' : 'Cần kiểm tra', pageProfileBlocked(page) ? 'red' : ready(page) ? 'green' : 'amber'));
       if (!active(page)) connection.append(node('div', 'subline', 'Kết nối đang tạm dừng'));
       const errors = issues(page); if (errors.length) {const issue = node('div', 'issue-line', errors[0]); issue.title = errors.join('\n'); connection.append(issue);}
       const automation = node('td'); automation.append(badge(enabled(page) ? 'Đã bật' : 'Đã tắt', enabled(page) ? 'blue' : ''));
@@ -206,7 +319,7 @@
       const quota = node('td'); const used = number(page.comments_used_today); const limit = number(page.max_comments_per_day) || 20;
       quota.append(node('div', 'quota', `${used} / ${limit} bình luận`));
       const bar = node('div', 'quota-bar'); const fill = node('div', 'quota-fill'); fill.style.width = `${limit > 0 ? Math.min(100, used / limit * 100) : 0}%`; bar.append(fill); quota.append(bar);
-      if (mode(page) === 'BROWSER') quota.append(node('span', 'subline', `Profile: ${number(page.profile_operations_today)} / ${number(page.profile_operations_limit)} thao tác`));
+      if (mode(page) === 'BROWSER') {const safety = pageProfileSafety(page); quota.append(node('span', 'subline', `Profile: ${counterText(safety?.operations_today)} / ${counterText(safety?.operations_limit)} thao tác`));}
       const actions = node('td'); actions.append(button('Chi tiết →', () => openPage(page.page_id)));
       row.append(name, connection, automation, quota, actions); $('page-rows').append(row);
     });
@@ -269,7 +382,7 @@
     }
     if (confirmed) await mutate(`tasks/${encodeURIComponent(task.id)}/${action}`, body);
   }
-  function render() {renderRuntime(); renderProfiles(); renderPages(); renderTasks(); renderDetail();}
+  function render() {renderRuntime(); renderProfiles(); renderSafety(); renderPages(); renderTasks(); renderDetail();}
   function section(title) {const element = node('section', 'detail-section'); element.append(node('h3', '', title)); return element;}
   function fact(list, title, value) {const item = node('div'); item.append(node('dt', '', title), node('dd', '', value || '—')); list.append(item);}
   function renderDetail() {
@@ -304,7 +417,7 @@
     source.id = 'detail-sequence';
     const auto = section('3. Tự động & hạn mức'); const autoTitle = auto.querySelector('h3'); autoTitle.append(badge(enabled(page) ? 'Đã bật' : 'Đã tắt', enabled(page) ? 'blue' : ''));
     const quotas = node('dl', 'detail-facts'); fact(quotas, 'Bình luận của Page hôm nay', `${number(page.comments_used_today)} / ${number(page.max_comments_per_day) || 20}`); fact(quotas, 'Còn lại', page.comments_remaining_today == null ? String(Math.max(0, (number(page.max_comments_per_day) || 20) - number(page.comments_used_today))) : number(page.comments_remaining_today).toString());
-    if (mode(page) === 'BROWSER') {fact(quotas, 'Thao tác chung của profile', `${number(page.profile_operations_today)} / ${number(page.profile_operations_limit)}`); fact(quotas, 'Profile có thể thử lại', dateText(page.profile_retry_at));}
+    if (mode(page) === 'BROWSER') {const safety = pageProfileSafety(page); fact(quotas, 'Thao tác chung của profile', `${counterText(safety?.operations_today)} / ${counterText(safety?.operations_limit)}`); fact(quotas, 'Profile có thể thử lại', dateText(safety?.retry_at));}
     fact(quotas, 'Lượt gửi tiếp theo', dateText(page.next_send_at)); auto.append(quotas);
     const autoActions = node('div', 'detail-actions'); autoActions.append(button(enabled(page) ? 'Tắt tự động Page' : 'Bật tự động Page', async () => {
       const next = !enabled(page);
@@ -317,7 +430,7 @@
     autoActions.append(button('Khôi phục tác vụ tạm dừng', async () => {
       const confirmed = await confirmAction({title: 'Khôi phục tác vụ của Page', description: 'Chỉ tác vụ tạm dừng được đưa về hàng đợi. Tác vụ cần đối chiếu vẫn giữ nguyên; lịch và hạn mức tiếp tục áp dụng.', submit: 'Khôi phục tác vụ'});
       if (confirmed) await mutate(`pages/${encodeURIComponent(page.page_id)}/resume_tasks`, {});
-    }, 'secondary', mayOperate() && ready(page)));
+    }, 'secondary', mayOperate() && ready(page) && !pageProfileBlocked(page)));
     auto.append(autoActions);
     if (!enabled(page) && !automationReady(page)) auto.append(node('p', 'block-reason', 'Cần kết nối đã xác minh, Page hoạt động và nguồn Sheet hợp lệ trước khi bật tự động.'));
     $('page-detail').append(connection, source, auto);
@@ -345,6 +458,7 @@
     document.querySelectorAll('[data-tab]').forEach(tab => {const selected = tab.dataset.tab === name; tab.setAttribute('aria-selected', String(selected)); tab.tabIndex = selected ? 0 : -1; if (selected && focus) tab.focus(); $('panel-' + tab.dataset.tab).hidden = !selected;});
   }
   $('refresh').addEventListener('click', () => refresh({report: true}));
+  $('run-preflight').addEventListener('click', runPreflight);
   $('notice-close').addEventListener('click', () => {$('notice').hidden = true;});
   ['page-search', 'profile-filter', 'mode-filter', 'page-filter'].forEach(id => $(id).addEventListener(id === 'page-search' ? 'input' : 'change', renderPages));
   $('task-search').addEventListener('input', renderTasks);
@@ -357,13 +471,16 @@
   $('page-dialog').addEventListener('cancel', event => {event.preventDefault(); closePage();});
   $('copy-id').addEventListener('click', async () => {try {await navigator.clipboard.writeText(String(state.selectedPage)); notice('Đã sao chép Page ID.');} catch (_) {notice('Không sao chép được. Page ID hiển thị bên dưới tên Page.', true);}});
   $('pause-toggle').addEventListener('click', async () => {
-    if (!mayOperate() || !knownPause()) return;
+    if (!state.online || !knownPause() || !paused() || state.resuming) {await requestPause(); return;}
+    if (!mayOperate()) return;
     const next = !paused();
     if (!next) {
       const confirmed = await confirmAction({title: 'Tiếp tục hệ thống', description: `${state.pages.filter(enabled).length} Page đã bật tự động. Commenter sẽ kiểm tra nguồn trước khi nhận lượt gửi mới.`, check: 'Tôi đã kiểm tra các Page và chuỗi bình luận được bật.', submit: 'Tiếp tục hệ thống'});
       if (!confirmed) return;
     }
-    await mutate('system/pause', {paused: next}, next ? 'Đã yêu cầu tạm dừng hệ thống.' : 'Đã yêu cầu tiếp tục hệ thống.');
+    state.resuming = true;
+    try {await mutate('system/pause', {paused: next}, 'Đã xử lý yêu cầu tiếp tục.');}
+    finally {state.resuming = false; renderRuntime();}
   });
   $('sheet-url').addEventListener('input', () => {$('sheet-url').dataset.edited = '1';});
   $('sheet-form').addEventListener('submit', async event => {

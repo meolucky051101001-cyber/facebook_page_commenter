@@ -34,12 +34,66 @@ ACTION_FIELDS = frozenset("""
 """.split())
 PREVIEW_FIELDS = frozenset(("templates", "comment_sequence", "delay_minutes", "source_error", "sheet_url"))
 TASK_STATUSES = ("PENDING", "SENDING", "SUCCESS", "FAILED", "NEED_CHECK", "CANCELLED", "PAUSED")
+PROFILE_FIELDS = frozenset("""profile_id profile_name page_count page_names status reason operations_today
+    operations_limit wait_reason retry_at blocked_page_ids verified_page_ids""".split())
+FINDING_FIELDS = frozenset(("severity", "code", "page_id", "page_name", "profile_id", "reason"))
+PAGE_ISSUE_FIELDS = frozenset(("page_id", "page_name", "profile_id", "reason"))
 
 
 def _project(value, fields):
     if not isinstance(value, dict):
         raise ValueError("Invalid Commenter response")
     return {key: value[key] for key in fields if key in value}
+
+
+def _public_report(value, *, preflight=False):
+    if (not isinstance(value, dict) or value.get("read_only") is not True
+            or type(value.get("paused_all")) is not bool):
+        raise ValueError("Invalid readiness report")
+    if not isinstance(value.get("generated_at"), str):
+        raise ValueError("Missing report timestamp")
+    if preflight:
+        result = _project(value, ("read_only", "paused_all", "generated_at", "scope", "eligible_pages", "enabled_pages",
+                                  "blocked_pages", "blocked_profiles", "source_errors", "needs_check_count"))
+        for key in ("eligible_pages", "enabled_pages", "blocked_pages", "blocked_profiles", "source_errors", "needs_check_count"):
+            if type(result.get(key)) is not int or result[key] < 0:
+                raise ValueError("Invalid readiness count")
+        if not isinstance(value.get("findings"), list):
+            raise ValueError("Invalid findings")
+        result["task_counts"] = _project(value["task_counts"], TASK_STATUSES)
+        if any(type(result["task_counts"].get(key)) is not int or result["task_counts"][key] < 0 for key in TASK_STATUSES):
+            raise ValueError("Invalid task counts")
+        result["findings"] = [_project(item, FINDING_FIELDS) for item in value["findings"]]
+        for item in result["findings"]:
+            if (item.get("severity") not in ("info", "warning", "error")
+                    or not isinstance(item.get("code"), str) or not isinstance(item.get("reason"), str)):
+                raise ValueError("Invalid finding")
+            if any(item.get(key) is not None and not isinstance(item[key], str) for key in ("page_id", "page_name", "profile_id")):
+                raise ValueError("Invalid finding location")
+    else:
+        result = _project(value, ("read_only", "paused_all", "generated_at"))
+        for key, fields in (("profiles", PROFILE_FIELDS), ("blocked_pages", PAGE_ISSUE_FIELDS), ("pages_needing_attention", PAGE_ISSUE_FIELDS)):
+            if not isinstance(value.get(key), list):
+                raise ValueError("Invalid profile report")
+            result[key] = [_project(item, fields) for item in value[key]]
+        for item in result["profiles"]:
+            if (item.get("status") not in ("READY", "WAITING", "BLOCKED")
+                    or not isinstance(item.get("profile_id"), str) or not item["profile_id"]
+                    or type(item.get("page_count")) is not int or item["page_count"] < 1):
+                raise ValueError("Invalid profile gate")
+            for key in ("page_names", "blocked_page_ids", "verified_page_ids"):
+                if not isinstance(item.get(key), list) or any(not isinstance(text, str) for text in item[key]):
+                    raise ValueError("Invalid profile members")
+            for key in ("operations_today", "operations_limit"):
+                if item.get(key) is not None and (type(item[key]) is not int or item[key] < 0):
+                    raise ValueError("Invalid profile counter")
+            if any(item.get(key) is not None and not isinstance(item[key], str)
+                   for key in ("profile_name", "reason", "wait_reason", "retry_at")):
+                raise ValueError("Invalid profile details")
+        for item in result["blocked_pages"] + result["pages_needing_attention"]:
+            if any(item.get(key) is not None and not isinstance(item[key], str) for key in PAGE_ISSUE_FIELDS):
+                raise ValueError("Invalid Page issue")
+    return result
 
 
 async def _body(request, required, optional=()):
@@ -93,11 +147,11 @@ def register_commenter_routes(app, authorized, templates, local_request):
         try:
             results = await asyncio.gather(*(
                 asyncio.to_thread(local_request, "GET", path)
-                for path in ("/api/metrics", "/api/pages", "/api/tasks?limit=200")
+                for path in ("/api/metrics", "/api/pages", "/api/tasks?limit=200", "/api/profile-safety")
             ))
             if any(status != 200 for status, _ in results):
                 raise ValueError("Commenter unavailable")
-            overview, catalog, queue = (data for _, data in results)
+            overview, catalog, queue, safety = (data for _, data in results)
             metrics = overview["metrics"]
             if not isinstance(metrics, dict) or type(metrics.get("paused_all")) is not bool:
                 raise ValueError("Unknown pause state")
@@ -114,9 +168,21 @@ def register_commenter_routes(app, authorized, templates, local_request):
             }
             return {"overview": safe_overview,
                     "pages": [_project(page, PAGE_FIELDS) for page in catalog["pages"]],
-                    "tasks": [_project(task, TASK_FIELDS) for task in queue["tasks"]]}
+                    "tasks": [_project(task, TASK_FIELDS) for task in queue["tasks"]],
+                    "profile_safety": _public_report(safety)}
         except (OSError, ValueError, TypeError, KeyError, requests.RequestException):
             raise HTTPException(502, "Không tải được trạng thái Commenter. Các thao tác chạy đã được khóa trên giao diện.") from None
+
+    @app.get("/api/commenter/preflight")
+    async def commenter_preflight(request: Request):
+        require_session(request)
+        try:
+            status, data = await asyncio.to_thread(local_request, "GET", "/api/preflight")
+            if status != 200:
+                raise ValueError("Preflight unavailable")
+            return _public_report(data, preflight=True)
+        except (OSError, ValueError, TypeError, KeyError, requests.RequestException):
+            raise HTTPException(502, "Chưa hoàn tất preflight. Giữ Pause và thử lại.") from None
 
     @app.get("/api/commenter/tasks")
     async def commenter_tasks(request: Request, status: str = "", page_id: str = ""):

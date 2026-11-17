@@ -28,6 +28,7 @@ import comment_dispatch
 import service_lock
 import browser_safety
 import submit_control
+import operational_readiness
 
 
 
@@ -285,6 +286,24 @@ def draft_rewrite(req: DraftRequest):
 
 
 # --- REST API Endpoints ---
+
+@app.get("/api/profile-safety")
+def profile_safety_overview():
+    try:
+        return operational_readiness.snapshot(scheduler.SCHEDULER_METRICS["paused_all"])["profile_safety"]
+    except Exception:
+        raise HTTPException(503, "Chưa đọc được trạng thái an toàn. Giữ Pause và thử lại.") from None
+
+
+@app.get("/api/preflight")
+def preflight_overview():
+    try:
+        return operational_readiness.snapshot(
+            scheduler.SCHEDULER_METRICS["paused_all"], scheduler.SCHEDULER_METRICS.get("sheet_sync"),
+        )["preflight"]
+    except Exception:
+        raise HTTPException(503, "Chưa hoàn tất preflight. Giữ Pause và kiểm tra lại dịch vụ.") from None
+
 
 @app.get("/api/metrics")
 def get_metrics():

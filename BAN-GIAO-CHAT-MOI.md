@@ -1,9 +1,11 @@
 # Bàn giao hiện trạng Commenter Facebook
 
-Cập nhật: 17/11/2026, Asia/Bangkok. Thư mục làm việc:
+Cập nhật: 18/11/2026, Asia/Bangkok. Thư mục làm việc:
 `C:\Projects\Tools\facebook comment\facebook_page_commenter`.
 
 Ưu tiên đọc `docs/KE-HOACH-VAN-HANH-GRAPH-VA-BROWSER.md` cho luồng mới. Đã triển khai source/test kết hợp: Graph hoặc phiên đăng nhập Browser được chọn riêng cho từng Page, không fallback. Startup luôn Pause; chưa đổi DB vận hành, mode, opt-in hoặc bật AUTO. Không đọc `.env`, DB thật, cookie, token hoặc khóa thật trong lần triển khai này. Kết quả kiểm thử thực chạy nằm ở mục 17/11 trong `docs/NHAT-KY-TRIEN-KHAI-COMMENT-TU-DONG.md`.
+
+Đợt 18/11 bổ sung `operational_readiness.py`: API/profile UI chỉ đọc, preflight toàn lịch sử tác vụ, phân biệt chốt READY/WAITING/BLOCKED với proof từng Page. Trạng thái lỗi không giả định counter=0. Nút Pause không bị khóa bởi check/Resume đang chờ. Script `verify_commenter_ui.py` kiểm tra giao diện bằng 66 Page giả và chặn mọi request ngoài fixture; không chạy application/lifespan thật. Chưa triển khai bản integration vào Antidetect cài đặt bên ngoài, chưa xác minh DB/live profile.
 
 Các phần ngày 16/11 và 15/11 bên dưới là lịch sử. Quyết định cũ hoãn Browser và nhận định các lỗi chưa sửa không còn phản ánh source mới; số liệu DB/dịch vụ cũ không phải trạng thái hiện tại. Quyền chạy cũ không cấp quyền vận hành mới. DB workspace vẫn là nguồn đích, đồng bộ từ `.gemini` riêng sau.
 

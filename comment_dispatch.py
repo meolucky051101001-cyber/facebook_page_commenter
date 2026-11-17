@@ -207,7 +207,7 @@ def final_check(page_id, paused, initial_page, *, automatic=False, require_sheet
         return Decision("POLICY_UNAVAILABLE", message="Chưa xác minh được chính sách gửi; đã hủy lượt gửi.")
 
 
-def page_status(page, paused=False):
+def page_status(page, paused=False, *, safety=None):
     """Read-only status projection, including shared cooldowns and local-day counts."""
     now = datetime.now(timezone.utc)
     used = (page.get("comments_today_count") or 0) if page.get("comments_today_date") == db.local_day_key(now) else 0
@@ -228,13 +228,13 @@ def page_status(page, paused=False):
     until, reason = max(deadlines, key=lambda item: datetime.fromisoformat(item[0])) if deadlines else (None, None)
     if paused:
         reason = "Hệ thống đang tạm dừng"
-    elif page.get("send_mode") == "BROWSER" and not browser_ready(page):
+    elif page.get("send_mode") == "BROWSER" and not browser_ready(page, safety=safety):
         reason = page.get("browser_error") or "Page cần kiểm tra kết nối trình duyệt"
     elif page.get("send_mode", "GRAPH_API") == "GRAPH_API" and (not page.get("is_active") or page.get("token_status") not in ("OK", "EXPIRING_SOON")):
         reason = page.get("status_note") or "Page cần kết nối Meta hợp lệ"
     profile = {}
     if page.get("send_mode") == "BROWSER" and page.get("antidetect_profile_id"):
-        safety = browser_safety.status(page["antidetect_profile_id"])
+        safety = safety if safety is not None else browser_safety.status(page["antidetect_profile_id"])
         profile = {"profile_operations_today": safety["count"],
                    "profile_operations_limit": safety.get("max_operations_per_day"),
                    "profile_wait_reason": safety["message"] if not safety["ready"] else None,
