@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="vi" class="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Bình luận Fanpage · Antidetect</title>
+  <link rel="stylesheet" href="/commenter/styles.css">
+  <script src="/commenter/actions.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#workspace">Đến nội dung</a>
+  <header class="app-header">
+    <a class="brand" href="/"><span class="brand-mark" aria-hidden="true">A</span><span>Antidetect <small>Workspace</small></span></a>
+    <nav aria-label="Điều hướng chính"><a href="/">Profiles</a><a href="/fanpages">Fanpage Manager</a><a href="/commenter/" aria-current="page">Bình luận Fanpage</a></nav>
+  </header>
+  <main id="workspace">
+    <div class="page-heading"><div><p class="eyebrow">QUẢN LÝ BÌNH LUẬN</p><h1>Bình luận Fanpage</h1><p class="muted" id="updated-at">Đang kết nối Commenter…</p></div><button id="refresh" class="button secondary" type="button">↻ <span>Làm mới</span></button></div>
+    <div id="notice" class="notice" role="status" aria-live="polite" hidden><span id="notice-text"></span><button id="notice-close" type="button" aria-label="Đóng thông báo">×</button></div>
+    <section class="runtime-bar" aria-label="Trạng thái vận hành"><div class="runtime-copy"><span class="status-dot" id="runtime-dot"></span><div><strong id="runtime-state">Đang kết nối</strong><p id="runtime-description">Chưa có trạng thái vận hành.</p></div></div><button id="pause-toggle" type="button" class="button" disabled>Tạm dừng toàn bộ</button></section>
+    <section class="stats-grid" aria-label="Tổng quan"><div class="stat"><span>Fanpage</span><strong id="stat-pages">—</strong><small id="stat-transports">Graph API · Browser</small></div><div class="stat"><span>Đã bật tự động</span><strong id="stat-auto">—</strong><small id="stat-ready">Đang tải kết nối</small></div><button class="stat stat-link" id="open-pending" type="button"><span>Chờ lịch</span><strong id="stat-pending">—</strong><small id="stat-sending">Đang tải tác vụ</small></button><button class="stat stat-link" id="open-review" type="button"><span>Cần đối chiếu</span><strong id="stat-review">—</strong><small>Trong 500 tác vụ gần nhất</small></button></section>
+    <div class="workspace-tabs" role="tablist" aria-label="Khu vực làm việc"><button type="button" role="tab" id="tab-pages" aria-controls="panel-pages" aria-selected="true" data-tab="pages">Fanpage <span id="tab-page-count"></span></button><button type="button" role="tab" id="tab-tasks" aria-controls="panel-tasks" aria-selected="false" tabindex="-1" data-tab="tasks">Tác vụ <span id="tab-task-count"></span></button><button type="button" role="tab" id="tab-source" aria-controls="panel-source" aria-selected="false" tabindex="-1" data-tab="source">Nguồn bình luận</button></div>
+    <section id="panel-pages" role="tabpanel" aria-labelledby="tab-pages">
+      <div class="filter-bar"><label class="search-label"><span class="sr-only">Tìm Fanpage</span><input type="search" id="page-search" placeholder="Tìm tên Page, ID hoặc profile…" autocomplete="off"></label><label><span class="sr-only">Profile</span><select id="profile-filter"><option value="">Tất cả profile</option></select></label><label><span class="sr-only">Cách gửi</span><select id="mode-filter"><option value="">Tất cả cách gửi</option><option value="GRAPH_API">Graph API</option><option value="BROWSER">Browser</option></select></label><label><span class="sr-only">Trạng thái Page</span><select id="page-filter"><option value="">Tất cả trạng thái</option><option value="ready">Sẵn sàng</option><option value="attention">Cần xử lý</option><option value="enabled">Đã bật tự động</option><option value="disabled">Đã tắt tự động</option></select></label></div>
+      <div class="section-meta"><span id="page-result-count">Đang tải Fanpage…</span><button id="clear-filters" class="text-button" type="button">Xóa bộ lọc</button></div>
+      <div class="table-wrap"><table class="page-table"><thead><tr><th scope="col">Fanpage / Profile</th><th scope="col">Kết nối</th><th scope="col">Tự động</th><th scope="col">Hạn mức hôm nay</th><th scope="col"><span class="sr-only">Thao tác</span></th></tr></thead><tbody id="page-rows"><tr><td colspan="5" class="empty">Đang tải danh sách…</td></tr></tbody></table></div>
+    </section>
+    <section id="panel-tasks" role="tabpanel" aria-labelledby="tab-tasks" hidden>
+      <div class="filter-bar"><label class="search-label"><span class="sr-only">Tìm tác vụ</span><input type="search" id="task-search" placeholder="Tìm tên Page, ID bài viết hoặc nội dung…"></label><label><span class="sr-only">Fanpage của tác vụ</span><select id="task-page-filter"><option value="">Tất cả Fanpage</option></select></label><label><span class="sr-only">Trạng thái tác vụ</span><select id="task-filter"><option value="">Tất cả trạng thái</option><option value="NEED_CHECK">Cần đối chiếu</option><option value="PENDING">Chờ lịch</option><option value="SENDING">Đang gửi</option><option value="PAUSED">Tạm dừng</option><option value="FAILED">Lỗi</option><option value="SUCCESS">Thành công</option><option value="CANCELLED">Đã hủy</option></select></label></div>
+      <div class="section-meta"><span id="task-result-count">Đang tải tác vụ…</span><small>Tối đa 200 tác vụ mới nhất theo bộ lọc</small></div><div id="task-list" class="task-list"></div>
+    </section>
+    <section id="panel-source" role="tabpanel" aria-labelledby="tab-source" hidden>
+      <div class="source-layout"><section class="panel source-panel"><div class="section-title"><div><h2>Google Sheet</h2><p class="muted">Comments - Multi-Page</p></div></div><form id="sheet-form"><label for="sheet-url">Đường dẫn Sheet</label><input type="url" id="sheet-url" required maxlength="2048" placeholder="https://docs.google.com/spreadsheets/d/…"><div class="form-actions"><button class="button primary" id="sheet-submit" type="submit" disabled>Lưu và đồng bộ</button></div></form><div id="sheet-status" class="source-status">Đang tải nguồn…</div></section></div>
+    </section>
+    <footer class="workspace-footer"><span id="footer-connection">Commenter cục bộ</span></footer>
+  </main>
+  <dialog id="page-dialog" class="page-dialog" aria-labelledby="detail-name"><div class="drawer-header"><div><p class="eyebrow">CHI TIẾT FANPAGE</p><h2 id="detail-name"></h2><div class="id-line"><span id="detail-id"></span><button type="button" class="text-button" id="copy-id">Sao chép ID</button></div></div><button type="button" class="close-button" id="close-page" aria-label="Đóng chi tiết">×</button></div><div id="page-detail" class="drawer-body"></div></dialog>
+  <dialog id="confirm-dialog" class="confirm-dialog" aria-labelledby="confirm-title"><form id="confirm-form"><h2 id="confirm-title"></h2><p id="confirm-description"></p><label id="confirm-input-label" hidden>ID bình luận (nếu có)<input type="text" id="confirm-input" maxlength="200" autocomplete="off"></label><label class="check-label" id="confirm-check-label" hidden><input type="checkbox" id="confirm-check"><span id="confirm-check-text"></span></label><div class="dialog-actions"><button type="button" class="button secondary" id="confirm-cancel">Hủy</button><button type="submit" class="button primary" id="confirm-submit">Xác nhận</button></div></form></dialog>
+</body>
+</html>
