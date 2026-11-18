@@ -26,6 +26,9 @@ import spintax
 import operations
 import comment_dispatch
 import service_lock
+import browser_safety
+import submit_control
+import operational_readiness
 
 
 
@@ -33,9 +36,11 @@ import service_lock
 async def lifespan(app: FastAPI):
     with service_lock.exclusive_database(db.DB_PATH):
         db.init_db()
+        # Previous process consent never starts a new service session.
+        scheduler.set_system_paused(True)
         with closing(db.get_connection()) as conn:
             operations.recover_interrupted_operations(conn)
-        scheduler.SCHEDULER_METRICS["paused_all"] = db.get_setting("automation_run_state") != "running"
+        browser_safety.recover_interrupted_operations()
         loops = [asyncio.create_task(loop()) for loop in (
             scheduler.loop_post_scanner, scheduler.loop_task_executor, scheduler.loop_maintenance,
             operations.loop_publications, operations.loop_inbox,
@@ -282,6 +287,24 @@ def draft_rewrite(req: DraftRequest):
 
 # --- REST API Endpoints ---
 
+@app.get("/api/profile-safety")
+def profile_safety_overview():
+    try:
+        return operational_readiness.snapshot(scheduler.SCHEDULER_METRICS["paused_all"])["profile_safety"]
+    except Exception:
+        raise HTTPException(503, "Chưa đọc được trạng thái an toàn. Giữ Pause và thử lại.") from None
+
+
+@app.get("/api/preflight")
+def preflight_overview():
+    try:
+        return operational_readiness.snapshot(
+            scheduler.SCHEDULER_METRICS["paused_all"], scheduler.SCHEDULER_METRICS.get("sheet_sync"),
+        )["preflight"]
+    except Exception:
+        raise HTTPException(503, "Chưa hoàn tất preflight. Giữ Pause và kiểm tra lại dịch vụ.") from None
+
+
 @app.get("/api/metrics")
 def get_metrics():
     tasks = db.get_all_tasks(limit=500)
@@ -307,14 +330,15 @@ def get_metrics():
 
 @app.post("/api/system/pause")
 def set_pause(req: PauseRequest):
+    request_version = scheduler.begin_run_state_request(req.paused)
     if not req.paused:
         enabled_pages = [p for p in db.get_all_pages() if p.get("rule_enabled")]
         if enabled_pages:
             result = scheduler.refresh_comment_sheet(force=True)
             if not result.get("success"):
                 raise HTTPException(status_code=409, detail=result.get("error", "Không đồng bộ được tab bình luận."))
-    scheduler.set_system_paused(req.paused)
-    return {"success": True, "paused": req.paused}
+    paused = scheduler.set_system_paused(req.paused, expected_version=request_version)
+    return {"success": True, "paused": paused}
 
 
 @app.post("/api/sync")
@@ -351,9 +375,9 @@ def sync_from_antidetect():
 
 def _public_graph_ready(page):
     return bool(page.get("is_active") and page.get("has_page_token")
+                and not comment_dispatch.graph_quarantined(page.get("page_id", ""))
                 and page.get("token_status") in ("OK", "EXPIRING_SOON")
-                and (page["page_id"] == config.PILOT_PAGE_ID
-                     or (page.get("connection_checked_at") and not page.get("connection_error"))))
+                and page.get("connection_checked_at") and not page.get("connection_error"))
 
 
 def _public_send_ready(page):
@@ -427,13 +451,19 @@ def verify_connected_page(page_id: str):
         raise HTTPException(status_code=404, detail="Không tìm thấy Page")
     if page.get("send_mode") == "BROWSER":
         result = antidetect_client.verify_page_connection_cdp(page)
-        if result.get("category") == "BROWSER_BUSY":
+        if result.get("category") in ("BROWSER_BUSY", "BROWSER_LIMIT", "BROWSER_BLOCKED"):
             raise HTTPException(409, result.get("error") or "Profile đang bận.")
+        scheduler._record_browser_connection_failure(page, result)
+        if not result.get("success") and result.get("profile_safety_recorded"):
+            # The sender recorded the profile failure while holding its lock.
+            # Do not overwrite a newer recovery after that lock was released.
+            raise HTTPException(409, result.get("error") or "Profile cần kiểm tra lại.")
         status = result.get("browser_status") or "ERROR"
         saved = db.update_page_browser_check(
             page_id, datetime.now(timezone.utc).isoformat(), status,
             error=result.get("error"), identity_id=result.get("identity_id"),
             profile_id=result.get("profile_id"),
+            expected_generation=result.get("safety_generation"),
         )
         if not result.get("success") or not saved:
             raise HTTPException(409, result.get("error") or "Chưa xác minh được đúng Page trong profile đã chọn.")
@@ -450,10 +480,13 @@ def verify_connected_page(page_id: str):
         error = error.replace(page["page_access_token"], "[đã ẩn]")
         if config.META_APP_SECRET:
             error = error.replace(config.META_APP_SECRET, "[đã ẩn]")
-    db.update_page_connection_check(
+    saved = db.update_page_connection_check(
         page_id, datetime.now(timezone.utc).isoformat(), error, status,
         info.get("missing_scopes"), info.get("expires_at"),
+        expected_connection=page,
     )
+    if not saved:
+        raise HTTPException(409, "Kết nối Page đã thay đổi trong lúc kiểm tra. Hãy kiểm tra lại.")
     if not result.get("success"):
         raise HTTPException(status_code=409, detail=error or "Kiểm tra kết nối Page thất bại.")
     return status
@@ -487,7 +520,8 @@ def preview_page(page_id: str):
 def set_page_automation(page_id: str, req: PageAutomationRequest):
     # Stop requests remain immediate; enabling cannot race a send or mode change.
     if not req.enabled:
-        return _set_page_automation(page_id, req)
+        with submit_control.mutation(page_id, automatic=True):
+            return _set_page_automation(page_id, req)
     with _page_configuration_guard(page_id):
         return _set_page_automation(page_id, req)
 
@@ -913,7 +947,7 @@ def index():
                 <span id="systemStatusBadge" class="badge bg-secondary py-2 px-3">Đang kiểm tra trạng thái</span>
                 <span id="pilotStatus" class="small text-light"></span>
                 <button id="unlockBtn" class="btn btn-sm btn-outline-light" onclick="unlockDashboard()" hidden>Mở khóa Dashboard</button>
-                <button id="pauseBtn" class="btn btn-sm btn-outline-warning" onclick="togglePause()"><i class="fa-solid fa-pause"></i> Tạm dừng khẩn cấp</button>
+                <button id="pauseBtn" class="btn btn-sm btn-outline-warning" title="Dừng nhận lượt gửi mới; lượt đang gửi có thể hoàn tất." onclick="togglePause()"><i class="fa-solid fa-pause"></i> Tạm dừng</button>
             </div>
         </div>
     </nav>
@@ -960,6 +994,7 @@ def index():
             <li class="nav-item"><button class="nav-link" data-bs-toggle="pill" data-bs-target="#tab-rules"><i class="fa-solid fa-sliders me-1"></i> 3. Kịch bản từng Page</button></li>
             <li class="nav-item"><button class="nav-link" data-bs-toggle="pill" data-bs-target="#tab-manual"><i class="fa-solid fa-paper-plane me-1"></i> 4. Hẹn giờ thủ công</button></li>
             <li class="nav-item"><button class="nav-link" data-bs-toggle="pill" data-bs-target="#tab-tasks"><i class="fa-solid fa-clock-rotate-left me-1"></i> 5. Lịch sử tác vụ (<span id="taskCount">0</span>)</button></li>
+            <li class="nav-item"><button class="nav-link" data-bs-toggle="pill" data-bs-target="#tab-safety" onclick="loadProfileSafety()"><i class="fa-solid fa-shield-heart me-1"></i> 6. Profile &amp; Preflight</button></li>
             <li class="nav-item"><a class="nav-link" href="/operations">Hộp thư, xuất bản &amp; báo cáo</a></li>
         </ul>
 
@@ -996,8 +1031,10 @@ def index():
                         <div class="card p-4 border-start border-4 border-success mb-3">
                             <h5 class="fw-bold mb-2 text-success"><i class="fa-solid fa-shield-halved"></i> Đồng bộ từ Antidetect Python</h5>
                             <p class="text-muted small mb-2">
-                                Đồng bộ danh mục Page và profile. Chọn Graph API hoặc Trình duyệt Antidetect cho từng Page,
-                                kiểm tra kết nối, đồng bộ tab Comments - Multi-Page rồi bật tự động.
+                                Chọn Graph API hoặc Browser (phiên đăng nhập) riêng cho từng Page.
+                                Mỗi tài khoản Facebook dùng một profile Antidetect riêng; tool dùng phiên đã đăng nhập,
+                                không yêu cầu nhập cookie. Kiểm tra đúng ID Page trước khi bật tự động.
+                                Đổi cách gửi tạm dừng tác vụ đang chờ; kiểm tra thành công không tự chạy lại.
                             </p>
 
                             <div id="antidetectSummary" class="small text-secondary mb-3">Đang kiểm tra dữ liệu Antidetect...</div>
@@ -1028,6 +1065,7 @@ def index():
                     <div class="col-md-7">
                         <div class="card p-4">
                             <h5 class="fw-bold mb-3"><i class="fa-solid fa-list-check text-primary"></i> Danh sách Fanpage (<span id="pageCount">0</span>)</h5>
+                            <p class="small text-muted">Bật tự động để theo dõi bài đăng mới từ thời điểm bật. Tool kiểm tra danh sách bài định kỳ và lưu lịch sử xử lý.</p>
                             <div class="table-responsive" style="max-height: 620px; overflow-y: auto;">
                                 <table class="table align-middle">
                                     <thead class="table-light sticky-top">
@@ -1169,6 +1207,26 @@ def index():
                     </div>
                 </div>
             </div>
+
+            <!-- TAB 6: PROFILE SAFETY & READ-ONLY PREFLIGHT -->
+            <div class="tab-pane fade" id="tab-safety">
+                <div class="card p-4">
+                    <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+                        <div>
+                            <h5 class="fw-bold mb-1"><i class="fa-solid fa-shield-heart text-primary"></i> An toàn Profile Browser &amp; Kiểm tra Preflight</h5>
+                            <small class="text-muted">Chỉ đọc metadata đã lưu; không tự mở trình duyệt, không tiêu lượt thao tác và không bật gửi.</small>
+                        </div>
+                        <div class="d-flex gap-2">
+                            <button class="btn btn-sm btn-outline-secondary" type="button" onclick="loadProfileSafety()"><i class="fa-solid fa-rotate-right"></i> Tải trạng thái Profile</button>
+                            <button class="btn btn-sm btn-primary" type="button" id="btnRunPreflight" onclick="runDashboardPreflight()"><i class="fa-solid fa-clipboard-check"></i> Chạy Preflight chỉ đọc</button>
+                        </div>
+                    </div>
+                    <div id="preflightBox" class="mb-3" style="display:none;"></div>
+                    <div id="profileSafetyBox" class="row g-3">
+                        <div class="col-12 text-muted small">Bấm "Tải trạng thái Profile" hoặc "Chạy Preflight chỉ đọc" để xem báo cáo.</div>
+                    </div>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -1252,7 +1310,7 @@ def index():
                     statusBadge.className = 'badge bg-success py-2 px-3';
                     statusBadge.innerHTML = '<i class="fa-solid fa-circle-check"></i> Hệ thống đang chạy';
                     pauseBtn.className = 'btn btn-sm btn-outline-warning';
-                    pauseBtn.innerHTML = '<i class="fa-solid fa-pause"></i> Tạm dừng khẩn cấp';
+                    pauseBtn.innerHTML = '<i class="fa-solid fa-pause"></i> Tạm dừng';
                 }
             } catch(e) {}
         }
@@ -1304,10 +1362,12 @@ def index():
                 const isPageActive = Number(p.is_active) === 1;
                 const browserMode = p.send_mode === 'BROWSER';
                 const browserLabels = {READY: 'Đã xác minh Page', UNCHECKED: 'Chưa kiểm tra',
-                    LOGIN_REQUIRED: 'Cần đăng nhập Facebook', CHECKPOINT: 'Cần xác minh Facebook', ERROR: 'Cần kiểm tra lại'};
+                    LOGIN_REQUIRED: 'Cần đăng nhập Facebook', CHECKPOINT: 'Cần xác minh Facebook',
+                    RESTRICTED: 'Facebook hạn chế hoạt động', RECOVERY_REQUIRED: 'Cần kiểm tra sau gián đoạn',
+                    ERROR: 'Cần kiểm tra lại'};
                 const tokenLabels = {OK: 'Token hợp lệ', EXPIRING_SOON: 'Token sắp hết hạn',
                     EXPIRED: 'Token hết hạn', INVALID_SECRET: 'Cần kết nối lại token',
-                    MISSING_PERMISSIONS: 'Thiếu quyền Page'};
+                    MISSING_PERMISSIONS: 'Thiếu quyền Page', RESTRICTED: 'Facebook hạn chế hoạt động'};
                 const statusText = browserMode ? (browserLabels[p.browser_status] || 'Chưa kiểm tra')
                     : (p.has_page_token ? (tokenLabels[p.token_status] || 'Cần kiểm tra Meta') : 'Chưa kết nối Meta');
                 const badgeToken = `<span class="badge ${p.send_ready ? 'bg-success' : 'bg-warning text-dark'}">${escapeHtml(statusText)}</span>`;
@@ -1320,7 +1380,7 @@ def index():
                 const tr = document.createElement('tr');
                 tr.innerHTML = `
                     <td><strong>${escapeHtml(p.page_name)}</strong><br><small class="text-muted">ID: ${escapeHtml(p.page_id)}</small></td>
-                    <td><span class="badge bg-light text-dark border text-wrap text-start">${escapeHtml(srcLabel)}</span></td>
+                    <td><span class="badge bg-light text-dark border text-wrap text-start">${escapeHtml(srcLabel)}</span>${browserMode ? '<br><small>Thao tác profile hôm nay: ' + escapeHtml(p.profile_operations_today ?? '—') + '/' + escapeHtml(p.profile_operations_limit ?? '—') + '</small>' : ''}</td>
                     <td><div class="send-mode-control mb-1"></div>${activeBadge}<br>${badgeToken}<br><small class="text-muted">${escapeHtml((browserMode ? p.browser_error : p.connection_error) || p.send_error || p.scan_error || '')}</small></td>
                     <td>${p.rule_enabled ? 'Đã bật' : 'Tạm dừng'}<br><small>${p.delay_minutes ?? '—'} phút · Đã dùng ${p.comments_used_today}/${p.max_comments_per_day ?? '—'}, còn ${p.comments_remaining_today}<br>${escapeHtml(p.source_error || p.send_wait_reason || '')}${p.next_send_at ? '<br>Thử tiếp: ' + escapeHtml(new Date(p.next_send_at).toLocaleString('vi-VN', {timeZone:'Asia/Bangkok'})) : ''}</small></td>
                     <td></td>
@@ -1328,7 +1388,7 @@ def index():
                 const modeSelect = document.createElement('select');
                 modeSelect.className = 'form-select form-select-sm';
                 modeSelect.setAttribute('aria-label', 'Cách gửi của ' + p.page_name);
-                for (const [value, label] of [['GRAPH_API', 'Graph API'], ['BROWSER', 'Trình duyệt Antidetect']]) {
+                for (const [value, label] of [['GRAPH_API', 'Graph API'], ['BROWSER', 'Browser (phiên đăng nhập)']]) {
                     const option = new Option(label, value);
                     option.disabled = value === 'BROWSER' && !p.antidetect_profile_id;
                     modeSelect.appendChild(option);
@@ -1795,6 +1855,73 @@ def index():
             }
             loadTasks();
             fetchMetrics();
+        }
+
+        async function loadProfileSafety() {
+            const box = document.getElementById('profileSafetyBox');
+            if (!box) return;
+            try {
+                const res = await apiFetch('/api/profile-safety');
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || 'Chưa đọc được trạng thái an toàn.');
+                const profiles = data.profiles || [];
+                if (!profiles.length) {
+                    box.innerHTML = '<div class="col-12 text-muted small">Hiện chưa có Fanpage nào chọn chế độ gửi Browser.</div>';
+                    return;
+                }
+                box.innerHTML = profiles.map(item => {
+                    const st = String(item.status || 'UNKNOWN').toUpperCase();
+                    const badgeCls = st === 'READY' ? 'bg-success' : st === 'BLOCKED' ? 'bg-danger' : 'bg-warning text-dark';
+                    const reserveNote = item.reserved_send_operations ? ` · Giữ ${Number(item.reserved_send_operations)} lượt gửi (quét tối đa ${escapeHtml(item.scan_operations_limit ?? '—')})` : '';
+                    const retryStr = item.retry_at ? new Date(item.retry_at).toLocaleString('vi-VN', {timeZone: 'Asia/Bangkok'}) : '—';
+                    return `<div class="col-md-6"><div class="border rounded-3 p-3 bg-white h-100">
+                        <div class="d-flex justify-content-between align-items-start mb-2">
+                            <div><strong>${escapeHtml(item.profile_name || item.profile_id)}</strong><br><small class="text-muted">${escapeHtml(item.profile_id)}</small></div>
+                            <span class="badge ${badgeCls}">${escapeHtml(st)}</span>
+                        </div>
+                        <div class="small">
+                            <div>Page dùng Browser: <strong>${Number(item.page_count || 0)}</strong> · Đã xác minh riêng: <strong>${(item.verified_page_ids || []).length}</strong></div>
+                            <div>Thao tác hôm nay: <strong>${escapeHtml(item.operations_today ?? '—')} / ${escapeHtml(item.operations_limit ?? '—')}</strong>${reserveNote}</div>
+                            <div>Có thể thử lại: ${escapeHtml(retryStr)}</div>
+                            ${item.wait_reason ? `<div class="text-danger mt-1">${escapeHtml(item.wait_reason)}</div>` : ''}
+                        </div>
+                    </div></div>`;
+                }).join('');
+            } catch (err) {
+                box.innerHTML = `<div class="col-12 text-danger small">${escapeHtml(err.message)}</div>`;
+            }
+        }
+
+        async function runDashboardPreflight() {
+            const btn = document.getElementById('btnRunPreflight');
+            const box = document.getElementById('preflightBox');
+            btn.disabled = true;
+            try {
+                await loadProfileSafety();
+                const res = await apiFetch('/api/preflight');
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || 'Chưa hoàn tất preflight.');
+                const findings = data.findings || [];
+                const itemsHtml = findings.length
+                    ? '<ul class="mb-0 mt-2 small">' + findings.slice(0, 30).map(f => `<li><strong>[${escapeHtml(String(f.severity || '').toUpperCase())}] ${escapeHtml(f.page_name || f.page_id || f.profile_id || 'Hệ thống')}:</strong> ${escapeHtml(f.reason)}</li>`).join('') + '</ul>'
+                    : '<div class="small mt-1 text-success">Không ghi nhận lỗi cấu hình trên các Page hiện tại.</div>';
+                box.innerHTML = `<div class="alert alert-light border mb-0">
+                    <div class="d-flex flex-wrap gap-3 small fw-semibold">
+                        <span>Page AUTO đủ điều kiện: <strong class="text-success">${Number(data.eligible_pages || 0)}</strong> / ${Number(data.enabled_pages || 0)}</span>
+                        <span>Page cần xử lý/chờ: <strong class="text-warning">${Number(data.blocked_pages || 0)}</strong></span>
+                        <span>Profile bị chặn: <strong class="text-danger">${Number(data.blocked_profiles || 0)}</strong></span>
+                        <span>Nguồn lỗi: <strong class="text-danger">${Number(data.source_errors || 0)}</strong></span>
+                        <span>NEED_CHECK toàn lịch sử: <strong class="text-danger">${Number(data.needs_check_count || 0)}</strong></span>
+                    </div>
+                    ${itemsHtml}
+                </div>`;
+                box.style.display = 'block';
+            } catch (err) {
+                box.innerHTML = `<div class="alert alert-danger py-2 mb-0 small">${escapeHtml(err.message)}</div>`;
+                box.style.display = 'block';
+            } finally {
+                btn.disabled = false;
+            }
         }
 
         window.onload = () => {

@@ -2,14 +2,18 @@
 
 Hệ thống quản lý Fanpage đa tài khoản độc lập, định tuyến kịch bản bình luận riêng cho từng Page và tự động lên lịch comment sau một khoảng thời gian ($X$ phút) kể từ khi bài viết mới được đăng.
 
+Cập nhật 17/11/2026: triển khai **chọn Graph API hoặc Browser theo từng Page**. Page có kết nối Graph hợp lệ có thể dùng Graph; Page còn lại có thể dùng phiên đăng nhập sẵn trong profile Antidetect của tài khoản quản lý. Không tự đổi cách gửi khi Graph lỗi. Xem [luồng Graph và Browser](docs/KE-HOACH-VAN-HANH-GRAPH-VA-BROWSER.md).
+
+Đã sửa source, đồng bộ DB và bổ sung test an toàn; **chưa bật AUTO hàng loạt hay khởi chạy dịch vụ thật**. Mỗi lần khởi động đều tạm dừng (`paused`), kể cả DB từng lưu trạng thái running. Maintenance và đồng bộ Sheet tự động không chạy khi pause; kiểm tra kết nối chủ động không mở quyền gửi. DB workspace hiện đã đồng bộ và xác minh giải mã đầy đủ danh mục **66 Page = 19 HYBRID + 47 ANTIDETECT** (giữ nguyên toàn bộ 45 tác vụ lịch sử). Graph và Browser đều chịu chính sách, quyền và giới hạn của Meta.
+
 ---
 
 ## 🎯 Tính năng nổi bật
 
-1. **Quản lý Đa tài khoản cô lập (Anti-Chain Ban):**
-   - Chỉ dùng 1 App Meta duy nhất (thêm các nick làm App Tester).
+1. **Quản lý nhiều tài khoản và Page:**
+   - Hỗ trợ dùng chung App Meta; quyền hữu hiệu và điều kiện truy cập phải được xác minh cho từng Page/thao tác.
    - Mỗi Fanpage được lưu trữ và sử dụng `Page Access Token` độc lập.
-   - Khi 1 nick bị checkpoint hoặc mất quyền, chỉ Page của nick đó dừng, các Page ở nick khác vẫn hoạt động 100% bình thường.
+   - Phân loại lỗi theo phạm vi ảnh hưởng. Giới hạn cấp tài khoản hoặc ứng dụng có thể ảnh hưởng nhiều Page; kế hoạch Graph yêu cầu cooldown/dừng đúng phạm vi, không bảo đảm cô lập mọi hạn chế.
 
 2. **Kịch bản Bình luận riêng biệt theo Page:**
    - Cài đặt thời gian chờ tùy chỉnh ($X$ phút) cho từng Page.
@@ -29,6 +33,8 @@ Hệ thống quản lý Fanpage đa tài khoản độc lập, định tuyến k
 ---
 
 ## 🚀 Hướng dẫn khởi chạy
+
+Các lệnh dưới đây là hướng dẫn chung. Đợt tích hợp hiện chưa được phép khởi chạy thật; cần nghiệm thu và được duyệt thao tác vận hành trước khi dùng DB hoặc phiên đăng nhập thật.
 
 ### 1. Cài đặt thư viện phụ thuộc (nếu chưa có)
 ```bash
@@ -79,15 +85,33 @@ Token lỗi giải mã sẽ được đánh dấu INVALID_SECRET và tác vụ G
 
 ### Bình luận bằng trình duyệt Antidetect
 
-Đồng bộ danh mục Antidetect, chọn **Trình duyệt Antidetect** ở Page, bấm **Kiểm tra trình duyệt**, đồng bộ Sheet rồi **Bật tự động**. Nếu profile hết phiên, đăng nhập Facebook lại trong đúng profile rồi kiểm tra lại. Chế độ này dùng phiên trình duyệt, không yêu cầu Page Access Token.
+Browser sử dụng phiên đăng nhập cục bộ của từng tài khoản trong profile Antidetect; không cần nhập hoặc xuất cookie thô. Các Page cùng tài khoản dùng chung profile và ngân sách thao tác. Source đã bổ sung chốt gửi sau DOM cuối, nhận diện thông báo hạn chế và phục hồi dấu thao tác sau gián đoạn. Kiểm thử giả lập chưa thay thế nghiệm thu Facebook thật trên Page được phép; chưa bật AUTO hoặc tự đổi mode trong DB vận hành.
+
+Giao diện Commenter trong Antidetect tại `/commenter/` có danh sách Fanpage lọc theo profile/cách gửi/trạng thái, nguồn Google Sheet, hàng đợi tác vụ và khu vực **Profile & an toàn**. Chi tiết Page hiển thị chuỗi theo thứ tự, giới hạn riêng của Page và hạn mức thao tác chung của profile Browser. Các thao tác cập nhật tại chỗ; tác vụ NEED_CHECK cần người vận hành đối chiếu trước khi gửi lại hoặc đánh dấu đã đăng. Nút Pause vẫn nhận yêu cầu dừng khi kiểm tra kết nối hoặc Resume đang chờ. Tải trang chỉ đọc trạng thái, không tự quét bài, đồng bộ Sheet hoặc thay đổi trạng thái chạy. Proxy chỉ trả các trường dashboard cần thiết, không chuyển token/cookie ra giao diện. Bản `integration/antidetect` là source workspace, chưa áp dụng vào thư mục Antidetect cài đặt bên ngoài.
+
+Trong **Profile & an toàn**, chốt an toàn chung có ba trạng thái: `READY`, `WAITING` (khoảng cách, hạn mức hoặc thao tác đang chạy) và `BLOCKED` (checkpoint, đăng nhập lại, hạn chế, metadata hỏng hoặc cần khôi phục). Số liệu chưa đọc được hiển thị `—`; không suy thành 0. Chặn profile chỉ áp dụng các Page chọn Browser cùng profile; Page Graph không bị đổi transport. Một Page kiểm tra thành công không xác minh các Page còn lại.
+
+**Chạy preflight** chỉ đọc metadata đã lưu: nguồn Sheet, proof của từng Page, chốt profile, quota/cooldown và tổng số task trên toàn lịch sử, kể cả NEED_CHECK cũ hơn 500 task. Số “Page AUTO đã chuẩn bị” chỉ tính Page đã bật AUTO và không có điều kiện chặn/chờ tại lúc đọc; không phải quyền gửi hoặc kết quả kiểm tra Facebook trực tiếp. Pause vẫn giữ nguyên. Tác vụ NEED_CHECK giữ quy trình đối chiếu riêng và chặn các bước sau trong chuỗi của nó. Thời gian trên giao diện dùng UTC+7. Sau đổi cấu hình hoặc tải trạng thái mới, chạy lại preflight để có snapshot mới.
+
+Có thể kiểm tra giao diện với dữ liệu giả bằng `python verify_commenter_ui.py` khi máy đã có Playwright/Chromium. Script tạo browser mới, intercept mọi request, không khởi động ứng dụng hoặc dùng profile Facebook; xuất ảnh desktop/mobile vào `.pytest_cache/commenter-ui/`.
+
+AUTO theo dõi bài đăng mới từ lúc bật cho từng Page. Mốc bài đã thấy và hàng đợi được lưu cùng nhau trong DB, tiếp tục dùng sau khi khởi động lại. Bật lại sau khi tắt AUTO tạo mốc bắt đầu mới. Tool vẫn kiểm tra danh sách bài định kỳ để phát hiện bài mới, chỉ mở bài cần gửi khi tác vụ đến hạn. Bài phát hiện muộn hơn `MAX_POST_AGE_MIN` (mặc định 120 phút) được bỏ qua. Với Browser, bước xác minh bài và gửi bình luận dùng cùng một tab, có kiểm tra lại danh tính Page và nội dung trước khi gửi.
+
+Quy trình tham khảo sau khi hoàn tất sửa, nghiệm thu và được phép mở lại Browser: đồng bộ danh mục Antidetect, chọn **Trình duyệt Antidetect** ở Page, bấm **Kiểm tra trình duyệt**, đồng bộ Sheet rồi **Bật tự động** trong phạm vi được duyệt. Nếu profile hết phiên, đăng nhập Facebook lại trong đúng profile rồi kiểm tra lại. Chế độ này dùng phiên trình duyệt, không yêu cầu Page Access Token.
 
 Tool xác minh numeric ID Page, bài viết, người bình luận và nội dung ngay trước Enter. Tên Page giống nhau không đủ để xác minh. Mỗi profile chỉ xử lý một thao tác cùng lúc. Tool chỉ đóng phiên browser có `launch_id` do nó sở hữu. Đổi cách gửi tạm dừng tác vụ đang chờ; cần **Khôi phục tác vụ** riêng sau khi kiểm tra, quota và lịch sử vẫn giữ.
 
+Mọi lượt kiểm tra kết nối, quét bài, xác minh bài nhập tay hoặc mở bài để gửi đều dùng chung ngân sách của profile: `BROWSER_MAX_OPERATIONS_PER_PROFILE_PER_DAY=100`, cách nhau ít nhất `BROWSER_MIN_GAP_PER_PROFILE_SEC=60` giây theo mặc định. Vòng quét nền chỉ quét các Page Browser theo chu kỳ `BROWSER_SCAN_INTERVAL_SEC=900` giây (15 phút), nhường lượt khi cùng profile có tác vụ gửi đến hạn, và giữ lại `BROWSER_RESERVED_SEND_OPERATIONS=25` lượt cuối trong ngày ưu tiên cho `send`/`check` để lượt quét không tiêu cạn toàn bộ hạn mức ngày. Lượt đã giữ vẫn được tính khi thao tác thất bại; tranh chấp khóa hoặc lượt bị chặn không tính thêm. Bộ đếm theo ngày UTC+7, lưu qua restart và đổi Page. Scanner luân phiên các Page cùng profile theo lần thử quét gần nhất, kể cả khi không có bài mới; thứ tự này cũng giữ qua restart. Hạn mức bình luận từng Page vẫn áp dụng riêng. Đây là giới hạn tải của tool, không phải ngưỡng Facebook bảo đảm không checkpoint; thao tác ngoài tool không được tính.
+
+Khi thấy đăng nhập lại, checkpoint hoặc thông báo hạn chế hoạt động được hỗ trợ, tool chặn toàn profile, làm mất hiệu lực kiểm tra Browser của các Page cùng profile và chuyển tác vụ PENDING sang PAUSED. Nếu đã nhấn Enter mà chưa xác nhận được kết quả, tác vụ giữ NEED_CHECK, không tự gửi lại. Khóa chặn tồn tại qua restart. Sau khi tự xử lý trên Facebook, dùng **Kiểm tra trình duyệt** để kiểm tra lại (vẫn chịu hạn mức/khoảng cách), rồi kiểm tra từng Page và **Khôi phục tác vụ** riêng. Kiểm tra thành công không tự khôi phục hàng đợi cũ. Các Page ở profile khác và luồng Graph không bị khóa theo profile này.
+
+Trước khi bật AUTO Browser, chạy `python -m pytest -q`: test dùng DB tạm, dữ liệu giả, vô hiệu hóa đọc/ghi `.env` trước khi import cấu hình và chặn HTTP thật. Bộ test kiểm tra hạn mức dùng chung, đồng thời/restart, dừng trước Enter, kết quả chưa rõ sau Enter, đổi danh tính/nội dung/cấu hình và không gửi lại. Kiểm thử mô phỏng chưa thay thế nghiệm thu layout Facebook thật: phải xác minh đúng numeric actor, chủ bài, timestamp tuyệt đối và ID bình luận trên một Page được phép trước khi mở rộng. Không bật AUTO nếu các bằng chứng này chưa đủ.
+
 Khi đổi cách gửi, lịch AUTO còn đối chiếu permalink trong cùng Page để tránh tạo lại chuỗi nếu Graph ID khác Reel ID. Chuỗi cũ giữ nguyên nội dung và thời gian. Việc đối chiếu link không thay thế bước xác minh bài và người đăng trước khi gửi.
 
-Chỉ ghi SUCCESS khi thấy ID bình luận mới đúng Page/nội dung. Kết quả không rõ sau Enter chuyển NEED_CHECK và không tự gửi lại. Layout thiếu ID hoặc timestamp tuyệt đối sẽ bị chặn; hiện chưa hỗ trợ link `pfbid`/rút gọn qua trình duyệt. Cần nghiệm thu layout trên phiên Facebook đã đăng nhập trước khi bật nhiều Page. Xem `docs/KE-HOACH-BINH-LUAN-TRINH-DUYET.md`.
+Chỉ ghi SUCCESS khi thấy ID bình luận mới đúng Page/nội dung. Kết quả không rõ sau Enter chuyển NEED_CHECK và không tự gửi lại. Bộ trích xuất DOM hỗ trợ cả URL số và `pfbid...` khi đối chiếu được Relay JSON / React Fiber đúng chủ bài viết, timestamp tuyệt đối và numeric actor ID; các liên kết rút gọn (`fb.watch`, `/share/...`) hoặc layout thiếu bằng chứng định danh vẫn bị chặn an toàn. Cần nghiệm thu layout trên phiên Facebook đã đăng nhập trước khi bật nhiều Page. Xem `docs/KE-HOACH-BINH-LUAN-TRINH-DUYET.md`.
 
-Ứng dụng khóa theo đường dẫn DB trước khi recovery, kể cả chạy qua `run.py`, `run_background.pyw` hoặc Uvicorn trực tiếp. Chỉ một tiến trình được dùng DB. Trạng thái chạy được lưu trong DB: chưa có trạng thái thì tạm dừng, đã có thì khôi phục trạng thái đã lưu. Để cập nhật dịch vụ, tạm dừng trước, sao lưu bằng SQLite Backup API và kiểm tra bản sao. Nếu đã gửi sau nâng cấp, phải giữ lịch sử gửi mới khi rollback để tránh mất khóa chống trùng.
+Ứng dụng khóa theo đường dẫn DB trước khi recovery, kể cả chạy qua `run.py`, `run_background.pyw` hoặc Uvicorn trực tiếp. Chỉ một tiến trình được dùng DB. **Startup luôn lưu trạng thái tạm dừng** và cách ly profile có thao tác dở trước khi khởi động worker. Pause dừng nhận lượt gửi mới; lượt đã chốt gửi có thể đang diễn ra và kết quả chưa rõ giữ NEED_CHECK. Để cập nhật dịch vụ, tạm dừng trước, sao lưu bằng SQLite Backup API và kiểm tra bản sao. Nếu đã gửi sau nâng cấp, phải giữ lịch sử gửi mới khi rollback để tránh mất khóa chống trùng.
 
 ---
 

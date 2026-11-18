@@ -517,9 +517,28 @@ async def home_page(request: Request):
 
 
 
+_commenter_key_lock = threading.Lock()
+_commenter_key_cache: Dict[str, Any] = {"sig": None, "key": None}
+
+
+def _read_commenter_admin_key(env_path) -> str:
+    import re
+    stat = env_path.stat()
+    sig = (str(env_path), stat.st_mtime_ns, stat.st_size)
+    with _commenter_key_lock:
+        if _commenter_key_cache["sig"] == sig and _commenter_key_cache["key"]:
+            return _commenter_key_cache["key"]
+    values = re.findall(r"(?m)^DASHBOARD_ADMIN_KEY\s*=\s*([A-Za-z0-9_-]{32,})\s*$", env_path.read_text(encoding="utf-8-sig"))
+    if len(values) != 1:
+        raise ValueError("Commenter key is missing or ambiguous")
+    with _commenter_key_lock:
+        _commenter_key_cache["sig"] = sig
+        _commenter_key_cache["key"] = values[0]
+    return values[0]
+
+
 def _commenter_request(method, path, body=None):
     """Proxy fixed Commenter routes using the local dashboard key."""
-    import re
     from pathlib import Path
     import requests
 
@@ -528,12 +547,10 @@ def _commenter_request(method, path, body=None):
     port = os.environ.get("FACEBOOK_COMMENTER_PORT", "8080")
     if not port.isdecimal() or not 1 <= int(port) <= 65535:
         raise ValueError("Invalid Commenter port")
-    values = re.findall(r"(?m)^DASHBOARD_ADMIN_KEY\s*=\s*([A-Za-z0-9_-]{32,})\s*$", env_path.read_text(encoding="utf-8-sig"))
-    if len(values) != 1:
-        raise ValueError("Commenter key is missing or ambiguous")
+    admin_key = _read_commenter_admin_key(env_path)
     with requests.Session() as client:
         client.trust_env = False
-        client.headers["X-Dashboard-Key"] = values[0]
+        client.headers["X-Dashboard-Key"] = admin_key
         response = client.request(
             method, f"http://127.0.0.1:{port}{path}", json=body,
             timeout=(3, 80 if method == "POST" else 5), allow_redirects=False,
@@ -541,231 +558,9 @@ def _commenter_request(method, path, body=None):
         return response.status_code, response.json()
 
 
-@app.api_route("/api/commenter/pages/{page_id}/{action}", methods=["GET", "POST"])
-async def commenter_page_action(request: Request, page_id: str, action: str):
-    import re
-    import requests
+from .commenter import register_commenter_routes
 
-    methods = {"preview": "GET", "check": "POST", "automation": "POST", "reactivate": "POST"}
-    if not re.fullmatch(r"[0-9]{5,30}", page_id) or methods.get(action) != request.method:
-        raise HTTPException(status_code=404, detail="Thao tác Page không hợp lệ.")
-    body = None
-    if action == "automation":
-        try:
-            data = await request.json()
-        except ValueError:
-            data = None
-        if not isinstance(data, dict) or type(data.get("enabled")) is not bool:
-            raise HTTPException(status_code=400, detail="Cần chọn bật hoặc tạm dừng.")
-        body = {"enabled": data["enabled"]}
-    try:
-        status, data = await asyncio.to_thread(
-            _commenter_request, request.method, f"/api/pages/{page_id}/{action}", body,
-        )
-    except (OSError, ValueError, requests.RequestException):
-        raise HTTPException(status_code=502, detail="Không kết nối được Commenter cục bộ.") from None
-    return JSONResponse(data, status_code=status)
-
-
-@app.post("/api/commenter/sheets/sync")
-async def commenter_sync_sheet(request: Request):
-    from urllib.parse import urlparse
-    import requests
-
-    try:
-        payload = await request.json()
-    except ValueError:
-        payload = None
-    raw_url = payload.get("sheet_url") if isinstance(payload, dict) else None
-    sheet_url = raw_url.strip() if isinstance(raw_url, str) else ""
-    parsed = urlparse(sheet_url)
-    if (
-        not sheet_url
-        or len(sheet_url) > 2048
-        or parsed.scheme != "https"
-        or parsed.netloc != "docs.google.com"
-        or not parsed.path.startswith("/spreadsheets/d/")
-    ):
-        raise HTTPException(status_code=400, detail="Hãy nhập đường dẫn Google Sheet hợp lệ.")
-
-    try:
-        status, data = await asyncio.to_thread(
-            _commenter_request, "POST", "/api/sheets/sync", {"sheet_url": sheet_url},
-        )
-    except (OSError, ValueError, requests.RequestException):
-        raise HTTPException(status_code=502, detail="Không đồng bộ được Google Sheet từ Commenter cục bộ.") from None
-    return JSONResponse(data, status_code=status)
-
-
-@app.get("/commenter/actions.js")
-async def commenter_actions_script():
-    from fastapi.responses import Response
-
-    return Response("""
-        const output = document.getElementById('action-result');
-        document.querySelectorAll('button[data-action]').forEach(button => {
-            button.addEventListener('click', async () => {
-                const {page, action, enable} = button.dataset;
-                button.disabled = true;
-                output.hidden = false;
-                output.textContent = 'Đang xử lý…';
-                try {
-                    const response = await fetch('/api/commenter/pages/' + encodeURIComponent(page) + '/' + action, {
-                        method: action === 'preview' ? 'GET' : 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: action === 'automation' ? JSON.stringify({enabled: enable === '1'}) : undefined,
-                    });
-                    const data = await response.json();
-                    if (!response.ok) throw new Error(data.detail || 'Không thực hiện được thao tác.');
-                    if (action === 'preview') {
-                        const sequence = data.comment_sequence || [];
-                        const lines = sequence.length
-                            ? sequence.map((step, index) => '#' + (index + 1) + ' · Sau ' + step.delay_minutes + ' phút · ' + step.template)
-                            : ['Thời gian chờ: ' + data.delay_minutes + ' phút', ...(data.templates || [])];
-                        output.textContent = [data.source_error, ...lines].filter(Boolean).join(String.fromCharCode(10, 10));
-                    } else {
-                        sessionStorage.setItem('commenter-result', data.message ||
-                            (data.enabled ? 'Đã bật tự động cho Page.' : 'Đã tạm dừng tự động cho Page.'));
-                        location.reload();
-                    }
-                } catch (error) {
-                    output.textContent = error.message;
-                } finally {
-                    button.disabled = false;
-                }
-            });
-        });
-        const previous = sessionStorage.getItem('commenter-result');
-        if (previous) {
-            sessionStorage.removeItem('commenter-result');
-            output.hidden = false;
-            output.textContent = previous;
-        }
-
-        const sheetForm = document.getElementById('commenter-sheet-form');
-        if (sheetForm) {
-            sheetForm.addEventListener('submit', async event => {
-                event.preventDefault();
-                const button = document.getElementById('commenter-sheet-submit');
-                const sheetUrl = document.getElementById('commenter-sheet-url').value.trim();
-                button.disabled = true;
-                output.hidden = false;
-                output.textContent = 'Đang đồng bộ cấu hình Sheet…';
-                try {
-                    const response = await fetch('/api/commenter/sheets/sync', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({sheet_url: sheetUrl}),
-                    });
-                    const data = await response.json();
-                    if (!response.ok || !data.success) {
-                        throw new Error(data.detail || data.error || 'Không đồng bộ được Sheet.');
-                    }
-                    const errors = (data.errors || []).slice(0, 8);
-                    sessionStorage.setItem('commenter-result',
-                        [data.message || 'Đã đồng bộ Sheet.', ...errors].join(String.fromCharCode(10)));
-                    location.reload();
-                } catch (error) {
-                    output.textContent = error.message;
-                } finally {
-                    button.disabled = false;
-                }
-            });
-        }
-    """, media_type="application/javascript")
-
-
-@app.get("/commenter/", response_class=HTMLResponse)
-async def commenter_overview(request: Request):
-    if not authorized(request):
-        return templates.TemplateResponse(request=request, name="unlock.html", context={}, status_code=401)
-
-    from html import escape
-    from itertools import groupby
-    import requests
-
-    def label(value):
-        return escape(str(value or ""))
-
-    def profile_key(page):
-        return (page.get("antidetect_profile_name") or "Chưa ghép profile",
-                page.get("antidetect_profile_id") or "")
-
-    def button(page, action, title, enabled=True):
-        page_id = label(page["page_id"])
-        enable = "0" if page.get("rule_enabled") else "1"
-        disabled = "" if enabled else " disabled"
-        return f'<button type="button" data-page="{page_id}" data-action="{action}" data-enable="{enable}"{disabled}>{title}</button>'
-
-    try:
-        (metrics_status, overview), (pages_status, catalog) = await asyncio.gather(
-            asyncio.to_thread(_commenter_request, "GET", "/api/metrics"),
-            asyncio.to_thread(_commenter_request, "GET", "/api/pages"),
-        )
-        if metrics_status != 200 or pages_status != 200:
-            raise ValueError("Commenter did not return dashboard data")
-        metrics = overview["metrics"]
-        sheet = metrics["sheet_sync"]
-        state = "Tạm dừng" if metrics["paused_all"] else "Đang chạy"
-        counts = overview["task_counts"]
-        details = [
-            f'<p>Hệ thống: <strong>{state}</strong> · Chờ: {int(counts["PENDING"])}'
-            f' · Đang gửi: {int(counts["SENDING"])} · Cần kiểm tra: {int(counts["NEED_CHECK"])}</p>',
-            f'<p>Nguồn mẫu hiện tại: {label(sheet.get("sheet_url")) or "Chưa cấu hình"}<br>{label(sheet.get("last_error"))}</p>',
-            '<section class="sheet-panel"><h2>Quản lý Sheet bình luận</h2>'
-            '<p>Dán URL của tab <strong>Comments - Multi-Page</strong> rồi đồng bộ. Mỗi dòng cấu hình một mẫu cho Page bằng ID, tên Page, nội dung comment và số phút chờ.</p>'
-            '<form id="commenter-sheet-form">'
-            '<label for="commenter-sheet-url">Google Sheet URL</label>'
-            f'<input id="commenter-sheet-url" name="sheet_url" type="url" maxlength="2048" required value="{label(sheet.get("sheet_url"))}" placeholder="https://docs.google.com/spreadsheets/d/...">'
-            '<button id="commenter-sheet-submit" type="submit">Lưu và đồng bộ Sheet</button>'
-            '</form><small>Page chỉ chạy tự động khi có mẫu và thời gian chờ hợp lệ, kết nối Meta đã xác minh và được bật trong danh sách bên dưới.</small></section>',
-        ]
-        for (profile, profile_id), pages in groupby(sorted(catalog["pages"], key=profile_key), key=profile_key):
-            details.append(f'<h2>{label(profile)} <small>{label(profile_id)}</small></h2>')
-            details.append('<div class="scroll"><table><thead><tr><th>Fanpage</th><th>Meta</th>'
-                           '<th>Tự động / chờ</th><th>Lỗi gần nhất</th><th>Thao tác</th></tr></thead><tbody>')
-            for page in pages:
-                actions = button(page, "preview", "Xem mẫu")
-                actions += button(page, "check", "Kiểm tra Meta", page.get("has_page_token"))
-                if page.get("has_page_token") and not page.get("is_active"):
-                    actions += button(page, "reactivate", "Kích hoạt kết nối")
-                enabled = page.get("rule_enabled")
-                actions += button(page, "automation", "Tạm dừng" if enabled else "Bật tự động",
-                                  enabled or (page.get("has_page_token") and page.get("is_active")))
-                verified = "Đã xác minh" if page.get("graph_ready") else "Cần kiểm tra"
-                delay = page.get("delay_minutes")
-                errors = [page.get(key) for key in ("connection_error", "scan_error", "source_error", "send_error", "send_wait_reason")]
-                errors = "<br>".join(label(error) for error in dict.fromkeys(errors) if error)
-                details.append(f'<tr><th scope="row">{label(page["page_name"])}<br><small>{label(page["page_id"])}</small></th>'
-                               f'<td>{verified}<br>{label(page.get("token_status"))}</td>'
-                               f'<td>{"Đã bật" if enabled else "Tạm dừng"} · {label(delay)} phút<br>'
-                               f'Đã dùng {int(page.get("comments_used_today", 0))}/{int(page.get("max_comments_per_day") or 20)}, '
-                               f'còn {int(page.get("comments_remaining_today", 0))}</td>'
-                               f'<td>{errors or "—"}</td><td>{actions}</td></tr>')
-            details.append('</tbody></table></div>')
-        if not catalog["pages"]:
-            details.append("<p>Chưa có Fanpage trong danh mục.</p>")
-    except (OSError, ValueError, KeyError, TypeError, requests.RequestException):
-        details = ["<p>Chưa kết nối được Commenter. Kiểm tra dịch vụ cục bộ và cổng được cấu hình.</p>"]
-
-    return HTMLResponse(
-        '<!doctype html><html lang="vi"><head><meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width,initial-scale=1">'
-        '<title>Bình luận Fanpage</title><style>'
-        'body{font:16px system-ui,sans-serif;background:#101828;color:#f8fafc;margin:0}'
-        'main{max-width:1200px;margin:40px auto;padding:0 20px}a{color:#93c5fd}nav{display:flex;gap:20px}'
-        '.scroll{overflow:auto}table{width:100%;border-collapse:collapse;text-align:left}'
-        'th,td{padding:10px;border-bottom:1px solid #344054;vertical-align:top}'
-        'small{color:#b8c5d6}.sheet-panel{margin:20px 0;padding:18px;border:1px solid #344054;border-radius:12px;background:#182230}'
-        '.sheet-panel form{display:flex;gap:10px;align-items:end;flex-wrap:wrap}.sheet-panel label{display:block;width:100%}'
-        '.sheet-panel input{flex:1;min-width:280px;padding:9px;border:1px solid #526174;border-radius:6px;background:#101828;color:#f8fafc}'
-        'button{margin:2px;padding:7px 10px;cursor:pointer}button:disabled{opacity:.6;cursor:wait}pre{white-space:pre-wrap}'
-        '</style><script src="/commenter/actions.js" defer></script></head><body><main>'
-        '<nav><a href="/">Profiles</a><a href="/fanpages">Fanpage Manager</a>'
-        '<a href="/commenter/">Làm mới</a><a href="http://127.0.0.1:8080/operations">Hộp thư, xuất bản &amp; báo cáo</a></nav><h1>Bình luận Fanpage</h1>'
-        '<pre id="action-result" role="status" hidden></pre>'
-        + "".join(details) + '</main></body></html>'
-    )
+register_commenter_routes(app, authorized, templates, _commenter_request)
 
 
 # --- REST API Endpoints ---

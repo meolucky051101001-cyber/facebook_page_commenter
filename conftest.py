@@ -1,15 +1,34 @@
 """Isolated test runtime: never use the operator's database or HTTP credentials."""
 import copy
 import os
+from pathlib import Path
+import sys
 from datetime import datetime, timedelta, timezone
 
 from cryptography.fernet import Fernet
 import httpx
 import pytest
 
+# Fail before opening operator state even if a future test forgets a fixture.
+_project_dir = Path(__file__).resolve().parent
+_protected_files = {os.path.normcase(str(_project_dir / name)) for name in (
+    ".env", "fb_commenter.db", "fb_commenter.db.bak", "fb_commenter.db-wal", "fb_commenter.db-shm",
+)}
+
+
+def _protect_operator_files(event, args):
+    if event in ("open", "sqlite3.connect") and args and isinstance(args[0], (str, bytes, os.PathLike)):
+        path = os.path.normcase(os.path.abspath(os.fsdecode(args[0])))
+        if path in _protected_files or Path(path).name.lower() in ("cookies", "cookies-journal", "secrets.dpapi"):
+            raise AssertionError("Tests must not access operator credentials or production database")
+
+
+sys.addaudithook(_protect_operator_files)
+os.environ["PYTHON_DOTENV_DISABLED"] = "1"
 os.environ["ENCRYPTION_KEY"] = Fernet.generate_key().decode()
 for _key in ("META_APP_ID", "META_APP_SECRET", "META_OAUTH_REDIRECT_URI",
-             "MULTI_PAGE_SHEET_URL", "PILOT_SHEET_URL", "DEFAULT_SHEET_URL", "PILOT_PAGE_ID"):
+             "MULTI_PAGE_SHEET_URL", "PILOT_SHEET_URL", "DEFAULT_SHEET_URL", "PILOT_PAGE_ID",
+             "GEMINI_API_KEY", "GEMINI_MODEL"):
     os.environ[_key] = ""
 os.environ["DASHBOARD_ADMIN_KEY"] = "isolated-test-dashboard-key-0000000000"
 
@@ -28,12 +47,16 @@ def isolated_runtime(tmp_path, monkeypatch):
     scheduler.SCHEDULER_METRICS["paused_all"] = False
     monkeypatch.setattr(scheduler, "_comment_sheet_result", {"success": False})
     monkeypatch.setattr(scheduler, "_last_comment_sheet_read", float("-inf"))
+    monkeypatch.setattr(scheduler, "_last_browser_scan_mono", float("-inf"))
     monkeypatch.setattr(scheduler, "_SCAN_BACKOFF_UNTIL", {})
 
     def no_http(*args, **kwargs):
         raise AssertionError("Tests must mock HTTP; real network access is disabled")
 
     monkeypatch.setattr(httpx.HTTPTransport, "handle_request", no_http)
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", no_http)
+    monkeypatch.setattr("urllib.request.urlopen", no_http)
+    monkeypatch.setattr("websockets.connect", no_http)
     db.init_db()
 
 
@@ -52,7 +75,7 @@ def clock(monkeypatch):
         def advance(cls, **kwargs):
             cls.value += timedelta(**kwargs)
 
-    for name in ("database", "scheduler", "operations", "comment_dispatch", "meta_client"):
+    for name in ("database", "scheduler", "operations", "comment_dispatch", "meta_client", "browser_safety"):
         module = sys.modules.get(name)
         if module and hasattr(module, "datetime"):
             monkeypatch.setattr(module, "datetime", Clock)

@@ -14,6 +14,8 @@ import database as db
 import meta_client
 import sheets_sync
 import antidetect_client
+import browser_safety
+import submit_control
 
 
 # In-memory status for UI monitoring
@@ -34,17 +36,38 @@ SCHEDULER_METRICS: Dict[str, Any] = {
 _SCAN_LOCK = threading.Lock()
 _EXEC_LOCK = threading.Lock()
 _RUN_STATE_LOCK = threading.Lock()
+_RUN_REQUEST_LOCK = threading.Lock()
+_RUN_REQUEST_VERSION = 0
 _COMMENT_SHEET_LOCK = threading.Lock()
 _last_comment_sheet_read = float("-inf")
+_last_browser_scan_mono = float("-inf")
 _comment_sheet_result = {"success": False, "error": "Chưa đọc tab bình luận."}
 
 
-def set_system_paused(paused: bool) -> None:
-    with _RUN_STATE_LOCK:
+def begin_run_state_request(paused: bool) -> int:
+    """Order operator intent before any slow Resume preparation."""
+    global _RUN_REQUEST_VERSION
+    with submit_control.mutation(), _RUN_REQUEST_LOCK:
+        _RUN_REQUEST_VERSION += 1
         if paused:
             SCHEDULER_METRICS["paused_all"] = True
-        db.set_setting("automation_run_state", "paused" if paused else "running")
-        SCHEDULER_METRICS["paused_all"] = paused
+        return _RUN_REQUEST_VERSION
+
+
+def set_system_paused(paused: bool, *, expected_version: Optional[int] = None) -> bool:
+    # Publish cancellation before waiting for a DB/other state writer. Resume
+    # never revives a ticket created before the stop, even if DB writing fails.
+    with submit_control.mutation():
+        request_version = begin_run_state_request(paused) if expected_version is None else expected_version
+        with _RUN_STATE_LOCK:
+            with _RUN_REQUEST_LOCK:
+                if request_version != _RUN_REQUEST_VERSION:
+                    return SCHEDULER_METRICS["paused_all"]
+            db.set_setting("automation_run_state", "paused" if paused else "running")
+            with _RUN_REQUEST_LOCK:
+                if request_version == _RUN_REQUEST_VERSION:
+                    SCHEDULER_METRICS["paused_all"] = paused
+                return SCHEDULER_METRICS["paused_all"]
 
 
 def comment_sheet_url() -> str:
@@ -116,9 +139,13 @@ def _record_browser_connection_failure(page, result):
     """Invalidate only the browser binding used by this operation, never its token."""
     category = result.get("category")
     status = result.get("browser_status")
-    if status not in ("LOGIN_REQUIRED", "CHECKPOINT", "ERROR"):
+    if status not in ("LOGIN_REQUIRED", "CHECKPOINT", "RESTRICTED", "ERROR"):
         return
-    if category in ("BROWSER_BUSY", "CANCELLED_BEFORE_SEND", "NETWORK_RETRYABLE", "RATE_LIMIT", "POST_ERROR"):
+    if category in ("BROWSER_BUSY", "BROWSER_LIMIT", "BROWSER_BLOCKED", "CANCELLED_BEFORE_SEND", "NETWORK_RETRYABLE", "RATE_LIMIT", "POST_ERROR"):
+        return
+    if status in ("LOGIN_REQUIRED", "CHECKPOINT", "RESTRICTED"):
+        if not result.get("profile_safety_recorded") and page.get("antidetect_profile_id"):
+            browser_safety.block(page["antidetect_profile_id"], status, result.get("error"))
         return
     db.invalidate_page_browser(
         page["page_id"], status, result.get("error"),
@@ -151,17 +178,97 @@ def build_post_schedule(page: Dict[str, Any], post_id: str, post_url: Optional[s
     return {"id": post_id, "url": post_url, "created_time": created_at.isoformat(), "steps": steps}
 
 
-def detect_new_posts_and_schedule():
+def detect_new_posts_and_schedule(*, include_browser: bool = True):
     """Single-flight wrapper: a background loop and a manual sync must not scan concurrently."""
     if not _SCAN_LOCK.acquire(blocking=False):
         return
     try:
-        _detect_new_posts_and_schedule()
+        _detect_new_posts_and_schedule(include_browser=include_browser)
     finally:
         _SCAN_LOCK.release()
 
 
-def _detect_new_posts_and_schedule():
+_BROWSER_SCAN_ATTEMPT_PREFIX = "browser_scan_attempt:"
+
+
+def _fair_scan_order(pages):
+    """Rotate each profile's Browser pages without changing Graph page slots."""
+    with closing(db.get_connection()) as conn:
+        attempts = dict(conn.execute(
+            "SELECT setting_key,setting_value FROM app_settings WHERE setting_key LIKE ?",
+            (_BROWSER_SCAN_ATTEMPT_PREFIX + "%",),
+        ))
+
+    def last_attempt(page):
+        raw = attempts.get(_BROWSER_SCAN_ATTEMPT_PREFIX + page["page_id"])
+        try:
+            parsed = datetime.fromisoformat(raw)
+            if parsed.tzinfo is not None:
+                return parsed.astimezone(timezone.utc)
+        except (TypeError, ValueError, OverflowError):
+            pass
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+    profiles = {}
+    for page in pages:
+        if _send_mode(page) == "BROWSER":
+            profiles.setdefault(page.get("antidetect_profile_id"), []).append(page)
+    ordered = {profile: iter(sorted(group, key=last_attempt)) for profile, group in profiles.items()}
+    return [next(ordered[page.get("antidetect_profile_id")]) if _send_mode(page) == "BROWSER" else page
+            for page in pages]
+
+
+def _scan_browser_posts(page, since):
+    # A denied reservation did not use this Page's turn. Empty scans and failed
+    # browser attempts did, and must rotate even when the post cursor stays put.
+    attempted = True
+    try:
+        return antidetect_client.get_recent_posts_for_page_cdp(page, since_timestamp=since)
+    except antidetect_client.BrowserAutomationError as exc:
+        attempted = exc.category not in ("BROWSER_BUSY", "BROWSER_LIMIT", "BROWSER_BLOCKED")
+        raise
+    finally:
+        if attempted:
+            db.set_setting(_BROWSER_SCAN_ATTEMPT_PREFIX + page["page_id"], datetime.now(timezone.utc).isoformat())
+
+
+def _profile_has_due_send_task(profile_id: Optional[str], now_utc: datetime) -> bool:
+    """Yield the profile's inter-operation gap when a Browser comment is already due to send."""
+    if not profile_id:
+        return False
+    gap_sec = max(0, int(getattr(config, "BROWSER_MIN_GAP_PER_PROFILE_SEC", 60)))
+    horizon = (now_utc + timedelta(seconds=gap_sec)).isoformat()
+    with closing(db.get_connection()) as conn:
+        rows = conn.execute(f"""
+            SELECT DISTINCT t.page_id, t.source FROM tasks t
+            JOIN pages p ON p.page_id = t.page_id
+            LEFT JOIN page_rules r ON r.page_id = t.page_id
+            WHERE t.status = 'PENDING' AND t.scheduled_at <= ?
+              AND p.send_mode = 'BROWSER' AND p.antidetect_profile_id = ?
+              AND p.is_active = 1
+              AND (t.source != 'AUTO' OR (r.is_enabled = 1 AND r.source_error IS NULL))
+              AND {db._selected_transport_ready_sql('p')}
+              AND (COALESCE(t.sequence_step, 1) <= 1 OR EXISTS (
+                  SELECT 1 FROM tasks previous
+                  WHERE previous.page_id = t.page_id AND previous.post_id = t.post_id
+                    AND previous.source = 'AUTO' AND previous.sequence_step = t.sequence_step - 1
+                    AND previous.status = 'SUCCESS'
+                    AND julianday(previous.updated_at, '+' || t.sequence_gap_minutes || ' minutes') <= julianday(?)
+              ))
+            LIMIT 10
+        """, (horizon, profile_id, horizon)).fetchall()
+    for row in rows:
+        auto = row["source"] == "AUTO"
+        decision = comment_dispatch.check(
+            row["page_id"], lambda: False, automatic=auto,
+            require_sheet=auto, transport="selected", profile_reserved=True,
+        )
+        if decision.ready:
+            return True
+    return False
+
+
+def _detect_new_posts_and_schedule(*, include_browser: bool = True):
     """
     Scans all active pages incrementally, detecting newly published posts.
     Calculates target delay and creates deduplicated auto-tasks.
@@ -170,14 +277,17 @@ def _detect_new_posts_and_schedule():
         return
     if not refresh_comment_sheet()["success"]:
         return
-    pages = db.get_all_pages()
+    pages = _fair_scan_order(db.get_all_pages())
     now_utc = datetime.now(timezone.utc)
+    busy_send_profiles = {}
 
     for p in pages:
         if SCHEDULER_METRICS["paused_all"]:
             break
         page_id = p["page_id"]
         if not p.get("is_active") or not p.get("rule_enabled") or p.get("source_error"):
+            continue
+        if _send_mode(p) == "BROWSER" and not include_browser:
             continue
         if _SCAN_BACKOFF_UNTIL.get(page_id, now_utc) > now_utc:
             continue
@@ -198,14 +308,21 @@ def _detect_new_posts_and_schedule():
                                  (since, page_id))
                 continue
             if _send_mode(page_full) == "BROWSER":
-                posts = antidetect_client.get_recent_posts_for_page_cdp(page_full, since_timestamp=since)
+                prof_id = page_full.get("antidetect_profile_id")
+                if prof_id not in busy_send_profiles:
+                    busy_send_profiles[prof_id] = _profile_has_due_send_task(prof_id, now_utc)
+                if busy_send_profiles[prof_id]:
+                    _SCAN_BACKOFF_UNTIL[page_id] = now_utc + timedelta(seconds=config.TASK_TICK_SEC)
+                    continue
+                posts = _scan_browser_posts(page_full, since)
             else:
                 posts = meta_client.get_recent_posts(page_id, page_full["page_access_token"], since_timestamp=since)
         except antidetect_client.BrowserAutomationError as exc:
             SCHEDULER_METRICS["scan_errors"][page_id] = exc.message
             _record_browser_connection_failure(page_full, exc.as_result())
-            if exc.category in ("BROWSER_BUSY", "NETWORK_RETRYABLE"):
-                _SCAN_BACKOFF_UNTIL[page_id] = now_utc + timedelta(seconds=config.TASK_TICK_SEC)
+            if exc.category in ("BROWSER_BUSY", "BROWSER_LIMIT", "NETWORK_RETRYABLE"):
+                retry_at = exc.as_result().get("retry_at")
+                _SCAN_BACKOFF_UNTIL[page_id] = date_parser.isoparse(retry_at) if retry_at else now_utc + timedelta(seconds=config.TASK_TICK_SEC)
             continue
         except meta_client.MetaAPIError as exc:
             SCHEDULER_METRICS["scan_errors"][page_id] = exc.message
@@ -214,6 +331,9 @@ def _detect_new_posts_and_schedule():
             elif exc.category in ("TOKEN_EXPIRED", "MISSING_PERMISSIONS"):
                 status = "EXPIRED" if exc.category == "TOKEN_EXPIRED" else exc.category
                 db.update_page_status(page_id, bool(p["is_active"]), status, exc.message)
+            elif exc.category == "RESTRICTED":
+                comment_dispatch.quarantine_graph(page_id)
+                db.update_page_status(page_id, bool(p["is_active"]), "RESTRICTED", exc.message)
             continue
         except Exception:
             SCHEDULER_METRICS["scan_errors"][page_id] = "Không thể đọc bài hoặc cấu hình Page."
@@ -289,7 +409,7 @@ def _due_task_candidates(include_auto):
             yield task
 
 
-def _prepare_before_submit(task, initial_page, paused, *, refresh_sheet=False):
+def _prepare_before_submit(task, initial_page, paused, *, refresh_sheet=False, profile_reserved=False):
     """Recheck policy after slow browser navigation without acquiring the Page lock again."""
     automatic = task.get("source") == "AUTO"
     if automatic and refresh_sheet and not refresh_comment_sheet(force=True).get("success"):
@@ -298,7 +418,7 @@ def _prepare_before_submit(task, initial_page, paused, *, refresh_sheet=False):
         if automatic and not _comment_sheet_result.get("success"):
             return comment_dispatch.Decision("SOURCE_CHANGED", message="Nguồn bình luận chưa sẵn sàng.")
         latest = comment_dispatch.check(task["page_id"], paused, automatic=automatic,
-                                        require_sheet=automatic, transport="selected")
+                                        require_sheet=automatic, transport="selected", profile_reserved=profile_reserved)
         if not latest.ready:
             return latest
         if not _same_send_connection(initial_page, latest.page):
@@ -316,6 +436,31 @@ def _prepare_before_submit(task, initial_page, paused, *, refresh_sheet=False):
         return latest
 
 
+def _final_submit_gate(task, initial_page, paused, ticket, *, profile_reserved=False):
+    """No HTTP, waiting Sheet mutex or browser work after the final DOM read."""
+    if not _COMMENT_SHEET_LOCK.acquire(blocking=False):
+        return comment_dispatch.Decision("SOURCE_BUSY", message="Nguồn bình luận đang cập nhật; đã hủy lượt gửi.")
+    try:
+        automatic = task.get("source") == "AUTO"
+        if automatic and not _comment_sheet_result.get("success"):
+            return comment_dispatch.Decision("SOURCE_CHANGED", message="Nguồn bình luận chưa sẵn sàng.")
+        latest = comment_dispatch.final_check(
+            task["page_id"], paused, initial_page, automatic=automatic,
+            require_sheet=automatic, transport="selected", profile_reserved=profile_reserved, task=task,
+        )
+        if not latest.ready:
+            return latest
+        revision = task.get("content_revision") or ""
+        if (_send_mode(initial_page) == "BROWSER" and automatic and task.get("sequence_step") is None
+                and not revision.startswith("snapshot:") and revision != comment_content.rule_revision(latest.page)):
+            return comment_dispatch.Decision("SOURCE_CHANGED", message="Mẫu hoặc lịch bình luận đã đổi.")
+        if not submit_control.commit(ticket, paused):
+            return comment_dispatch.Decision("CANCELLED_BEFORE_SEND", message="Quyền gửi đã thay đổi; đã hủy lượt gửi.")
+        return latest
+    finally:
+        _COMMENT_SHEET_LOCK.release()
+
+
 def _execute_due_tasks():
     if SCHEDULER_METRICS["paused_all"]:
         return
@@ -327,6 +472,7 @@ def _execute_due_tasks():
             break
         task_id, page_id = task["id"], task["page_id"]
         automatic = task.get("source") == "AUTO"
+        ticket = submit_control.snapshot(page_id, automatic=automatic)
         with comment_dispatch.guard(page_id, paused, automatic=automatic, require_sheet=automatic,
                                     transport="selected") as decision:
             if not decision.ready:
@@ -355,9 +501,7 @@ def _execute_due_tasks():
                 break
             attempts += 1
             try:
-                if browser:
-                    verified = antidetect_client.verify_post_for_page_cdp(page, task["post_id"], post_url=task.get("post_url"))
-                else:
+                if not browser:
                     verified = meta_client.verify_post_belongs_to_page(task["post_id"], page_id, token)
             except (meta_client.MetaAPIError, antidetect_client.BrowserAutomationError) as exc:
                 result = exc.as_result()
@@ -374,15 +518,24 @@ def _execute_due_tasks():
                         cancellation = {}
 
                         def before_submit():
-                            final = _prepare_before_submit(task, page, paused, refresh_sheet=True)
+                            final = _prepare_before_submit(task, page, paused, refresh_sheet=True, profile_reserved=True)
                             if not final.ready:
                                 cancellation.update(error=final.message, retry_at=final.retry_at)
                             return final.ready
 
+                        def final_submit_gate():
+                            final = _final_submit_gate(task, page, paused, ticket, profile_reserved=True)
+                            if not final.ready:
+                                cancellation.update(error=final.message, retry_at=final.retry_at)
+                            return final.ready
+
+                        # The browser sender verifies the post and its timestamp
+                        # in the same tab it uses to submit the comment.
                         result = antidetect_client.send_page_comment_cdp(
-                            page, verified["clean_post_id"], content,
-                            post_url=verified.get("permalink_url") or task.get("post_url"),
+                            page, task["post_id"], content,
+                            post_url=task.get("post_url"),
                             before_submit=before_submit,
+                            final_submit_gate=final_submit_gate,
                         )
                         if result.get("category") == "CANCELLED_BEFORE_SEND":
                             result.update(cancellation)
@@ -390,12 +543,17 @@ def _execute_due_tasks():
                             result = {"success": False, "category": "NEED_CHECK",
                                       "error": "Chưa có mã bình luận xác thực từ trình duyệt. Đối chiếu trên Facebook."}
                     else:
+                        final = _final_submit_gate(task, page, paused, ticket)
+                        if not final.ready:
+                            db.release_task_lock(task_id)
+                            db.defer_task(task_id, final.retry_at, final.message)
+                            continue
                         result = meta_client.post_comment(verified["clean_post_id"], page_id, token, content)
                 except antidetect_client.BrowserAutomationError as exc:
                     result = exc.as_result()
                 except Exception:
                     result = {"success": False, "category": "NEED_CHECK", "error": "Chưa xác nhận được kết quả gửi. Đối chiếu trên Facebook."}
-            if browser and result.get("category") == "BROWSER_BUSY":
+            if browser and result.get("category") in ("BROWSER_BUSY", "BROWSER_LIMIT", "BROWSER_BLOCKED"):
                 attempts -= 1  # Profile contention must not consume another Page's send budget.
             _record_dispatch_result(task, result, decision.page)
 
@@ -413,22 +571,28 @@ def _record_dispatch_result(task, result, page):
     SCHEDULER_METRICS["send_errors"][page_id] = error
     if _send_mode(page) == "BROWSER":
         _record_browser_connection_failure(page, result)
-        if category in ("BROWSER_BUSY", "CANCELLED_BEFORE_SEND"):
+        if category in ("BROWSER_BUSY", "BROWSER_LIMIT", "CANCELLED_BEFORE_SEND"):
             db.release_task_lock(task_id)
             retry_at = result.get("retry_at") or (
                 datetime.now(timezone.utc) + timedelta(seconds=config.TASK_TICK_SEC)).isoformat()
             db.defer_task(task_id, retry_at, error)
             return
-        if result.get("browser_status") in ("LOGIN_REQUIRED", "CHECKPOINT", "ERROR") and category not in (
+        if category == "BROWSER_BLOCKED":
+            db.update_task_result(task_id, "PAUSED", error_message=error)
+            return
+        if result.get("browser_status") in ("LOGIN_REQUIRED", "CHECKPOINT", "RESTRICTED", "ERROR") and category not in (
                 "NEED_CHECK", "NETWORK_RETRYABLE", "RATE_LIMIT", "POST_ERROR"):
             db.update_task_result(task_id, "PAUSED", error_message=error)
             return
     if category == "NEED_CHECK":
         db.update_task_result(task_id, "NEED_CHECK", error_message=error)
-    elif category in ("TOKEN_EXPIRED", "MISSING_PERMISSIONS"):
-        db.update_task_result(task_id, "PAUSED", error_message=error)
+    elif category in ("TOKEN_EXPIRED", "MISSING_PERMISSIONS", "RESTRICTED"):
+        # If persisting the Page block fails, retain SENDING as a durable
+        # interrupted-write marker; startup recovery invalidates Graph proof.
+        comment_dispatch.quarantine_graph(page_id)
         status = "EXPIRED" if category == "TOKEN_EXPIRED" else category
         db.update_page_status(page_id, bool(page["is_active"]), status, error)
+        db.update_task_result(task_id, "PAUSED", error_message=error)
     elif category in ("RATE_LIMIT", "NETWORK_RETRYABLE"):
         if category == "RATE_LIMIT":
             retry_at = db.record_rate_limit(page_id, result)
@@ -495,17 +659,23 @@ def run_maintenance_cycle():
     Runs periodic maintenance:
     1. Recovers only tasks stuck in SENDING for > 5 minutes (startup=False).
     2. Checks token health ONLY when debug_token actually succeeded (`checked=True`).
-    3. Refreshes Google Sheet configuration even while sending is paused.
+    3. Performs external reads only while the system is running.
     """
     db.recover_stale_tasks(startup=False, stale_after_seconds=300)
+    if SCHEDULER_METRICS["paused_all"]:
+        return
 
     for p in db.get_all_pages():
+        if SCHEDULER_METRICS["paused_all"]:
+            return
         pid = p["page_id"]
         if not p.get("rule_enabled") or _send_mode(p) == "BROWSER":
             continue
         full_p = db.get_page_for_dispatch(pid)
         if not full_p or not full_p.get("page_access_token"):
             continue
+        if SCHEDULER_METRICS["paused_all"]:
+            return
         info = meta_client.debug_token(full_p["page_access_token"])
         if info.get("checked") is not True:
             continue
@@ -519,7 +689,7 @@ def run_maintenance_cycle():
             continue
         db.update_page_status(pid, bool(p["is_active"]), status, note)
 
-    if comment_sheet_url():
+    if not SCHEDULER_METRICS["paused_all"] and comment_sheet_url():
         refresh_comment_sheet()
 
 
@@ -537,11 +707,17 @@ async def run_worker(worker):
 
 
 async def loop_post_scanner():
-    """Loop 1: Incremental post scanner (Interval: config.POST_SCAN_INTERVAL_SEC)."""
+    """Loop 1: Incremental post scanner (Graph: POST_SCAN_INTERVAL_SEC, Browser: BROWSER_SCAN_INTERVAL_SEC)."""
+    global _last_browser_scan_mono
     while True:
         if not SCHEDULER_METRICS["paused_all"]:
+            now_mono = time.monotonic()
+            browser_interval = max(60, int(getattr(config, "BROWSER_SCAN_INTERVAL_SEC", 900)))
+            include_browser = (now_mono - _last_browser_scan_mono) >= browser_interval
             try:
-                await run_worker(detect_new_posts_and_schedule)
+                await run_worker(lambda: detect_new_posts_and_schedule(include_browser=include_browser))
+                if include_browser and not SCHEDULER_METRICS["paused_all"]:
+                    _last_browser_scan_mono = time.monotonic()
                 SCHEDULER_METRICS["post_scan"]["last_run"] = datetime.now(timezone.utc).isoformat()
                 SCHEDULER_METRICS["post_scan"]["last_error"] = None
             except Exception as e:
@@ -550,11 +726,11 @@ async def loop_post_scanner():
 
 
 async def loop_task_executor():
-    """Loop 2: Refresh Page templates while paused and dispatch enabled tasks."""
+    """Loop 2: Refresh and dispatch only while explicitly running."""
     while True:
-        await run_worker(refresh_comment_sheet)
         if not SCHEDULER_METRICS["paused_all"]:
             try:
+                await run_worker(refresh_comment_sheet)
                 await run_worker(execute_due_tasks)
                 SCHEDULER_METRICS["task_exec"]["last_run"] = datetime.now(timezone.utc).isoformat()
                 SCHEDULER_METRICS["task_exec"]["last_error"] = None

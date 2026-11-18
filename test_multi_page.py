@@ -44,9 +44,13 @@ def pages(tmp_path, monkeypatch):
     return db
 
 
-def test_two_pages_dedupe_checkpoint_and_dispatch(pages, monkeypatch):
-    old = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
-    new = datetime.now(timezone.utc).isoformat()
+def test_two_pages_dedupe_checkpoint_and_dispatch(pages, monkeypatch, clock):
+    # Windows wall-clock reads can share the same tick as the second Page's
+    # enable checkpoint. Model a post strictly after both activation cursors.
+    clock.value = max(datetime.fromisoformat(pages.get_page(page_id)["last_seen_post_time"])
+                      for page_id in (PAGE_A, PAGE_B)) + timedelta(seconds=1)
+    old = (clock.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    new = clock.now(timezone.utc).isoformat()
     monkeypatch.setattr(meta_client, "get_recent_posts", lambda *args, **kwargs: [
         {"id": "old", "created_time": old}, {"id": "same-post", "created_time": new},
     ])
@@ -98,6 +102,53 @@ def test_sheet_edit_isolates_error_and_updates_pending_auto(pages):
     result = app.set_page_automation(PAGE_A, app.PageAutomationRequest(enabled=False))
     assert result["cancelled_auto_tasks"] == 1
     assert pages.get_all_tasks(source="MANUAL")[0]["status"] == "PENDING"
+
+
+def test_new_posts_only_survives_restart_and_reenable(clock, ready_pages, monkeypatch):
+    page_id, other_page = ready_pages
+    db.set_page_automation(other_page, False)
+    enabled_at = clock.now(timezone.utc)
+    posts = [
+        {"id": "before-enable", "created_time": (enabled_at - timedelta(seconds=1)).isoformat()},
+        {"id": "at-enable", "created_time": enabled_at.isoformat()},
+        {"id": "new-post", "created_time": (enabled_at + timedelta(minutes=1)).isoformat()},
+    ]
+    scanned_since = []
+
+    def recent_posts(page, token, *, since_timestamp):
+        assert page == page_id
+        scanned_since.append(since_timestamp)
+        return posts
+
+    monkeypatch.setattr(meta_client, "get_recent_posts", recent_posts)
+    clock.advance(minutes=2)
+    scheduler.detect_new_posts_and_schedule()
+    tasks = db.get_all_tasks(page_id=page_id)
+    assert [task["post_id"] for task in tasks] == ["new-post"]
+    db.update_task_result(tasks[0]["id"], "SUCCESS", "existing-comment")
+    checkpoint = db.get_page(page_id)["last_seen_post_time"]
+
+    db.init_db()
+    clock.advance(minutes=1)
+    assert not db.set_page_automation(page_id, True)["changed"]
+    assert db.get_page(page_id)["last_seen_post_time"] == checkpoint
+    scheduler.detect_new_posts_and_schedule()
+    assert scanned_since == [enabled_at.isoformat(), checkpoint]
+    assert len(db.get_all_tasks(page_id=page_id)) == 1
+
+    db.set_page_automation(page_id, False)
+    clock.advance(minutes=1)
+    posts.append({"id": "while-disabled", "created_time": clock.now(timezone.utc).isoformat()})
+    clock.advance(minutes=1)
+    resumed_at = clock.now(timezone.utc)
+    assert db.set_page_automation(page_id, True)["changed"]
+    clock.advance(minutes=1)
+    posts.append({"id": "after-reenable", "created_time": clock.now(timezone.utc).isoformat()})
+    scheduler.detect_new_posts_and_schedule()
+    assert scanned_since[-1] == resumed_at.isoformat()
+    assert {task["post_id"]: task["status"] for task in db.get_all_tasks(page_id=page_id)} == {
+        "new-post": "SUCCESS", "after-reenable": "PENDING",
+    }
 
 
 def test_v2_migration_preserves_pilot_history_and_cursor(tmp_path):

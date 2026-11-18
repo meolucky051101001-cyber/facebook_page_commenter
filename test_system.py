@@ -482,13 +482,17 @@ def test_google_sheet_unified_single_tab_mode():
     assert json.loads(p["templates"]) == ["{Chào|Xin chào} bạn, mẫu 1!", "Mẫu 2 {nhé|nha}!"]
 
 
-def test_maintenance_refreshes_source_while_paused(monkeypatch):
+def test_maintenance_does_not_contact_sources_while_paused(monkeypatch):
     monkeypatch.setattr(scheduler, "comment_sheet_url", lambda: "mock-sheet")
     monkeypatch.setitem(scheduler.SCHEDULER_METRICS, "paused_all", True)
-    with patch("scheduler.refresh_comment_sheet", return_value={"success": True}) as refresh, patch("meta_client.post_comment") as send:
+    with patch("scheduler.refresh_comment_sheet", return_value={"success": True}) as refresh, patch("meta_client.post_comment") as send, patch("meta_client.debug_token") as check:
         scheduler.run_maintenance_cycle()
-    refresh.assert_called_once()
-    send.assert_not_called()
+        refresh.assert_not_called()
+        check.assert_not_called()
+        send.assert_not_called()
+        scheduler.SCHEDULER_METRICS["paused_all"] = False
+        scheduler.run_maintenance_cycle()
+        refresh.assert_called_once()
 
 
 def test_manual_sync_endpoint_schedules_background_cycle(client, monkeypatch):

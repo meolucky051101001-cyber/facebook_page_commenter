@@ -62,6 +62,11 @@ def classify_error(err_data: Dict[str, Any]) -> Tuple[str, str]:
     subcode = err_data.get("error_subcode", 0)
     msg = sanitize_error_message(err_data.get("message", "Unknown Meta API error"))
 
+    if code == 368 or re.search(
+            r"temporarily blocked|blocked for polic(?:y|ies)|(?:account|page) (?:is |has been )?restricted|"
+            r"we restrict certain activity|chúng tôi hạn chế (?:một số )?hoạt động|"
+            r"(?:tài khoản|trang) .{0,40}bị hạn chế", msg, re.IGNORECASE):
+        return "RESTRICTED", f"Meta đang hạn chế hoạt động; cần kiểm tra trước khi tiếp tục (Mã {code}/{subcode})."
     if code in [190, 102] or subcode in [458, 460, 463, 467] or "access token" in msg.lower():
         return "TOKEN_EXPIRED", f"Token hết hạn hoặc bị thu hồi (Mã {code}/{subcode}): {msg}"
     elif code in [4, 17, 32, 613] or "rate limit" in msg.lower() or "too many calls" in msg.lower():

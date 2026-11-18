@@ -1,4 +1,35 @@
-Nhật ký triển khai kế hoạch sửa 5 lỗi comment tự động — 15/11/2026
+# Bổ sung profile và preflight — 18/11/2026, Asia/Bangkok
+
+Hoàn tất source: `operational_readiness.py` tổng hợp metadata công khai, chốt profile và toàn bộ task counts bằng truy vấn aggregate. API `/api/profile-safety` và `/api/preflight` chỉ đọc, không giải mã token, không quét bài, kiểm tra kết nối, đồng bộ Sheet, reserve quota hay sửa trạng thái. Profile Browser phân biệt READY, WAITING (quota/gap/busy), BLOCKED (checkpoint/latch/recovery/metadata lỗi). Proof từng Page giữ riêng; Graph cùng mapping không bị chặn theo profile Browser. Counter chưa xác định giữ `null`, UI hiện `—`.
+
+Giao diện Antidetect thêm **Profile & an toàn**, preflight chủ động với kết quả ở đầu panel và danh sách lỗi cuộn được. Tác vụ NEED_CHECK được đếm cả ngoài 500 bản ghi dashboard. Pause có đường gửi riêng để dừng khi check hoặc Resume còn chờ; refresh cũ không ghi đè ý định mới. Giao diện hiển thị giờ UTC+7, giữ bộ lọc, không tự chạy preflight hoặc gửi khi tải trang.
+
+Kiểm thử: `python -m pytest -q -o faulthandler_timeout=30 --tb=short` đạt **563 passed** trong **99.90 giây**, một cảnh báo deprecation Starlette/AnyIO. Bộ riêng preflight/proxy đạt **132 passed**. Python/JavaScript syntax và diff whitespace đạt. `python verify_commenter_ui.py` chạy headless browser mới với mọi request bị intercept bằng fixture 66 Page (19 Graph + 47 Browser), xác nhận trạng thái profile, preflight chỉ GET, chặn AUTO/restore khi profile lỗi, không tràn ngang ở 390px và Pause trong khi check/Resume đang chờ. Ảnh kiểm thử ở `.pytest_cache/commenter-ui/`; script cần Playwright/Chromium đã cài sẵn, không tự tải.
+
+Không đọc `.env`, DB/cookie/token thật hoặc gọi Facebook. Chưa đồng bộ DB, đổi mode/opt-in, mở profile hoặc khởi chạy/restart dịch vụ. Bản integration mới ở source workspace, chưa copy vào Antidetect cài đặt bên ngoài. Bộ duyệt quyền ban đầu lỗi dịch vụ/timeout; lần thử lại qua cùng luồng phê duyệt đã chạy thành công UI và full suite.
+
+---
+
+# Cập nhật source Graph và Browser — 17/11/2026
+
+Đã triển khai chọn Graph/Browser theo từng Page, dùng phiên đăng nhập cục bộ của profile tài khoản; không thêm nhập/xuất cookie thô và không fallback Browser khi Graph lỗi. Source startup luôn lưu Pause, chặn maintenance/Sheet tự động khi pause, bỏ miễn proof Pilot và chặn hide/unhide/reply/publication trước lệnh ghi.
+
+Browser có marker thao tác state v2 trước I/O, latch trước persistence, recovery sau crash, generation và ticket global/Page/AUTO/profile. Final gate nằm sau DOM cuối, dùng snapshot policy 200 ms và từ chối bằng chứng quá 2 giây. Giữ nguyên checkpoint khi DB lỗi, giữ ID bình luận đã xác minh nếu cleanup thất bại; kết quả chưa rõ giữ NEED_CHECK. Nhận diện thêm thông báo hạn chế tiếng Anh/Việt; Graph code 368 dừng Page. Lỗi lưu trạng thái Graph giữ marker SENDING/action_pending/PUBLISHING để startup vô hiệu proof và yêu cầu đối chiếu.
+
+Kiểm tra Graph có điều kiện đối chiếu binding hiện tại để kết quả cũ không xác minh nhầm token vừa thay. Pause mới thắng Resume cũ kể cả khi Resume đang tải Sheet. UI mô tả phiên đăng nhập Browser và giới hạn của Pause đối với lượt đã bắt đầu gửi.
+
+Kiểm thử cách ly thực chạy:
+
+- Full suite trên source cuối: **431 passed**, không skip/deselect, 1 cảnh báo deprecation Starlette/AnyIO, trong **61.49 giây**. Lệnh: `python -m pytest -q -o faulthandler_timeout=30 --tb=short`. Quyền loopback nội bộ chỉ phục vụ asyncio/TestClient Windows; các lớp chặn file vận hành và HTTP/CDP thật vẫn được giữ nguyên.
+- Bao gồm regression Pause trong DOM cuối, Pause/Resume trong lúc tải Sheet, lỗi persistence/cleanup/recovery, proof Graph cũ sau reconnect và cách ly transport/profile. Test thời gian multi-Page dùng đồng hồ giả để bài mới nằm sau mốc bật của cả hai Page.
+- Phạm vi commit là đúng 27 file source/test/docs trong manifest triển khai; không gồm bí mật, DB hoặc bốn file legacy có sẵn.
+- Kiểm tra cú pháp 37 file Python và 2 khối JavaScript đạt; diff whitespace sạch. Các test dùng DB tạm, khóa/credential giả, HTTP/CDP mock; có crash subprocess trên DB tạm và fixture tổng hợp 19 HYBRID + 47 Browser.
+
+Không đọc `.env`, DB/backups vận hành, cookie, token hoặc khóa thật. Không đổi DB_PATH/Pilot/mode/opt-in thật, không đồng bộ DB, không restart dịch vụ hoặc gửi Facebook. Không thấy dịch vụ Python/Uvicorn hoặc listener 8080/8000 sau test; trạng thái DB vận hành chưa kiểm tra. Kế hoạch mới ở `KE-HOACH-VAN-HANH-GRAPH-VA-BROWSER.md`; danh mục thật và Pilot là bước riêng được cho phép sau.
+
+---
+
+Nhật ký lịch sử triển khai kế hoạch sửa 5 lỗi comment tự động — 15/11/2026
 
 **Chặng A: hoàn tất.** Bản chụp trước sửa nằm tại backups/auto-comment-20261115-834cb6ce. Có source.zip, bản vá so với HEAD, trạng thái Git, manifest băm tệp, bản sao DB nhất quán và cấu hình cục bộ. DB schema 5 có 65 Page, 65 rule, 4 tác vụ lịch sử, không có publication/inbox; tất cả Page tắt, run state paused. quick_check đạt; 9 token Page trong bản sao giải mã được. Năm test hồi quy ban đầu đều thất bại đúng nguyên nhân đã review.
 

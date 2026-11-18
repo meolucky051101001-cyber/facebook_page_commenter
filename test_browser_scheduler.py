@@ -22,9 +22,11 @@ def browser_page(ready_pages, monkeypatch):
     db.set_page_send_mode(page_id, "BROWSER")
     assert db.update_page_browser_check(page_id, datetime.now(timezone.utc).isoformat(), "READY",
                                         identity_id=page_id, profile_id="profile-1")
-    monkeypatch.setattr(browser, "verify_post_for_page_cdp", lambda page, post, **kwargs: {
-        "clean_post_id": post, "permalink_url": f"https://www.facebook.com/{post}",
-    })
+
+    def unexpected_browser_preflight(*args, **kwargs):
+        raise AssertionError("Browser dispatch must verify and send in one tab")
+
+    monkeypatch.setattr(browser, "verify_post_for_page_cdp", unexpected_browser_preflight)
 
     def unexpected(*args, **kwargs):
         raise AssertionError("Selected BROWSER mode must never call Graph")
@@ -46,8 +48,9 @@ def test_browser_task_sends_without_graph_token(browser_page, monkeypatch):
     queue_due(browser_page, browser_page + "_123")
     calls = []
 
-    def send(page, post, content, *, post_url, before_submit):
+    def send(page, post, content, *, post_url, before_submit, final_submit_gate):
         assert before_submit()
+        assert final_submit_gate()
         calls.append((page["antidetect_profile_id"], post, content, post_url))
         return {"success": True, "comment_id": "123_456"}
 
@@ -89,7 +92,7 @@ def test_browser_final_callback_stops_changed_policy(browser_page, monkeypatch, 
     queue_due(browser_page, browser_page + "_123")
     submitted = []
 
-    def send(page, post, content, *, post_url, before_submit):
+    def send(page, post, content, *, post_url, before_submit, final_submit_gate):
         if change == "pause":
             scheduler.SCHEDULER_METRICS["paused_all"] = True
         elif change == "disable":
@@ -105,7 +108,7 @@ def test_browser_final_callback_stops_changed_policy(browser_page, monkeypatch, 
                 elif change == "quota":
                     conn.execute("UPDATE pages SET comments_today_count=20,comments_today_date=? WHERE page_id=?",
                                  (db.local_day_key(datetime.now(timezone.utc)), browser_page))
-        if before_submit():
+        if before_submit() and final_submit_gate():
             submitted.append(True)
             return {"success": True, "comment_id": "unexpected"}
         return {"success": False, "category": "CANCELLED_BEFORE_SEND", "error": "policy changed"}
@@ -128,8 +131,8 @@ def test_browser_refreshes_sheet_before_enter_and_reprepares_changed_single(brow
             sheets_sync.sync_comment_sheet_rows([HEADERS, [browser_page, "A", "Updated comment", "10"]])
         return {"success": True}
 
-    def send(page, post, content, *, post_url, before_submit):
-        if not before_submit():
+    def send(page, post, content, *, post_url, before_submit, final_submit_gate):
+        if not before_submit() or not final_submit_gate():
             return {"success": False, "category": "CANCELLED_BEFORE_SEND"}
         sent.append(content)
         return {"success": True, "comment_id": "123_456"}
@@ -151,7 +154,7 @@ def test_browser_busy_preserves_retry_and_quota(browser_page, monkeypatch):
     def busy(*args, **kwargs):
         raise browser.BrowserAutomationError("Profile đang được dùng.", "BROWSER_BUSY", "READY")
 
-    monkeypatch.setattr(browser, "verify_post_for_page_cdp", busy)
+    monkeypatch.setattr(browser, "send_page_comment_cdp", busy)
     scheduler.execute_due_tasks()
     task = assert_task(browser_page, "PENDING")
     assert task["locked_at"] is None
@@ -170,7 +173,7 @@ def test_busy_profile_cannot_starve_other_pages(browser_page, ready_pages, monke
         raise browser.BrowserAutomationError("Profile đang được dùng.", "BROWSER_BUSY", "READY")
 
     calls = []
-    monkeypatch.setattr(browser, "verify_post_for_page_cdp", busy)
+    monkeypatch.setattr(browser, "send_page_comment_cdp", busy)
     monkeypatch.setattr(meta_client, "verify_post_belongs_to_page", lambda post, *args: {"clean_post_id": post})
     monkeypatch.setattr(meta_client, "post_comment", lambda post, page, *args: calls.append(page) or {
         "success": True, "comment_id": "123_456",
@@ -189,7 +192,7 @@ def test_browser_auth_failure_pauses_browser_only(browser_page, monkeypatch, sta
     def auth(*args, **kwargs):
         raise browser.BrowserAutomationError("Cần kiểm tra profile.", "TOKEN_EXPIRED", status)
 
-    monkeypatch.setattr(browser, "verify_post_for_page_cdp", auth)
+    monkeypatch.setattr(browser, "send_page_comment_cdp", auth)
     scheduler.execute_due_tasks()
     assert {task["status"] for task in db.get_all_tasks(page_id=browser_page)} == {"PAUSED"}
     page = db.get_page(browser_page)
@@ -207,6 +210,7 @@ def test_browser_ambiguous_submit_never_retries_automatically(browser_page, monk
 
     def send(*args, before_submit, **kwargs):
         assert before_submit()
+        assert kwargs["final_submit_gate"]()
         calls.append(True)
         return result.copy()
 
