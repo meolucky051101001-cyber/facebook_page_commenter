@@ -35,7 +35,7 @@ ACTION_FIELDS = frozenset("""
 PREVIEW_FIELDS = frozenset(("templates", "comment_sequence", "delay_minutes", "source_error", "sheet_url"))
 TASK_STATUSES = ("PENDING", "SENDING", "SUCCESS", "FAILED", "NEED_CHECK", "CANCELLED", "PAUSED")
 PROFILE_FIELDS = frozenset("""profile_id profile_name page_count page_names status reason operations_today
-    operations_limit wait_reason retry_at blocked_page_ids verified_page_ids""".split())
+    operations_limit scan_operations_limit reserved_send_operations wait_reason retry_at blocked_page_ids verified_page_ids""".split())
 FINDING_FIELDS = frozenset(("severity", "code", "page_id", "page_name", "profile_id", "reason"))
 PAGE_ISSUE_FIELDS = frozenset(("page_id", "page_name", "profile_id", "reason"))
 
@@ -84,7 +84,7 @@ def _public_report(value, *, preflight=False):
             for key in ("page_names", "blocked_page_ids", "verified_page_ids"):
                 if not isinstance(item.get(key), list) or any(not isinstance(text, str) for text in item[key]):
                     raise ValueError("Invalid profile members")
-            for key in ("operations_today", "operations_limit"):
+            for key in ("operations_today", "operations_limit", "scan_operations_limit", "reserved_send_operations"):
                 if item.get(key) is not None and (type(item[key]) is not int or item[key] < 0):
                     raise ValueError("Invalid profile counter")
             if any(item.get(key) is not None and not isinstance(item[key], str)

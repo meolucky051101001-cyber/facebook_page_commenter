@@ -52,6 +52,8 @@ def snapshot(paused_all, sheet_sync=None):
             "status": status, "reason": reason, "wait_reason": message,
             "retry_at": gate.get("retry_at"), "operations_today": gate.get("count"),
             "operations_limit": gate.get("max_operations_per_day"),
+            "scan_operations_limit": gate.get("scan_operations_limit"),
+            "reserved_send_operations": gate.get("reserved_send_operations"),
             "blocked_page_ids": [p["page_id"] for p in members] if status == "BLOCKED" else [],
             "verified_page_ids": verified,
         })

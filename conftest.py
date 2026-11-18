@@ -47,6 +47,7 @@ def isolated_runtime(tmp_path, monkeypatch):
     scheduler.SCHEDULER_METRICS["paused_all"] = False
     monkeypatch.setattr(scheduler, "_comment_sheet_result", {"success": False})
     monkeypatch.setattr(scheduler, "_last_comment_sheet_read", float("-inf"))
+    monkeypatch.setattr(scheduler, "_last_browser_scan_mono", float("-inf"))
     monkeypatch.setattr(scheduler, "_SCAN_BACKOFF_UNTIL", {})
 
     def no_http(*args, **kwargs):

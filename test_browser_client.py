@@ -952,3 +952,249 @@ process.stdout.write(JSON.stringify(results));
                                capture_output=True, text=True, encoding="utf-8", timeout=15)
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout) == [expected, "ok", "ok", "ok", "ok"]
+
+
+@pytest.mark.parametrize("bad_rt", [
+    {"port": 9222, "detached": True, "cdp_health": {"state": "recovery_required"}},
+    {"port": 9222, "cdp_health": {"state": "degraded", "reason": "SOCKET_CLOSED"}},
+    {"port": 9222, "cleanup_failed": True},
+])
+def test_acquire_rejects_degraded_or_detached_runtime_record(monkeypatch, bad_rt):
+    monkeypatch.setattr(browser, "_read_runtime_readonly", lambda: {PROFILE: bad_rt})
+    monkeypatch.setattr(browser, "_probe_cdp_port", lambda port: port == 9222)
+    with pytest.raises(browser.BrowserAutomationError) as caught:
+        browser.acquire_profile_cdp_port(PROFILE)
+    assert caught.value.category == "NETWORK_RETRYABLE"
+
+
+def test_server_launch_sends_require_healthy_and_rejects_degraded_payload(monkeypatch):
+    monkeypatch.setattr(browser, "_read_runtime_readonly", lambda: {})
+    monkeypatch.setattr(browser, "_INPROC_LAUNCHER", None)
+    monkeypatch.setattr(browser, "_probe_cdp_port", lambda port: port == 9222)
+    monkeypatch.setattr(browser, "_get_running_antidetect_server", lambda: (8000, "mock-key"))
+    seen_urls = []
+
+    class DegradedResp:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def read(self):
+            return json.dumps({
+                "success": True,
+                "port": 9222,
+                "degraded": True,
+                "cdp_ready": False,
+                "cdp_health": {"state": "degraded", "reason": "VERIFICATION_FAILED"},
+            }).encode("utf-8")
+
+    def fake_urlopen(req, **kwargs):
+        seen_urls.append(req.full_url)
+        return DegradedResp()
+
+    monkeypatch.setattr(browser.urllib.request, "urlopen", fake_urlopen)
+    with pytest.raises(browser.BrowserAutomationError) as caught:
+        browser.acquire_profile_cdp_port(PROFILE)
+    assert caught.value.category == "NETWORK_RETRYABLE"
+    assert seen_urls == [f"http://127.0.0.1:8000/api/profiles/{PROFILE}/start?require_healthy=true"]
+
+
+def test_open_and_close_transient_tab_use_synchronized_server_bridge(monkeypatch):
+    monkeypatch.setattr(browser, "_PORT_BRIDGE_CONTEXT", {9222: {"profile_id": PROFILE, "server_port": 8000}})
+    monkeypatch.setattr(browser, "_get_running_antidetect_server", lambda: (8000, "mock-key"))
+    requests_seen = []
+
+    class Resp:
+        def __init__(self, body):
+            self._body = json.dumps(body).encode("utf-8")
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def read(self):
+            return self._body
+
+    def fake_urlopen(req, **kwargs):
+        requests_seen.append((req.get_method(), req.full_url))
+        if req.get_method() == "POST":
+            return Resp({"success": True, "target_id": "sync-tab-99", "ws_url": "ws://127.0.0.1:9222/devtools/page/sync-tab-99"})
+        return Resp({"success": True, "closed": True})
+
+    monkeypatch.setattr(browser.urllib.request, "urlopen", fake_urlopen)
+    tid, ws_url = browser._open_transient_tab(9222)
+    assert tid == "sync-tab-99"
+    assert ws_url == "ws://127.0.0.1:9222/devtools/page/sync-tab-99"
+    browser._close_transient_tab(9222, tid)
+    assert requests_seen == [
+        ("POST", f"http://127.0.0.1:8000/api/profiles/{PROFILE}/tabs/transient"),
+        ("DELETE", f"http://127.0.0.1:8000/api/profiles/{PROFILE}/tabs/transient/sync-tab-99"),
+    ]
+
+
+def test_click_emits_curved_mouse_movement_and_valid_button_bitmasks(harness):
+    assert send(harness)["success"] is True
+    mouse_events = [params for method, params in harness.calls if method == "Input.dispatchMouseEvent"]
+    assert any(ev["type"] == "mouseMoved" and ev["buttons"] == 0 for ev in mouse_events)
+    pressed = [ev for ev in mouse_events if ev["type"] == "mousePressed"]
+    released = [ev for ev in mouse_events if ev["type"] == "mouseReleased"]
+    assert pressed and all(ev["buttons"] == 1 for ev in pressed)
+    assert released and all(ev["buttons"] == 0 for ev in released)
+
+
+def test_transient_tab_server_timeout_raises_without_opening_orphan_fallback(monkeypatch):
+    monkeypatch.setattr(browser, "_PORT_BRIDGE_CONTEXT", {9222: {"profile_id": PROFILE, "server_port": 8000}})
+    monkeypatch.setattr(browser, "_get_running_antidetect_server", lambda: (8000, "mock-key"))
+    fallback_called = []
+
+    def timeout_urlopen(req, **kwargs):
+        raise browser.urllib.error.URLError(TimeoutError("server transient tab timed out"))
+
+    monkeypatch.setattr(browser.urllib.request, "urlopen", timeout_urlopen)
+    monkeypatch.setattr(browser, "_cdp_http_json", lambda *args, **kwargs: fallback_called.append(args))
+    with pytest.raises(browser.BrowserAutomationError) as caught:
+        browser._open_transient_tab(9222)
+    assert caught.value.category == "NETWORK_RETRYABLE"
+    assert fallback_called == []
+
+
+def test_transient_tab_404_falls_back_to_blank_tab_and_owned_release_forgets_port(monkeypatch):
+    monkeypatch.setattr(browser, "_PORT_BRIDGE_CONTEXT", {9222: {"profile_id": PROFILE, "server_port": 8000}})
+    monkeypatch.setattr(browser, "_get_running_antidetect_server", lambda: (8000, "mock-key"))
+    monkeypatch.setattr(browser, "_INPROC_LAUNCHER", None)
+
+    def http_404(req, **kwargs):
+        if "/stop/owned" in req.full_url:
+            class OkResp:
+                def __enter__(self):
+                    return self
+                def __exit__(self, *args):
+                    pass
+            return OkResp()
+        raise browser.urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, None)
+
+    async def fake_stealth(ws_url, timeout=5.0):
+        return ws_url == "ws://127.0.0.1:9222/devtools/page/fallback-tab"
+
+    monkeypatch.setattr(browser.urllib.request, "urlopen", http_404)
+    monkeypatch.setattr(browser, "_cdp_http_json", lambda port, path, **kw: {
+        "id": "fallback-tab", "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/fallback-tab",
+    })
+    monkeypatch.setattr(browser, "_verify_blank_tab_stealth", fake_stealth)
+    tid, ws_url = browser._open_transient_tab(9222)
+    assert (tid, ws_url) == ("fallback-tab", "ws://127.0.0.1:9222/devtools/page/fallback-tab")
+
+    lease = {"port": 9222, "launch_id": "launch-z", "owner_instance": "owner-z"}
+    monkeypatch.setattr(browser.config, "ANTIDETECT_AUTO_CLOSE_BROWSER", True)
+    monkeypatch.setattr(browser, "_OWNED_PROFILE_LEASES", {PROFILE: dict(lease)})
+    monkeypatch.setattr(browser, "_read_runtime_readonly", lambda: {PROFILE: dict(lease)})
+    browser.release_profile_cdp_port(PROFILE, True, 8000)
+    assert 9222 not in browser._PORT_BRIDGE_CONTEXT
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="Node is needed to execute the Comet DOM fixture")
+def test_comet_dom_resolves_pfbid_relay_timestamp_and_fiber_actor_ids(harness):
+    pfbid_token = "pfbid02abcXYZ1234567890CometPost"
+    pfbid_url = f"https://www.facebook.com/ChiDepThichVe/posts/{pfbid_token}"
+    fixture = r"""
+const config = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+global.location = {href: config.url, pathname: new URL(config.url).pathname};
+global.getComputedStyle = () => ({visibility: 'visible', display: 'block'});
+global.Node = {DOCUMENT_POSITION_FOLLOWING: 4};
+const root = {closest: () => null};
+const outer = {parentElement: root, getAttribute: () => null};
+const makeLink = (href, article) => ({href, textContent: '12 phút',
+  closest: selector => selector === '[role="article"]' ? article : null,
+  matches: () => false, getAttribute: () => null, querySelector: () => null,
+  compareDocumentPosition: () => 4, contains: () => false});
+const postLink = makeLink(config.url, outer);
+const commentArticle = {parentElement: {closest: () => outer},
+  getBoundingClientRect: () => ({width: 120, height: 48})};
+const commentBody = {innerText: config.message,
+  closest: selector => selector === '[role="article"]' ? commentArticle : null};
+const commentPermalink = makeLink(config.url + '?comment_id=90001', commentArticle);
+commentArticle.querySelectorAll = selector => selector === 'a[href]' ? [commentPermalink] :
+  selector === '[dir="auto"]' ? [commentBody] : [];
+const box = {innerText: '', getBoundingClientRect: () => ({left: 20, top: 40, width: 200, height: 32}),
+  getAttribute: key => key === 'aria-label' ? 'Viết bình luận công khai…' : null,
+  closest: selector => selector === '[role="article"]' ? outer : null,
+  contains: () => false};
+const actorBtn = {textContent: '', getBoundingClientRect: () => ({left: 4, top: 40, width: 28, height: 28}),
+  getAttribute: key => key === 'aria-label' ? 'Đang tương tác dưới tên Chị Đẹp Thích Vẽ' : null,
+  querySelectorAll: () => [],
+  __reactFiber$mock: {memoizedProps: {actorID: config.actor}, return: null}};
+outer.querySelectorAll = selector => {
+  if (selector === 'a[href]') return [postLink, commentPermalink];
+  if (selector === '[contenteditable="true"][role="textbox"]') return [box];
+  if (selector === '[role="button"],button,[role="status"]') return [actorBtn];
+  return [];
+};
+const relayPayload = {
+  require: [[
+    'ScheduledServerJS', 'handle', null, [{
+      __bbox: {
+        result: {
+          data: {
+            node: {
+              __typename: 'Story',
+              post_id: config.post,
+              url: config.url,
+              creation_time: 1794729600,
+              owning_profile: {__typename: 'Page', id: config.actor},
+            },
+            comment: {
+              __typename: 'Comment',
+              legacy_fbid: '90001',
+              author: {id: config.actor},
+              body: {text: config.message},
+            }
+          }
+        }
+      }
+    }]
+  ]]
+};
+const scriptEl = {textContent: JSON.stringify(relayPayload)};
+global.document = {
+  activeElement: box,
+  querySelector: () => null,
+  querySelectorAll: selector => {
+    if (selector === 'script[type="application/json"]') return [scriptEl];
+    if (selector === '[role="article"]') return [outer, commentArticle];
+    return [];
+  }
+};
+const inspect = eval('(' + config.source + ')');
+process.stdout.write(JSON.stringify(inspect(config.post, config.message)));
+"""
+    payload = {"source": browser._BROWSER_EVIDENCE_JS, "url": pfbid_url, "post": POST,
+               "message": MESSAGE, "actor": ALIAS}
+    completed = subprocess.run([shutil.which("node"), "-e", fixture], input=json.dumps(payload),
+                               capture_output=True, text=True, encoding="utf-8", timeout=15)
+    assert completed.returncode == 0, completed.stderr
+    evidence = json.loads(completed.stdout)
+    assert evidence["actorIds"] == [ALIAS]
+    assert evidence["posts"] == [{
+        "id": POST, "pfbid": pfbid_token, "ownerIds": [ALIAS],
+        "url": pfbid_url, "created_time": "1794729600",
+    }]
+    assert evidence["comments"] == [{"id": "90001", "authorIds": [ALIAS], "text": MESSAGE}]
+
+    # Verify redirect from numeric story_fbid permalink to pfbid route succeeds when Relay links both
+    harness.state["url"] = pfbid_url
+    harness.state["posts"] = evidence["posts"]
+    verified = browser.verify_post_for_page_cdp(harness.page, f"{CANONICAL}_{POST}")
+    assert verified["clean_post_id"] == f"{CANONICAL}_{POST}"
+    assert verified["permalink_url"] == pfbid_url
+    assert send(harness)["success"] is True
+
+    # Redirect to an unrelated pfbid must still fail closed before typing
+    harness.calls.clear()
+    wrong_pfbid = "pfbid02wrongPost999999999999"
+    harness.state["url"] = f"https://www.facebook.com/ChiDepThichVe/posts/{wrong_pfbid}"
+    harness.state["posts"] = [{
+        "id": "88888888", "pfbid": wrong_pfbid, "ownerIds": [ALIAS],
+        "url": harness.state["url"], "created_time": "1794729600",
+    }]
+    rejected = send(harness)
+    assert rejected["category"] == "INVALID_TARGET"
+    assert enters(harness) == []

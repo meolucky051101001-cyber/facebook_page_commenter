@@ -40,6 +40,7 @@ def main():
             "reason": "PROFILE_BLOCKED" if blocked else "WAIT_PROFILE_GAP" if waiting else "READY",
             "wait_reason": "Synthetic checkpoint" if blocked else "Synthetic spacing wait" if waiting else None,
             "operations_today": None if blocked else 7, "operations_limit": None if blocked else 100,
+            "scan_operations_limit": None if blocked else 75, "reserved_send_operations": None if blocked else 25,
             "retry_at": "2026-11-18T02:00:00Z" if waiting else None,
             "blocked_page_ids": [p["page_id"] for p in members] if blocked else [],
             "verified_page_ids": [] if blocked else [p["page_id"] for p in members],

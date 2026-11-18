@@ -40,6 +40,7 @@ _RUN_REQUEST_LOCK = threading.Lock()
 _RUN_REQUEST_VERSION = 0
 _COMMENT_SHEET_LOCK = threading.Lock()
 _last_comment_sheet_read = float("-inf")
+_last_browser_scan_mono = float("-inf")
 _comment_sheet_result = {"success": False, "error": "Chưa đọc tab bình luận."}
 
 
@@ -177,12 +178,12 @@ def build_post_schedule(page: Dict[str, Any], post_id: str, post_url: Optional[s
     return {"id": post_id, "url": post_url, "created_time": created_at.isoformat(), "steps": steps}
 
 
-def detect_new_posts_and_schedule():
+def detect_new_posts_and_schedule(*, include_browser: bool = True):
     """Single-flight wrapper: a background loop and a manual sync must not scan concurrently."""
     if not _SCAN_LOCK.acquire(blocking=False):
         return
     try:
-        _detect_new_posts_and_schedule()
+        _detect_new_posts_and_schedule(include_browser=include_browser)
     finally:
         _SCAN_LOCK.release()
 
@@ -231,7 +232,43 @@ def _scan_browser_posts(page, since):
             db.set_setting(_BROWSER_SCAN_ATTEMPT_PREFIX + page["page_id"], datetime.now(timezone.utc).isoformat())
 
 
-def _detect_new_posts_and_schedule():
+def _profile_has_due_send_task(profile_id: Optional[str], now_utc: datetime) -> bool:
+    """Yield the profile's inter-operation gap when a Browser comment is already due to send."""
+    if not profile_id:
+        return False
+    gap_sec = max(0, int(getattr(config, "BROWSER_MIN_GAP_PER_PROFILE_SEC", 60)))
+    horizon = (now_utc + timedelta(seconds=gap_sec)).isoformat()
+    with closing(db.get_connection()) as conn:
+        rows = conn.execute(f"""
+            SELECT DISTINCT t.page_id, t.source FROM tasks t
+            JOIN pages p ON p.page_id = t.page_id
+            LEFT JOIN page_rules r ON r.page_id = t.page_id
+            WHERE t.status = 'PENDING' AND t.scheduled_at <= ?
+              AND p.send_mode = 'BROWSER' AND p.antidetect_profile_id = ?
+              AND p.is_active = 1
+              AND (t.source != 'AUTO' OR (r.is_enabled = 1 AND r.source_error IS NULL))
+              AND {db._selected_transport_ready_sql('p')}
+              AND (COALESCE(t.sequence_step, 1) <= 1 OR EXISTS (
+                  SELECT 1 FROM tasks previous
+                  WHERE previous.page_id = t.page_id AND previous.post_id = t.post_id
+                    AND previous.source = 'AUTO' AND previous.sequence_step = t.sequence_step - 1
+                    AND previous.status = 'SUCCESS'
+                    AND julianday(previous.updated_at, '+' || t.sequence_gap_minutes || ' minutes') <= julianday(?)
+              ))
+            LIMIT 10
+        """, (horizon, profile_id, horizon)).fetchall()
+    for row in rows:
+        auto = row["source"] == "AUTO"
+        decision = comment_dispatch.check(
+            row["page_id"], lambda: False, automatic=auto,
+            require_sheet=auto, transport="selected", profile_reserved=True,
+        )
+        if decision.ready:
+            return True
+    return False
+
+
+def _detect_new_posts_and_schedule(*, include_browser: bool = True):
     """
     Scans all active pages incrementally, detecting newly published posts.
     Calculates target delay and creates deduplicated auto-tasks.
@@ -242,12 +279,15 @@ def _detect_new_posts_and_schedule():
         return
     pages = _fair_scan_order(db.get_all_pages())
     now_utc = datetime.now(timezone.utc)
+    busy_send_profiles = {}
 
     for p in pages:
         if SCHEDULER_METRICS["paused_all"]:
             break
         page_id = p["page_id"]
         if not p.get("is_active") or not p.get("rule_enabled") or p.get("source_error"):
+            continue
+        if _send_mode(p) == "BROWSER" and not include_browser:
             continue
         if _SCAN_BACKOFF_UNTIL.get(page_id, now_utc) > now_utc:
             continue
@@ -268,6 +308,12 @@ def _detect_new_posts_and_schedule():
                                  (since, page_id))
                 continue
             if _send_mode(page_full) == "BROWSER":
+                prof_id = page_full.get("antidetect_profile_id")
+                if prof_id not in busy_send_profiles:
+                    busy_send_profiles[prof_id] = _profile_has_due_send_task(prof_id, now_utc)
+                if busy_send_profiles[prof_id]:
+                    _SCAN_BACKOFF_UNTIL[page_id] = now_utc + timedelta(seconds=config.TASK_TICK_SEC)
+                    continue
                 posts = _scan_browser_posts(page_full, since)
             else:
                 posts = meta_client.get_recent_posts(page_id, page_full["page_access_token"], since_timestamp=since)
@@ -661,11 +707,17 @@ async def run_worker(worker):
 
 
 async def loop_post_scanner():
-    """Loop 1: Incremental post scanner (Interval: config.POST_SCAN_INTERVAL_SEC)."""
+    """Loop 1: Incremental post scanner (Graph: POST_SCAN_INTERVAL_SEC, Browser: BROWSER_SCAN_INTERVAL_SEC)."""
+    global _last_browser_scan_mono
     while True:
         if not SCHEDULER_METRICS["paused_all"]:
+            now_mono = time.monotonic()
+            browser_interval = max(60, int(getattr(config, "BROWSER_SCAN_INTERVAL_SEC", 900)))
+            include_browser = (now_mono - _last_browser_scan_mono) >= browser_interval
             try:
-                await run_worker(detect_new_posts_and_schedule)
+                await run_worker(lambda: detect_new_posts_and_schedule(include_browser=include_browser))
+                if include_browser and not SCHEDULER_METRICS["paused_all"]:
+                    _last_browser_scan_mono = time.monotonic()
                 SCHEDULER_METRICS["post_scan"]["last_run"] = datetime.now(timezone.utc).isoformat()
                 SCHEDULER_METRICS["post_scan"]["last_error"] = None
             except Exception as e:

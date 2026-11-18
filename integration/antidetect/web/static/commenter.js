@@ -241,6 +241,9 @@
       const facts = node('dl', 'detail-facts');
       fact(facts, 'Page dùng Browser', String(number(item.page_count)));
       fact(facts, 'Thao tác hôm nay', `${counterText(item.operations_today)} / ${counterText(item.operations_limit)}`);
+      if (item.reserved_send_operations != null && number(item.reserved_send_operations) > 0) {
+        fact(facts, 'Giữ riêng cho gửi', `${number(item.reserved_send_operations)} lượt (quét tối đa ${counterText(item.scan_operations_limit)})`);
+      }
       fact(facts, 'Page đã xác minh riêng', String(Array.isArray(item.verified_page_ids) ? item.verified_page_ids.length : 0));
       fact(facts, 'Có thể thử lại', dateText(item.retry_at));
       card.append(heading, facts);

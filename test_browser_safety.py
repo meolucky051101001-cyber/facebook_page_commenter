@@ -398,7 +398,8 @@ os._exit(0)
     child_env = {name: os.environ[name] for name in ("SYSTEMROOT", "WINDIR", "PATH") if name in os.environ}
     child_env.update(PYTHON_DOTENV_DISABLED="1", ENCRYPTION_KEY=Fernet.generate_key().decode(),
                      DASHBOARD_ADMIN_KEY="synthetic-dashboard-key-for-child-0000")
-    completed = subprocess.run([sys.executable, "-c", child, str(db.DB_PATH), safety_clock.now(timezone.utc).isoformat()], env=child_env,
+    completed = subprocess.run([sys.executable, "-c", child, str(db.DB_PATH), safety_clock.now(timezone.utc).isoformat()],
+                               cwd=os.path.dirname(os.path.abspath(__file__)), env=child_env,
                                capture_output=True, text=True, timeout=20)
     assert completed.returncode == 0, completed.stderr
     assert safety.status("shared")["browser_status"] == "RECOVERY_REQUIRED"
@@ -433,3 +434,24 @@ def test_malformed_operation_marker_fails_closed(safety_clock, field, value):
     assert not safety.begin_operation("shared", kind="check", allow_blocked=True)["ready"]
     with pytest.raises(RuntimeError):
         safety.recover_interrupted_operations()
+
+
+def test_scan_stops_at_send_reserve_while_send_and_check_remain_allowed(safety_clock, monkeypatch):
+    monkeypatch.setattr(config, "BROWSER_MAX_OPERATIONS_PER_PROFILE_PER_DAY", 6)
+    monkeypatch.setattr(config, "BROWSER_RESERVED_SEND_OPERATIONS", 2, raising=False)
+    monkeypatch.setattr(config, "BROWSER_MIN_GAP_PER_PROFILE_SEC", 0)
+    for _ in range(4):
+        op = safety.begin_operation("shared", kind="scan")
+        assert op["ready"]
+        assert safety.finish_operation("shared", op["operation_id"], op["generation"])["completed"]
+    denied_scan = safety.begin_operation("shared", kind="scan")
+    assert not denied_scan["ready"]
+    assert denied_scan["reason"] == "WAIT_PROFILE_SEND_RESERVE"
+    assert safety.status("shared")["ready"] is True
+    assert safety.status("shared")["scan_ready"] is False
+    for kind in ("send", "check"):
+        op = safety.begin_operation("shared", kind=kind)
+        assert op["ready"]
+        assert safety.finish_operation("shared", op["operation_id"], op["generation"])["completed"]
+    exhausted = safety.begin_operation("shared", kind="send")
+    assert not exhausted["ready"] and exhausted["reason"] == "WAIT_PROFILE_DAILY"

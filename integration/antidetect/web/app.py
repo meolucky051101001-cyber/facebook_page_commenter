@@ -517,9 +517,28 @@ async def home_page(request: Request):
 
 
 
+_commenter_key_lock = threading.Lock()
+_commenter_key_cache: Dict[str, Any] = {"sig": None, "key": None}
+
+
+def _read_commenter_admin_key(env_path) -> str:
+    import re
+    stat = env_path.stat()
+    sig = (str(env_path), stat.st_mtime_ns, stat.st_size)
+    with _commenter_key_lock:
+        if _commenter_key_cache["sig"] == sig and _commenter_key_cache["key"]:
+            return _commenter_key_cache["key"]
+    values = re.findall(r"(?m)^DASHBOARD_ADMIN_KEY\s*=\s*([A-Za-z0-9_-]{32,})\s*$", env_path.read_text(encoding="utf-8-sig"))
+    if len(values) != 1:
+        raise ValueError("Commenter key is missing or ambiguous")
+    with _commenter_key_lock:
+        _commenter_key_cache["sig"] = sig
+        _commenter_key_cache["key"] = values[0]
+    return values[0]
+
+
 def _commenter_request(method, path, body=None):
     """Proxy fixed Commenter routes using the local dashboard key."""
-    import re
     from pathlib import Path
     import requests
 
@@ -528,12 +547,10 @@ def _commenter_request(method, path, body=None):
     port = os.environ.get("FACEBOOK_COMMENTER_PORT", "8080")
     if not port.isdecimal() or not 1 <= int(port) <= 65535:
         raise ValueError("Invalid Commenter port")
-    values = re.findall(r"(?m)^DASHBOARD_ADMIN_KEY\s*=\s*([A-Za-z0-9_-]{32,})\s*$", env_path.read_text(encoding="utf-8-sig"))
-    if len(values) != 1:
-        raise ValueError("Commenter key is missing or ambiguous")
+    admin_key = _read_commenter_admin_key(env_path)
     with requests.Session() as client:
         client.trust_env = False
-        client.headers["X-Dashboard-Key"] = values[0]
+        client.headers["X-Dashboard-Key"] = admin_key
         response = client.request(
             method, f"http://127.0.0.1:{port}{path}", json=body,
             timeout=(3, 80 if method == "POST" else 5), allow_redirects=False,

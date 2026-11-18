@@ -105,6 +105,13 @@ def _limits() -> tuple[int, int]:
     return max(1, max_ops), max(0, min_gap)
 
 
+def _reserved_send_ops(max_ops: int) -> int:
+    raw = int(getattr(config, "BROWSER_RESERVED_SEND_OPERATIONS", 0) or 0)
+    if raw <= 0 or max_ops <= 1:
+        return 0
+    return max_ops // 4 if raw >= max_ops else min(raw, max_ops - 1)
+
+
 def _empty(now: datetime) -> Dict[str, Any]:
     return {"version": 2, "day": db.local_day_key(now), "count": 0,
             "last_reserved_at": None, "browser_status": "READY", "generation": 0,
@@ -200,11 +207,16 @@ def _write(conn, profile_id: str, state: Dict[str, Any], now: datetime) -> None:
                  (_profile_key(profile_id), json.dumps(state, separators=(",", ":")), now.isoformat()))
 
 
-def _wait(state: Dict[str, Any], now: datetime, max_ops: int, min_gap: int) -> Optional[tuple]:
+def _wait(state: Dict[str, Any], now: datetime, max_ops: int, min_gap: int, *, kind: Optional[str] = None) -> Optional[tuple]:
     waits = []
+    reserved_send = _reserved_send_ops(max_ops)
+    scan_cap = max_ops - reserved_send
     if state["count"] >= max_ops:
         waits.append((datetime.fromisoformat(db.next_daily_reset_utc(now)), "WAIT_PROFILE_DAILY",
                       "Profile đã hết hạn mức thao tác trong ngày."))
+    elif kind == "scan" and reserved_send > 0 and state["count"] >= scan_cap:
+        waits.append((datetime.fromisoformat(db.next_daily_reset_utc(now)), "WAIT_PROFILE_SEND_RESERVE",
+                      f"Profile giữ {reserved_send} lượt thao tác cuối trong ngày ưu tiên cho gửi bình luận."))
     if state["last_reserved_at"]:
         last = datetime.fromisoformat(state["last_reserved_at"].replace("Z", "+00:00"))
         earliest = last.astimezone(timezone.utc) + timedelta(seconds=min_gap)
@@ -281,6 +293,7 @@ def status(profile_id: str, *, conn=None) -> Dict[str, Any]:
             state["message"] = "Cần kiểm tra profile sau thao tác bị gián đoạn."
         return _decision(state, now, reason="PROFILE_BLOCKED", message=state["message"])
     max_ops, min_gap = _limits()
+    reserved_send = _reserved_send_ops(max_ops)
     # Day rollover resets only the daily count; the inter-operation gap remains.
     if state["day"] != db.local_day_key(now):
         state["day"] = db.local_day_key(now)
@@ -288,6 +301,8 @@ def status(profile_id: str, *, conn=None) -> Dict[str, Any]:
     result = _decision(state, now, ready=True)
     result["operation_in_progress"] = bool(state["operation"] and _is_active(profile_id, state["operation"]))
     result["max_operations_per_day"] = max_ops
+    result["reserved_send_operations"] = reserved_send
+    result["scan_operations_limit"] = max_ops - reserved_send
     result["min_gap_seconds"] = min_gap
     if state["browser_status"] != "READY":
         result.update(ready=False, reason="PROFILE_BLOCKED",
@@ -297,6 +312,7 @@ def status(profile_id: str, *, conn=None) -> Dict[str, Any]:
         if wait:
             deadline, reason, message = wait
             result.update(ready=False, reason=reason, retry_at=deadline.isoformat(), message=message)
+    result["scan_ready"] = bool(result["ready"] and state["count"] < (max_ops - reserved_send))
     return result
 
 
@@ -333,7 +349,8 @@ def _reserve(profile_id: str, allow_blocked: bool, operation=None) -> Dict[str, 
             if state["browser_status"] == "ERROR" or (state["browser_status"] != "READY" and not allow_blocked):
                 return _decision(state, now, reason="PROFILE_BLOCKED",
                                  message=state["message"] or "Profile đang bị chặn; cần kiểm tra và khôi phục.")
-            wait = _wait(state, now, max_ops, min_gap)
+            op_kind = operation.get("kind") if isinstance(operation, dict) else None
+            wait = _wait(state, now, max_ops, min_gap, kind=op_kind)
             if wait:
                 deadline, reason, message = wait
                 return _decision(state, now, reason=reason, retry_at=deadline.isoformat(), message=message)

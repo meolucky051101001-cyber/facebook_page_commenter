@@ -258,3 +258,42 @@ def test_final_callback_can_use_last_reserved_daily_slot(profile_pages, monkeypa
     assert sends == [True]
     assert _task(pending["id"])["status"] == "SUCCESS"
     assert safety.status("shared")["count"] == 1
+
+
+def test_scanner_yields_profile_slot_when_browser_send_task_is_due(profile_pages, clock, monkeypatch):
+    a, b, _, _ = profile_pages
+    cursor = "2026-11-15T09:00:00+00:00"
+    for pid in (a, b):
+        db.set_page_automation(pid, True)
+    with closing(db.get_connection()) as conn, conn:
+        conn.execute("UPDATE pages SET last_seen_post_time=? WHERE page_id IN (?,?)", (cursor, a, b))
+    when_due = (clock.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    assert db.create_task(b, f"{b}_555", "Synthetic comment", when_due, source="MANUAL")
+    due_task = next(task for task in db.get_all_tasks(page_id=b) if task["post_id"] == f"{b}_555")
+    scans, sends = [], []
+
+    def fake_scan(page, since_timestamp):
+        res = safety.begin_operation(page["antidetect_profile_id"], page_id=page["page_id"], kind="scan")
+        if not res["ready"]:
+            raise browser.BrowserAutomationError(res["message"], "BROWSER_LIMIT", "READY", retry_at=res["retry_at"])
+        safety.finish_operation(page["antidetect_profile_id"], res["operation_id"], res["generation"])
+        scans.append(page["page_id"])
+        return []
+
+    def fake_send(page, *args, **kwargs):
+        res = safety.begin_operation(page["antidetect_profile_id"], page_id=page["page_id"], kind="send")
+        assert res["ready"]
+        safety.finish_operation(page["antidetect_profile_id"], res["operation_id"], res["generation"])
+        sends.append(page["page_id"])
+        return {"success": True, "comment_id": "sent-priority-1"}
+
+    monkeypatch.setattr(browser, "get_recent_posts_for_page_cdp", fake_scan)
+    monkeypatch.setattr(browser, "send_page_comment_cdp", fake_send)
+    scheduler.detect_new_posts_and_schedule()
+    assert scans == []
+    scheduler.execute_due_tasks()
+    assert sends == [b]
+    assert _task(due_task["id"])["status"] == "SUCCESS"
+    clock.advance(seconds=61)
+    scheduler.detect_new_posts_and_schedule()
+    assert len(scans) == 1

@@ -994,6 +994,7 @@ def index():
             <li class="nav-item"><button class="nav-link" data-bs-toggle="pill" data-bs-target="#tab-rules"><i class="fa-solid fa-sliders me-1"></i> 3. Kịch bản từng Page</button></li>
             <li class="nav-item"><button class="nav-link" data-bs-toggle="pill" data-bs-target="#tab-manual"><i class="fa-solid fa-paper-plane me-1"></i> 4. Hẹn giờ thủ công</button></li>
             <li class="nav-item"><button class="nav-link" data-bs-toggle="pill" data-bs-target="#tab-tasks"><i class="fa-solid fa-clock-rotate-left me-1"></i> 5. Lịch sử tác vụ (<span id="taskCount">0</span>)</button></li>
+            <li class="nav-item"><button class="nav-link" data-bs-toggle="pill" data-bs-target="#tab-safety" onclick="loadProfileSafety()"><i class="fa-solid fa-shield-heart me-1"></i> 6. Profile &amp; Preflight</button></li>
             <li class="nav-item"><a class="nav-link" href="/operations">Hộp thư, xuất bản &amp; báo cáo</a></li>
         </ul>
 
@@ -1203,6 +1204,26 @@ def index():
                                 <tr><td colspan="7" class="text-center text-muted">Đang tải danh sách tác vụ...</td></tr>
                             </tbody>
                         </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- TAB 6: PROFILE SAFETY & READ-ONLY PREFLIGHT -->
+            <div class="tab-pane fade" id="tab-safety">
+                <div class="card p-4">
+                    <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+                        <div>
+                            <h5 class="fw-bold mb-1"><i class="fa-solid fa-shield-heart text-primary"></i> An toàn Profile Browser &amp; Kiểm tra Preflight</h5>
+                            <small class="text-muted">Chỉ đọc metadata đã lưu; không tự mở trình duyệt, không tiêu lượt thao tác và không bật gửi.</small>
+                        </div>
+                        <div class="d-flex gap-2">
+                            <button class="btn btn-sm btn-outline-secondary" type="button" onclick="loadProfileSafety()"><i class="fa-solid fa-rotate-right"></i> Tải trạng thái Profile</button>
+                            <button class="btn btn-sm btn-primary" type="button" id="btnRunPreflight" onclick="runDashboardPreflight()"><i class="fa-solid fa-clipboard-check"></i> Chạy Preflight chỉ đọc</button>
+                        </div>
+                    </div>
+                    <div id="preflightBox" class="mb-3" style="display:none;"></div>
+                    <div id="profileSafetyBox" class="row g-3">
+                        <div class="col-12 text-muted small">Bấm "Tải trạng thái Profile" hoặc "Chạy Preflight chỉ đọc" để xem báo cáo.</div>
                     </div>
                 </div>
             </div>
@@ -1834,6 +1855,73 @@ def index():
             }
             loadTasks();
             fetchMetrics();
+        }
+
+        async function loadProfileSafety() {
+            const box = document.getElementById('profileSafetyBox');
+            if (!box) return;
+            try {
+                const res = await apiFetch('/api/profile-safety');
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || 'Chưa đọc được trạng thái an toàn.');
+                const profiles = data.profiles || [];
+                if (!profiles.length) {
+                    box.innerHTML = '<div class="col-12 text-muted small">Hiện chưa có Fanpage nào chọn chế độ gửi Browser.</div>';
+                    return;
+                }
+                box.innerHTML = profiles.map(item => {
+                    const st = String(item.status || 'UNKNOWN').toUpperCase();
+                    const badgeCls = st === 'READY' ? 'bg-success' : st === 'BLOCKED' ? 'bg-danger' : 'bg-warning text-dark';
+                    const reserveNote = item.reserved_send_operations ? ` · Giữ ${Number(item.reserved_send_operations)} lượt gửi (quét tối đa ${escapeHtml(item.scan_operations_limit ?? '—')})` : '';
+                    const retryStr = item.retry_at ? new Date(item.retry_at).toLocaleString('vi-VN', {timeZone: 'Asia/Bangkok'}) : '—';
+                    return `<div class="col-md-6"><div class="border rounded-3 p-3 bg-white h-100">
+                        <div class="d-flex justify-content-between align-items-start mb-2">
+                            <div><strong>${escapeHtml(item.profile_name || item.profile_id)}</strong><br><small class="text-muted">${escapeHtml(item.profile_id)}</small></div>
+                            <span class="badge ${badgeCls}">${escapeHtml(st)}</span>
+                        </div>
+                        <div class="small">
+                            <div>Page dùng Browser: <strong>${Number(item.page_count || 0)}</strong> · Đã xác minh riêng: <strong>${(item.verified_page_ids || []).length}</strong></div>
+                            <div>Thao tác hôm nay: <strong>${escapeHtml(item.operations_today ?? '—')} / ${escapeHtml(item.operations_limit ?? '—')}</strong>${reserveNote}</div>
+                            <div>Có thể thử lại: ${escapeHtml(retryStr)}</div>
+                            ${item.wait_reason ? `<div class="text-danger mt-1">${escapeHtml(item.wait_reason)}</div>` : ''}
+                        </div>
+                    </div></div>`;
+                }).join('');
+            } catch (err) {
+                box.innerHTML = `<div class="col-12 text-danger small">${escapeHtml(err.message)}</div>`;
+            }
+        }
+
+        async function runDashboardPreflight() {
+            const btn = document.getElementById('btnRunPreflight');
+            const box = document.getElementById('preflightBox');
+            btn.disabled = true;
+            try {
+                await loadProfileSafety();
+                const res = await apiFetch('/api/preflight');
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || 'Chưa hoàn tất preflight.');
+                const findings = data.findings || [];
+                const itemsHtml = findings.length
+                    ? '<ul class="mb-0 mt-2 small">' + findings.slice(0, 30).map(f => `<li><strong>[${escapeHtml(String(f.severity || '').toUpperCase())}] ${escapeHtml(f.page_name || f.page_id || f.profile_id || 'Hệ thống')}:</strong> ${escapeHtml(f.reason)}</li>`).join('') + '</ul>'
+                    : '<div class="small mt-1 text-success">Không ghi nhận lỗi cấu hình trên các Page hiện tại.</div>';
+                box.innerHTML = `<div class="alert alert-light border mb-0">
+                    <div class="d-flex flex-wrap gap-3 small fw-semibold">
+                        <span>Page AUTO đủ điều kiện: <strong class="text-success">${Number(data.eligible_pages || 0)}</strong> / ${Number(data.enabled_pages || 0)}</span>
+                        <span>Page cần xử lý/chờ: <strong class="text-warning">${Number(data.blocked_pages || 0)}</strong></span>
+                        <span>Profile bị chặn: <strong class="text-danger">${Number(data.blocked_profiles || 0)}</strong></span>
+                        <span>Nguồn lỗi: <strong class="text-danger">${Number(data.source_errors || 0)}</strong></span>
+                        <span>NEED_CHECK toàn lịch sử: <strong class="text-danger">${Number(data.needs_check_count || 0)}</strong></span>
+                    </div>
+                    ${itemsHtml}
+                </div>`;
+                box.style.display = 'block';
+            } catch (err) {
+                box.innerHTML = `<div class="alert alert-danger py-2 mb-0 small">${escapeHtml(err.message)}</div>`;
+                box.style.display = 'block';
+            } finally {
+                btn.disabled = false;
+            }
         }
 
         window.onload = () => {
